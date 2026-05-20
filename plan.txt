@@ -1,0 +1,944 @@
+# Calibrated Dominant-Plane Consensus for Trustworthy Unsupervised Deep Homography Estimation
+
+## 1. Central Thesis
+
+This project should not be positioned as another deep homography network with a better backbone, mask, or attention module. The stronger IEEE TIP-level idea is to reformulate homography estimation as a problem of calibrated dominant-plane consensus:
+
+Given two real images \(I_a\) and \(I_b\), the method estimates not only a homography \(H_{ab}\), but also:
+
+\[
+P(z_i = 1 \mid I_a, I_b),
+\]
+
+where \(z_i = 1\) means pixel or region \(i\) belongs to the dominant plane-induced homography, and a calibrated reliability score:
+
+\[
+s_{ab} = P(\text{single homography is valid} \mid I_a, I_b).
+\]
+
+The key claim is:
+
+Existing deep homography methods force every image pair into a single homography, even when the single-plane assumption is violated by parallax, dynamic objects, large foregrounds, or weak texture. This work estimates the homography together with its geometric validity domain and calibrated trustworthiness.
+
+The paper should emphasize trustworthy homography estimation, not only lower average reprojection error.
+
+## 2. Motivation From The Current Code And Paper
+
+The attached ECCV 2020 paper, "Content-Aware Unsupervised Deep Homography Estimation", introduced three important ideas:
+
+1. A learned feature extractor \(f(\cdot)\) for feature-space alignment.
+2. A learned content-aware mask \(m(\cdot)\) for outlier suppression.
+3. A triplet-style unsupervised loss to avoid trivial feature collapse.
+
+The current repository implements the simplified Oneline-DLT version:
+
+1. It predicts one forward homography \(H_{ab}\).
+2. It uses a one-channel learned feature map.
+3. It uses a sigmoid mask as attention and loss weighting.
+4. It uses a simplified hinge/triplet feature loss:
+
+\[
+\mathcal{L}_{\text{triplet}}
+= \sum_i M_i \max(0, 1 + d_i^+ - d_i^-),
+\]
+
+where:
+
+\[
+d_i^+ = \left|F_b(i) - F_a'(i)\right|,
+\]
+
+\[
+d_i^- = \left|F_b(i) - F_a(i)\right|,
+\]
+
+and \(F_a'\) is the feature of \(I_a\) after warping by the predicted homography.
+
+However, this version does not fully model:
+
+1. Bidirectional inverse consistency.
+2. Whether the mask is a true geometric consensus probability.
+3. Whether the homography is reliable.
+4. Whether uncertainty is calibrated.
+5. Whether the single-homography assumption is valid.
+
+These are the main opportunities for a novel paper.
+
+## 3. Novelty Positioning
+
+The proposed method should be framed as:
+
+Calibrated Dominant-Plane Consensus Homography Estimation.
+
+The central novelty is not "adding uncertainty" or "adding temporal consistency". The novelty is a probabilistic formulation in which homography estimation produces:
+
+1. A dominant-plane homography \(H_{ab}\).
+2. A posterior support map \(q_i = P(z_i = 1 \mid I_a, I_b)\).
+3. A spatial uncertainty map \(\sigma_i\).
+4. A scalar reliability score \(s_{ab}\).
+5. A failure-detection mechanism for cases where a single homography is physically invalid.
+
+This makes the model answer three questions:
+
+1. What is the best dominant homography?
+2. Where is this homography valid?
+3. Should this homography be trusted?
+
+This is more defensible for IEEE TIP than a module-combination paper.
+
+## 4. Literature Boundaries To Avoid Duplication
+
+The proposal must explicitly distinguish itself from the following known directions:
+
+1. Supervised deep homography estimation:
+   DeTone et al. estimate homography from synthetically warped image pairs.
+
+2. Unsupervised photometric homography:
+   Nguyen et al. minimize photometric error using differentiable warping.
+
+3. Content-aware mask learning:
+   Zhang et al. ECCV 2020 already introduced learned features and content-aware masks.
+
+4. Dynamic-scene masks:
+   Le et al. studied deep homography estimation with dynamic object masks.
+
+5. Motion-basis and low-rank homography:
+   BasesHomo models homography flow with motion bases and subspace projection.
+
+6. Transformer and recurrent refinement:
+   RHWF and related methods use recurrent homography-guided warping and attention.
+
+7. Geometrized transformer matching:
+   GeoFormer uses RANSAC-guided focused attention for self-supervised homography.
+
+8. Multi-homography plane masks:
+   Mask-Homo estimates pseudo-plane masks and multiple homographies.
+
+9. Adaptive query masking:
+   AGNet addresses query over-focusing in transformer homography estimation.
+
+10. Foundation-model feature teaching:
+    SAMFeat uses SAM to guide local feature learning for homography estimation.
+
+The proposed paper should not claim novelty in masks, transformers, multi-homography estimation, or SAM-guided features. Its novelty should be:
+
+\[
+\text{homography} + \text{dominant-plane posterior} + \text{calibrated uncertainty} + \text{validity/failure prediction}.
+\]
+
+## 5. Proposed Method
+
+### 5.1 Inputs And Outputs
+
+Input:
+
+\[
+(I_a, I_b)
+\]
+
+where \(I_a\) and \(I_b\) are two small-baseline real images or video frames.
+
+Outputs:
+
+\[
+H_{ab},
+\]
+
+\[
+H_{ba},
+\]
+
+\[
+q_{ab}(i) = P(z_i = 1 \mid I_a, I_b),
+\]
+
+\[
+\log \sigma_{ab}(i),
+\]
+
+\[
+s_{ab} \in [0, 1].
+\]
+
+Here:
+
+1. \(H_{ab}\) maps image \(I_a\) to image \(I_b\).
+2. \(H_{ba}\) maps image \(I_b\) to image \(I_a\).
+3. \(q_{ab}(i)\) is the dominant-plane posterior.
+4. \(\sigma_{ab}(i)\) is the predicted spatial uncertainty.
+5. \(s_{ab}\) is the pair-level reliability score.
+
+### 5.2 Feature Extractor
+
+Use a lightweight multi-scale feature extractor:
+
+\[
+F_a^l = f_l(I_a),
+\]
+
+\[
+F_b^l = f_l(I_b),
+\]
+
+where \(l\) indexes feature scales.
+
+For a single-GPU implementation, use a compact CNN or ResNet18-style backbone rather than a large transformer. The paper should avoid relying on a huge backbone as the source of novelty.
+
+### 5.3 Homography Estimator
+
+Retain the DLT-compatible four-corner offset representation used by the current code:
+
+\[
+\Delta p_{ab} \in \mathbb{R}^{8}.
+\]
+
+Given source patch corners:
+
+\[
+p = \{p_1, p_2, p_3, p_4\},
+\]
+
+the destination corners are:
+
+\[
+p' = p + \Delta p_{ab}.
+\]
+
+The homography is obtained by differentiable DLT:
+
+\[
+H_{ab} = \text{DLT}(p, p').
+\]
+
+Predict both directions:
+
+\[
+H_{ab} = g(F_a, F_b),
+\]
+
+\[
+H_{ba} = g(F_b, F_a).
+\]
+
+### 5.4 Dominant-Plane Posterior
+
+Replace the ordinary attention mask \(M_i\) with a probabilistic latent variable:
+
+\[
+z_i \in \{0, 1\}.
+\]
+
+The network predicts:
+
+\[
+q_i = P(z_i = 1 \mid I_a, I_b).
+\]
+
+The interpretation is:
+
+1. \(q_i \approx 1\): region \(i\) is consistent with the dominant plane-induced homography.
+2. \(q_i \approx 0\): region \(i\) is likely dynamic, non-planar, textureless, occluded, or geometrically unreliable.
+
+This must be described as a geometric consensus posterior, not an attention mask.
+
+### 5.5 Spatial Uncertainty
+
+The model predicts:
+
+\[
+\log \sigma_i.
+\]
+
+The uncertainty should explain feature residuals:
+
+\[
+r_i = \left\|F_b(i) - W(F_a, H_{ab})(i)\right\|_1.
+\]
+
+Here \(W(\cdot, H)\) denotes differentiable warping by homography \(H\).
+
+High \(\sigma_i\) should correspond to regions where alignment is inherently uncertain.
+
+### 5.6 Reliability Score
+
+The model predicts:
+
+\[
+s_{ab} = P(y_{ab}=1 \mid I_a, I_b),
+\]
+
+where \(y_{ab}=1\) means the image pair admits a reliable single dominant homography.
+
+The reliability head should use pooled statistics from:
+
+1. The dominant-plane posterior \(q_i\).
+2. The residual map \(r_i\).
+3. The uncertainty map \(\sigma_i\).
+4. The homography feature embedding.
+5. Optional inverse-consistency residuals.
+
+A possible reliability feature vector is:
+
+\[
+\phi_{ab}
+=
+\left[
+\text{mean}(q),
+\text{var}(q),
+\text{area}(q > \tau),
+\text{mean}(r),
+\text{mean}(q r),
+\text{mean}(\sigma),
+\left\|H_{ab}H_{ba} - I\right\|_F
+\right].
+\]
+
+Then:
+
+\[
+s_{ab} = \text{MLP}(\phi_{ab}).
+\]
+
+## 6. Loss Functions
+
+### 6.1 Robust Uncertainty-Weighted Alignment Loss
+
+Use a robust residual:
+
+\[
+r_i = \left\|F_b(i) - W(F_a, H_{ab})(i)\right\|_1.
+\]
+
+Use a Charbonnier penalty:
+
+\[
+\rho(x) = \sqrt{x^2 + \epsilon^2}.
+\]
+
+The uncertainty-weighted dominant-plane loss is:
+
+\[
+\mathcal{L}_{\text{align}}^{ab}
+=
+\frac{
+\sum_i q_i
+\left[
+\rho\left(\frac{r_i}{\sigma_i}\right)
++ \log \sigma_i
+\right]
+}{
+\sum_i q_i + \epsilon
+}.
+\]
+
+The bidirectional version is:
+
+\[
+\mathcal{L}_{\text{align}}
+=
+\mathcal{L}_{\text{align}}^{ab}
++
+\mathcal{L}_{\text{align}}^{ba}.
+\]
+
+### 6.2 Consensus-Weighted Triplet Loss
+
+Keep the useful idea from the original paper, but reinterpret the weighting as consensus probability:
+
+\[
+d_i^+ = \left\|F_b(i) - W(F_a, H_{ab})(i)\right\|_1,
+\]
+
+\[
+d_i^- = \left\|F_b(i) - F_a(i)\right\|_1.
+\]
+
+Then:
+
+\[
+\mathcal{L}_{\text{triplet}}^{ab}
+=
+\frac{
+\sum_i q_i \max(0, m + d_i^+ - d_i^-)
+}{
+\sum_i q_i + \epsilon
+}.
+\]
+
+Use \(m=1\) initially, matching the current implementation.
+
+### 6.3 Inverse Consistency Loss
+
+Enforce:
+
+\[
+H_{ab}H_{ba} \approx I.
+\]
+
+Loss:
+
+\[
+\mathcal{L}_{\text{inv}}
+=
+\left\|H_{ab}H_{ba} - I\right\|_F^2.
+\]
+
+This restores an important part of the original paper that the simplified Oneline version does not fully use.
+
+### 6.4 Support Regularization
+
+The posterior \(q_i\) can collapse to a tiny set of easy pixels. Prevent this with a soft support constraint.
+
+Let:
+
+\[
+\bar{q} = \frac{1}{N}\sum_i q_i.
+\]
+
+Require a minimum non-degenerate support \(\alpha\):
+
+\[
+\mathcal{L}_{\text{support}}
+=
+\max(0, \alpha - \bar{q})^2.
+\]
+
+Use \(\alpha = 0.05\) or \(\alpha = 0.10\) initially.
+
+To avoid forcing dense masks, do not require \(\bar{q}\) to be large. The goal is only to prevent collapse.
+
+### 6.5 Spatial Smoothness Of Consensus
+
+Encourage locally coherent validity maps:
+
+\[
+\mathcal{L}_{\text{smooth}}
+=
+\sum_i
+\left(
+\left|\partial_x q_i\right|
++
+\left|\partial_y q_i\right|
+\right)
+\exp(-\gamma \left|\nabla I_b(i)\right|).
+\]
+
+This allows discontinuities near image edges.
+
+### 6.6 Uncertainty Calibration Loss
+
+The predicted uncertainty should correlate with true residual magnitude. A simple self-supervised calibration target is:
+
+\[
+\hat{\sigma}_i = \text{stopgrad}(r_i).
+\]
+
+Use:
+
+\[
+\mathcal{L}_{\text{calib}}
+=
+\frac{1}{N}
+\sum_i
+\left|
+\log \sigma_i
+-
+\log(\hat{\sigma}_i + \epsilon)
+\right|.
+\]
+
+This term should be low-weighted to avoid making uncertainty merely copy residuals.
+
+### 6.7 Reliability Loss With Synthetic Invalid Pairs
+
+Create invalid pairs without manual labels:
+
+1. Pair frames from different videos.
+2. Pair frames with very large temporal distance.
+3. Pair image patches with inconsistent crops.
+
+For valid pairs:
+
+\[
+y_{ab}=1.
+\]
+
+For invalid generated pairs:
+
+\[
+y_{ab}=0.
+\]
+
+Use binary cross entropy:
+
+\[
+\mathcal{L}_{\text{rel}}
+=
+-
+y_{ab}\log s_{ab}
+-
+(1-y_{ab})\log(1-s_{ab}).
+\]
+
+This gives the model a direct training signal for rejecting impossible or unreliable homographies.
+
+### 6.8 Temporal Composition Consistency
+
+If video triplets are available:
+
+\[
+(I_t, I_{t+1}, I_{t+2}),
+\]
+
+then:
+
+\[
+H_{t,t+2}
+\approx
+H_{t+1,t+2}H_{t,t+1}.
+\]
+
+Loss:
+
+\[
+\mathcal{L}_{\text{temp}}
+=
+\left\|
+H_{t,t+2}
+-
+H_{t+1,t+2}H_{t,t+1}
+\right\|_F^2.
+\]
+
+Use this only when the dataset loader can safely sample frame triplets from the same video.
+
+### 6.9 Total Loss
+
+The full objective is:
+
+\[
+\mathcal{L}
+=
+\mathcal{L}_{\text{align}}
++
+\lambda_1 \mathcal{L}_{\text{triplet}}
++
+\lambda_2 \mathcal{L}_{\text{inv}}
++
+\lambda_3 \mathcal{L}_{\text{support}}
++
+\lambda_4 \mathcal{L}_{\text{smooth}}
++
+\lambda_5 \mathcal{L}_{\text{calib}}
++
+\lambda_6 \mathcal{L}_{\text{rel}}
++
+\lambda_7 \mathcal{L}_{\text{temp}}.
+\]
+
+Initial default weights:
+
+\[
+\lambda_1 = 1.0,
+\quad
+\lambda_2 = 0.01,
+\quad
+\lambda_3 = 0.01,
+\quad
+\lambda_4 = 0.001,
+\quad
+\lambda_5 = 0.05,
+\quad
+\lambda_6 = 0.1,
+\quad
+\lambda_7 = 0.1.
+\]
+
+These should be tuned by ablation, not treated as final.
+
+## 7. Architecture Plan
+
+### 7.1 Base Network
+
+Start from the existing Oneline-DLT model:
+
+1. Keep differentiable DLT.
+2. Keep patch-based training.
+3. Keep feature-space alignment.
+4. Keep the current training pipeline as the baseline.
+
+### 7.2 New Model Heads
+
+Add the following heads:
+
+1. Homography head:
+
+\[
+\Delta p_{ab} = g_H(F_a, F_b).
+\]
+
+2. Consensus posterior head:
+
+\[
+q_{ab} = \sigma(g_q(F_a, F_b, r)).
+\]
+
+3. Uncertainty head:
+
+\[
+\log \sigma_{ab} = g_\sigma(F_a, F_b, r).
+\]
+
+4. Reliability head:
+
+\[
+s_{ab} = g_s(\phi_{ab}).
+\]
+
+### 7.3 Suggested Output Dictionary
+
+The forward pass should return:
+
+```
+{
+    "H_ab": H_ab,
+    "H_ba": H_ba,
+    "offset_ab": offset_ab,
+    "offset_ba": offset_ba,
+    "validity_prob_ab": q_ab,
+    "validity_prob_ba": q_ba,
+    "log_sigma_ab": log_sigma_ab,
+    "log_sigma_ba": log_sigma_ba,
+    "reliability_score": s_ab,
+    "residual_map_ab": r_ab,
+    "residual_map_ba": r_ba,
+    "loss_align": loss_align,
+    "loss_triplet": loss_triplet,
+    "loss_inv": loss_inv,
+    "loss_support": loss_support,
+    "loss_smooth": loss_smooth,
+    "loss_calib": loss_calib,
+    "loss_rel": loss_rel,
+    "loss_temp": loss_temp,
+    "loss_total": loss_total
+}
+```
+
+## 8. Dataset Plan
+
+### 8.1 Existing Dataset
+
+Use the current CA-Homography dataset structure:
+
+1. Regular scenes.
+2. Low-texture scenes.
+3. Low-light scenes.
+4. Small-foreground scenes.
+5. Large-foreground scenes.
+
+Use coordinate labels only for evaluation.
+
+### 8.2 Pair Sampling
+
+For ordinary training:
+
+\[
+(I_a, I_b)
+\]
+
+from the provided train list.
+
+For invalid-pair reliability training:
+
+1. Sample \(I_a\) from one video and \(I_b\) from another video.
+2. Sample very distant frames from the same video.
+3. Sample mismatched patches from different spatial locations.
+
+For temporal consistency:
+
+\[
+(I_t, I_{t+1}, I_{t+2})
+\]
+
+from the same video when frame ordering is recoverable from filenames.
+
+## 9. Evaluation Plan
+
+### 9.1 Accuracy Metrics
+
+Use the manually provided point correspondences for evaluation:
+
+\[
+e_j =
+\left\|
+\pi(H_{ab} x_j^a) - x_j^b
+\right\|_2.
+\]
+
+Mean reprojection error:
+
+\[
+E =
+\frac{1}{K}
+\sum_{j=1}^{K} e_j.
+\]
+
+Report:
+
+1. Mean reprojection error.
+2. Median reprojection error.
+3. AUC at 1, 3, and 5 pixels.
+4. Inlier ratio at 1, 3, and 5 pixels.
+5. Category-wise results for RE, LT, LL, SF, and LF.
+
+### 9.2 Trustworthiness Metrics
+
+Define failure by a threshold:
+
+\[
+y_{\text{fail}} = \mathbb{1}[E > \tau].
+\]
+
+Use \(\tau = 3\) pixels and \(\tau = 5\) pixels.
+
+Evaluate:
+
+1. AUROC for failure detection.
+2. AUPRC for failure detection.
+3. Expected calibration error.
+4. Negative log likelihood.
+5. Risk-coverage curves.
+6. Reliability diagrams.
+
+Risk-coverage is especially important:
+
+Sort predictions by reliability \(s_{ab}\). Reject the lowest-confidence predictions. Measure whether reprojection error decreases as coverage decreases.
+
+This demonstrates that the reliability score is useful, not cosmetic.
+
+### 9.3 Qualitative Results
+
+Show:
+
+1. Input pair.
+2. Warped result.
+3. Dominant-plane posterior \(q_i\).
+4. Uncertainty map \(\sigma_i\).
+5. Failure/reliability score \(s_{ab}\).
+6. Point reprojection visualization.
+
+Important qualitative cases:
+
+1. Moving foreground.
+2. Large foreground.
+3. Low texture.
+4. Low light.
+5. Strong parallax.
+6. Invalid pairs.
+
+## 10. Baselines
+
+Compare against:
+
+1. Identity homography.
+2. SIFT + RANSAC.
+3. SIFT + MAGSAC.
+4. ORB + RANSAC.
+5. SuperPoint + RANSAC or MAGSAC, if available.
+6. LoFTR + RANSAC or MAGSAC, if available.
+7. Original supervised deep homography.
+8. Nguyen et al. unsupervised deep homography.
+9. Zhang et al. content-aware unsupervised homography.
+10. Current Oneline-DLT repo implementation.
+11. BasesHomo, if reproducible.
+12. RHWF, if reproducible.
+13. GeoFormer, if reproducible.
+14. Mask-Homo or AGNet, if reproducible.
+
+If some recent baselines cannot be reproduced, clearly report:
+
+1. Whether official code is available.
+2. Whether pretrained weights are available.
+3. Whether the dataset format is compatible.
+4. Whether reimplementation would be unreliable.
+
+## 11. Ablation Studies
+
+Essential ablations:
+
+1. Baseline Oneline-DLT.
+2. Baseline plus bidirectional inverse consistency.
+3. Baseline plus ordinary mask.
+4. Baseline plus dominant-plane posterior.
+5. Dominant-plane posterior without uncertainty.
+6. Uncertainty without dominant-plane posterior.
+7. Dominant-plane posterior plus uncertainty.
+8. Full model without reliability head.
+9. Full model without invalid-pair training.
+10. Full model without temporal consistency.
+11. Full model without support regularization.
+12. Full model without calibration loss.
+13. Full model with one-scale features.
+14. Full model with multi-scale features.
+
+The most important ablation is:
+
+\[
+\text{ordinary attention mask}
+\quad \text{vs.} \quad
+\text{dominant-plane posterior with calibrated likelihood}.
+\]
+
+This distinguishes the paper from ECCV 2020.
+
+## 12. Expected Contributions For The Paper
+
+The paper should claim the following contributions:
+
+1. A probabilistic dominant-plane consensus formulation for unsupervised deep homography estimation.
+2. A joint prediction framework for homography, geometric validity posterior, spatial uncertainty, and pair-level reliability.
+3. A self-supervised training objective using robust feature likelihood, inverse consistency, support regularization, calibration, synthetic invalid pairs, and optional temporal composition.
+4. A trustworthiness evaluation protocol for homography estimation, including failure detection, calibration, and risk-coverage analysis.
+5. Improved accuracy and reliability on regular, low-texture, low-light, small-foreground, and large-foreground scenes.
+
+## 13. Implementation Milestones
+
+### Milestone 1: Reproduce Baseline
+
+1. Train or load the current Oneline-DLT model.
+2. Confirm evaluation on the existing test set.
+3. Record category-wise reprojection error.
+
+Deliverable:
+
+Baseline table and qualitative outputs.
+
+### Milestone 2: Bidirectional Model
+
+1. Predict \(H_{ab}\) and \(H_{ba}\).
+2. Add \(\mathcal{L}_{\text{inv}}\).
+3. Verify training stability.
+
+Deliverable:
+
+Bidirectional baseline.
+
+### Milestone 3: Dominant-Plane Posterior
+
+1. Replace `genMask` with posterior head \(q_i\).
+2. Add support and smoothness losses.
+3. Compare against ordinary mask.
+
+Deliverable:
+
+Consensus posterior ablation.
+
+### Milestone 4: Uncertainty And Calibration
+
+1. Add \(\log \sigma_i\) head.
+2. Add uncertainty-weighted likelihood.
+3. Add calibration loss.
+4. Produce reliability diagrams.
+
+Deliverable:
+
+Calibrated uncertainty results.
+
+### Milestone 5: Reliability Score
+
+1. Add pair-level reliability head.
+2. Generate synthetic invalid pairs.
+3. Train \(\mathcal{L}_{\text{rel}}\).
+4. Evaluate AUROC, AUPRC, and risk-coverage.
+
+Deliverable:
+
+Failure detection results.
+
+### Milestone 6: Temporal Consistency
+
+1. Add triplet sampler if frame order is recoverable.
+2. Add \(\mathcal{L}_{\text{temp}}\).
+3. Evaluate whether it improves consistency and accuracy.
+
+Deliverable:
+
+Temporal ablation.
+
+### Milestone 7: Final Experiments
+
+1. Run all ablations.
+2. Run all feasible baselines.
+3. Generate tables and visualizations.
+4. Write the TIP manuscript.
+
+Deliverable:
+
+Complete experimental package.
+
+## 14. Risks And Mitigations
+
+### Risk 1: Reviewers see the method as a mask variant
+
+Mitigation:
+
+Do not call \(q_i\) an attention mask. Define it as a latent dominant-plane posterior and evaluate calibration/failure detection.
+
+### Risk 2: Reliability score learns shortcuts
+
+Mitigation:
+
+Use multiple invalid-pair generation strategies and evaluate on real failure cases defined by point reprojection error.
+
+### Risk 3: Uncertainty map copies residuals
+
+Mitigation:
+
+Use stop-gradient targets only as a weak calibration term. The main training should be through likelihood.
+
+### Risk 4: Temporal consistency is unavailable
+
+Mitigation:
+
+Make temporal consistency optional. The core novelty does not depend on it.
+
+### Risk 5: Recent baselines are hard to reproduce
+
+Mitigation:
+
+Use all runnable official implementations. For non-runnable methods, cite them clearly and explain the reproducibility limitation.
+
+## 15. Recommended Paper Title
+
+Calibrated Dominant-Plane Consensus for Trustworthy Unsupervised Deep Homography Estimation
+
+Alternative titles:
+
+1. Trustworthy Deep Homography Estimation via Calibrated Dominant-Plane Consensus.
+2. Learning When A Homography Is Valid: Calibrated Consensus for Deep Image Alignment.
+3. Reliability-Aware Dominant-Plane Homography Estimation in Real-World Scenes.
+
+## 16. Final Recommendation
+
+The previous plan was too close to a module-combination story. This revised plan is stronger because it changes the problem formulation:
+
+From:
+
+\[
+(I_a, I_b) \rightarrow H_{ab}
+\]
+
+to:
+
+\[
+(I_a, I_b)
+\rightarrow
+\left(
+H_{ab},
+P(z_i = 1 \mid I_a, I_b),
+\sigma_i,
+s_{ab}
+\right).
+\]
+
+This makes the work about reliable geometric estimation under violated planar assumptions. That is a much better IEEE TIP narrative than simply improving the content-aware homography network.
