@@ -111,7 +111,7 @@ def train(args):
     # Running sums for periodic logging
     _sums = {k: 0.0 for k in
              ('total', 'align', 'triplet', 'inv', 'support', 'smooth',
-              'calib', 'rel_valid', 'rel_invalid', 'temp')}
+              'calib', 'offset', 'rel_valid', 'rel_invalid', 'temp')}
 
     for epoch in range(args.max_epoch):
         net.train()
@@ -165,6 +165,7 @@ def train(args):
             loss_sup_v   = out['loss_support'].mean()
             loss_smo_v   = out['loss_smooth'].mean()
             loss_cal_v   = out['loss_calib'].mean()
+            loss_off_v   = out['loss_offset'].mean()
             loss_rel_valid_v = out['loss_rel'].mean()
             loss_rel_invalid_v = loss_total.new_tensor(0.0)
             loss_temp_v = loss_total.new_tensor(0.0)
@@ -222,6 +223,7 @@ def train(args):
             _sums['support'] += loss_sup_v.item()
             _sums['smooth']  += loss_smo_v.item()
             _sums['calib']   += loss_cal_v.item()
+            _sums['offset']  += loss_off_v.item()
             _sums['rel_valid']   += loss_rel_valid_v.item()
             _sums['rel_invalid'] += loss_rel_invalid_v.item()
             _sums['temp']        += loss_temp_v.item()
@@ -231,13 +233,13 @@ def train(args):
                 print(
                     'Ep[{:03d}/{:03d}] It[{:05d}/{:05d}] '
                     'Total={:.4f} Align={:.4f} Tri={:.4f} '
-                    'Inv={:.4f} Sup={:.4f} Smo={:.4f} Cal={:.4f} '
+                    'Inv={:.4f} Sup={:.4f} Smo={:.4f} Cal={:.4f} Off={:.4f} '
                     'Rel+={:.4f} Rel-={:.4f} Temp={:.4f} '
                     'lr={:.2e}'.format(
                         epoch + 1, args.max_epoch, i + 1, len(train_loader),
                         avgs['total'], avgs['align'], avgs['triplet'],
                         avgs['inv'], avgs['support'], avgs['smooth'], avgs['calib'],
-                        avgs['rel_valid'], avgs['rel_invalid'], avgs['temp'],
+                        avgs['offset'], avgs['rel_valid'], avgs['rel_invalid'], avgs['temp'],
                         scheduler.get_last_lr()[0],
                     )
                 )
@@ -264,6 +266,7 @@ def train(args):
                 'support': loss_sup_v.item(),
                 'smooth':  loss_smo_v.item(),
                 'calib':   loss_cal_v.item(),
+                'offset':  loss_off_v.item(),
                 'rel_valid': loss_rel_valid_v.item(),
                 'rel_invalid': loss_rel_invalid_v.item(),
                 'temp': loss_temp_v.item(),

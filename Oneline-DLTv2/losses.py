@@ -35,6 +35,18 @@ def clamp_log_sigma(log_sigma):
     return torch.clamp(log_sigma, _LOG_SIGMA_MIN, _LOG_SIGMA_MAX)
 
 
+def positive_sigma(log_sigma):
+    """Map the raw uncertainty head output to a positive, well-behaved sigma."""
+    return F.softplus(clamp_log_sigma(log_sigma)) + _EPS
+
+
+def normalize_homography(H):
+    """Normalize homographies before matrix consistency losses."""
+    scale = H[:, 2:3, 2:3]
+    scale = torch.where(scale.abs() < _EPS, torch.ones_like(scale) * _EPS, scale)
+    return H / scale
+
+
 # ---------------------------------------------------------------------------
 # L_align  (Section 6.1)
 # ---------------------------------------------------------------------------
@@ -44,10 +56,11 @@ def _align_single(r, log_sigma, q, eps=_EPS):
     r, log_sigma, q : [B, 1, Ph, Pw]
     Returns scalar.
     """
-    log_sigma = clamp_log_sigma(log_sigma)
-    sigma = torch.exp(log_sigma).clamp(min=eps)
+    sigma = positive_sigma(log_sigma)
     robust = charbonnier(r / sigma)
-    per_pixel = q * (robust + log_sigma)
+    # Use a positive uncertainty penalty. Raw +log(sigma) can drive the
+    # objective negative and reward sigma collapse during early training.
+    per_pixel = q * (robust + torch.log1p(sigma))
     return per_pixel.sum() / (q.sum() + eps)
 
 
@@ -84,10 +97,22 @@ def loss_triplet(r_ab, d_neg_ab, q_ab,
 def loss_inv(H_ab, H_ba):
     """||H_ab H_ba - I||_F^2 averaged over batch."""
     B = H_ab.size(0)
+    H_ab = normalize_homography(H_ab)
+    H_ba = normalize_homography(H_ba)
+    prod = normalize_homography(torch.bmm(H_ab, H_ba))
     I = torch.eye(3, device=H_ab.device, dtype=H_ab.dtype) \
              .unsqueeze(0).expand(B, -1, -1)
-    diff = torch.bmm(H_ab, H_ba) - I
+    diff = prod - I
     return (diff ** 2).sum() / B
+
+
+# ---------------------------------------------------------------------------
+# L_offset
+# ---------------------------------------------------------------------------
+
+def loss_offset(offset_ab, offset_ba):
+    """Small stabilizer that discourages wild early DLT corner offsets."""
+    return 0.5 * (offset_ab.pow(2).mean() + offset_ba.pow(2).mean())
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +152,7 @@ def loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a, gamma=5.0):
 def loss_calib(log_sigma_ab, r_ab, log_sigma_ba, r_ba, eps=_EPS):
     """Weak self-supervised calibration via stop-gradient residual targets."""
     def _single(log_sigma, r):
-        log_sigma = clamp_log_sigma(log_sigma)
+        log_sigma = torch.log(positive_sigma(log_sigma))
         log_r_sg = clamp_log_sigma(torch.log(r.detach() + eps))
         return torch.abs(log_sigma - log_r_sg).mean()
     return _single(log_sigma_ab, r_ab) + _single(log_sigma_ba, r_ba)
@@ -167,9 +192,9 @@ def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
 # Total loss  (Section 6.9)
 # ---------------------------------------------------------------------------
 
-def compute_total_loss(la, lt, li, ls, lsm, lc, lr=None, ltmp=None,
+def compute_total_loss(la, lt, li, ls, lsm, lc, lo=None, lr=None, ltmp=None,
                        lam1=1.0, lam2=0.01, lam3=0.01,
-                       lam4=0.001, lam5=0.05, lam6=0.1, lam7=0.1,
+                       lam4=0.001, lam5=0.1, lam6=1e-4, lam7=0.1, lam8=0.1,
                        include_geometric=True):
     """
     la  = L_align
@@ -178,14 +203,17 @@ def compute_total_loss(la, lt, li, ls, lsm, lc, lr=None, ltmp=None,
     ls  = L_support  (weight lam3)
     lsm = L_smooth   (weight lam4)
     lc  = L_calib    (weight lam5)
-    lr  = L_rel      (weight lam6)
-    ltmp= L_temp     (weight lam7)
+    lo  = L_offset   (weight lam6)
+    lr  = L_rel      (weight lam7)
+    ltmp= L_temp     (weight lam8)
     """
     total = la.new_tensor(0.0)
     if include_geometric:
         total = total + la + lam1 * lt + lam2 * li + lam3 * ls + lam4 * lsm + lam5 * lc
+        if lo is not None:
+            total = total + lam6 * lo
     if lr is not None:
-        total = total + lam6 * lr
+        total = total + lam7 * lr
     if ltmp is not None:
-        total = total + lam7 * ltmp
+        total = total + lam8 * ltmp
     return total

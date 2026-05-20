@@ -13,7 +13,7 @@ import torch.nn as nn
 from utils import transform, DLT_solve
 from losses import (loss_align, loss_triplet, loss_inv,
                     loss_support, loss_smooth, loss_calib,
-                    loss_reliability, compute_total_loss,
+                    loss_offset, loss_reliability, compute_total_loss,
                     clamp_log_sigma)
 
 __all__ = ['ResNetCDPC', 'resnet18_cdpc', 'resnet34_cdpc',
@@ -214,6 +214,8 @@ class ResNetCDPC(nn.Module):
         )
 
         self._init_weights()
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
 
     # ------------------------------------------------------------------
     def _make_layer(self, block, planes, blocks, stride=1):
@@ -405,10 +407,11 @@ class ResNetCDPC(nn.Module):
         ls  = loss_support(q_ab, q_ba)
         lsm = loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a)
         lc  = loss_calib(log_sigma_ab, r_ab, log_sigma_ba, r_ba)
+        lo  = loss_offset(offset_ab, offset_ba)
         lr = loss_reliability(s_ab, rel_label) if rel_label is not None else la.new_tensor(0.0)
         ltmp = la.new_tensor(0.0)
         lt_total = compute_total_loss(
-            la, lt, li, ls, lsm, lc, lr=lr,
+            la, lt, li, ls, lsm, lc, lo=lo, lr=lr,
             include_geometric=compute_geometric,
         )
 
@@ -436,6 +439,7 @@ class ResNetCDPC(nn.Module):
             'loss_support': ls,
             'loss_smooth':  lsm,
             'loss_calib':   lc,
+            'loss_offset':  lo,
             'loss_rel':     lr,
             'loss_temp':    ltmp,
             'loss_total':   lt_total,
