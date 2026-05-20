@@ -14,7 +14,7 @@ _IMAGENET_URLS = {
 _EXCLUDE = {'conv1.weight', 'fc.weight', 'fc.bias'}
 
 
-def build_model(model_name, pretrained=False):
+def build_model(model_name, pretrained=False, **model_kwargs):
     """
     Build a ResNetCDPC model.  pretrained=True loads ImageNet backbone
     weights into the ResNet trunk (conv2-layer4) while leaving the new
@@ -30,7 +30,7 @@ def build_model(model_name, pretrained=False):
         raise ValueError('Unsupported model: {}. Choose from {}'.format(
             model_name, list(builders.keys())))
 
-    model = builders[model_name]()
+    model = builders[model_name](**model_kwargs)
 
     if pretrained and model_name in _IMAGENET_URLS:
         pretrained_dict = model_zoo.load_url(_IMAGENET_URLS[model_name])

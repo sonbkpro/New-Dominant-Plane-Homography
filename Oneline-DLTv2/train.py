@@ -3,8 +3,10 @@
 Training script for Calibrated Dominant-Plane Consensus (CDPC) homography.
 
 Key differences from Oneline-DLTv1/train.py:
-  - Total loss = L_align + 1.0*L_triplet + 0.01*L_inv + 0.01*L_support
+  - Strict Oneline CDPC: learns H_ab only; loss_inv is logged as zero.
+  - Total loss defaults to L_align + 0.1*L_triplet + 0.01*L_support
                          + 0.001*L_smooth + 0.05*L_calib
+                         + 0.1*L_rel + a small offset stabilizer.
   - TensorBoard logs each loss component separately.
   - Model saved under train_log_CDPC/.
 """
@@ -60,7 +62,18 @@ def _to_device(tensor):
 
 def train(args):
     train_path = os.path.join(exp_name, 'Data/Train_List.txt')
-    net = build_model(args.model_name, pretrained=args.pretrained)
+    net = build_model(
+        args.model_name,
+        pretrained=args.pretrained,
+        triplet_margin=args.triplet_margin,
+        lambda_triplet=args.lambda_triplet,
+        lambda_support=args.lambda_support,
+        lambda_smooth=args.lambda_smooth,
+        lambda_calib=args.lambda_calib,
+        lambda_offset=args.lambda_offset,
+        lambda_rel=args.lambda_rel,
+        lambda_temp=args.lambda_temp,
+    )
 
     if args.finetune:
         model_path = _maybe_join(exp_name, args.model_path)
@@ -111,7 +124,10 @@ def train(args):
     # Running sums for periodic logging
     _sums = {k: 0.0 for k in
              ('total', 'align', 'triplet', 'inv', 'support', 'smooth',
-              'calib', 'offset', 'rel_valid', 'rel_invalid', 'temp')}
+              'calib', 'offset', 'rel_valid', 'rel_invalid', 'temp',
+              'triplet_weight', 'triplet_d_pos', 'triplet_d_neg',
+              'triplet_gap', 'triplet_margin_gap', 'triplet_active',
+              'q_mean', 'q_std')}
 
     for epoch in range(args.max_epoch):
         net.train()
@@ -152,10 +168,16 @@ def train(args):
             # ---- Forward / backward ----
             optimizer.zero_grad()
             valid_label = torch.ones(org_imges.size(0), 1, device=org_imges.device)
+            if args.triplet_warmup_iters > 0:
+                warmup_ratio = min(1.0, float(glob_iter + 1) / float(args.triplet_warmup_iters))
+            else:
+                warmup_ratio = 1.0
+            current_triplet_weight = args.lambda_triplet * warmup_ratio
             out = net(
                 org_imges, input_tesnors, h4p, patch_indices,
                 rel_label=valid_label,
                 compute_geometric=True,
+                triplet_weight=current_triplet_weight,
             )
 
             loss_total   = out['loss_total'].mean()
@@ -169,6 +191,14 @@ def train(args):
             loss_rel_valid_v = out['loss_rel'].mean()
             loss_rel_invalid_v = loss_total.new_tensor(0.0)
             loss_temp_v = loss_total.new_tensor(0.0)
+            triplet_weight_v = out['triplet_weight'].mean()
+            triplet_d_pos_v = out['triplet_d_pos'].mean()
+            triplet_d_neg_v = out['triplet_d_neg'].mean()
+            triplet_gap_v = out['triplet_gap'].mean()
+            triplet_margin_gap_v = out['triplet_margin_gap'].mean()
+            triplet_active_v = out['triplet_active'].mean()
+            q_mean_v = out['q_mean'].mean()
+            q_std_v = out['q_std'].mean()
 
             if args.use_invalid:
                 invalid_org = _to_device(batch_value['invalid_org'].float())
@@ -182,6 +212,7 @@ def train(args):
                     invalid_org, invalid_input, invalid_h4p, invalid_patch_indices,
                     rel_label=invalid_label,
                     compute_geometric=False,
+                    triplet_weight=current_triplet_weight,
                 )
                 loss_total = loss_total + out_invalid['loss_total'].mean()
                 loss_rel_invalid_v = out_invalid['loss_rel'].mean()
@@ -193,6 +224,7 @@ def train(args):
                     _to_device(batch_value['triplet01_h4p'].float()),
                     _to_device(batch_value['triplet01_patch_indices'].float()),
                     compute_geometric=False,
+                    triplet_weight=current_triplet_weight,
                 )
                 t12 = net(
                     _to_device(batch_value['triplet12_org'].float()),
@@ -200,6 +232,7 @@ def train(args):
                     _to_device(batch_value['triplet12_h4p'].float()),
                     _to_device(batch_value['triplet12_patch_indices'].float()),
                     compute_geometric=False,
+                    triplet_weight=current_triplet_weight,
                 )
                 t02 = net(
                     _to_device(batch_value['triplet02_org'].float()),
@@ -207,6 +240,7 @@ def train(args):
                     _to_device(batch_value['triplet02_h4p'].float()),
                     _to_device(batch_value['triplet02_patch_indices'].float()),
                     compute_geometric=False,
+                    triplet_weight=current_triplet_weight,
                 )
                 triplet_available = _to_device(batch_value['triplet_available'].float()).mean()
                 loss_temp_v = loss_temporal(t02['H_ab'], t12['H_ab'], t01['H_ab']) * triplet_available
@@ -227,6 +261,14 @@ def train(args):
             _sums['rel_valid']   += loss_rel_valid_v.item()
             _sums['rel_invalid'] += loss_rel_invalid_v.item()
             _sums['temp']        += loss_temp_v.item()
+            _sums['triplet_weight'] += triplet_weight_v.item()
+            _sums['triplet_d_pos'] += triplet_d_pos_v.item()
+            _sums['triplet_d_neg'] += triplet_d_neg_v.item()
+            _sums['triplet_gap'] += triplet_gap_v.item()
+            _sums['triplet_margin_gap'] += triplet_margin_gap_v.item()
+            _sums['triplet_active'] += triplet_active_v.item()
+            _sums['q_mean'] += q_mean_v.item()
+            _sums['q_std'] += q_std_v.item()
 
             if i % PRINT_FREQ == 0 and i != 0:
                 avgs = {k: v / PRINT_FREQ for k, v in _sums.items()}
@@ -235,11 +277,16 @@ def train(args):
                     'Total={:.4f} Align={:.4f} Tri={:.4f} '
                     'Inv={:.4f} Sup={:.4f} Smo={:.4f} Cal={:.4f} Off={:.4f} '
                     'Rel+={:.4f} Rel-={:.4f} Temp={:.4f} '
+                    'TriW={:.3f} Dp={:.4f} Dn={:.4f} Gap={:.4f} '
+                    'HAct={:.3f} Qm={:.3f} Qs={:.3f} '
                     'lr={:.2e}'.format(
                         epoch + 1, args.max_epoch, i + 1, len(train_loader),
                         avgs['total'], avgs['align'], avgs['triplet'],
                         avgs['inv'], avgs['support'], avgs['smooth'], avgs['calib'],
                         avgs['offset'], avgs['rel_valid'], avgs['rel_invalid'], avgs['temp'],
+                        avgs['triplet_weight'], avgs['triplet_d_pos'], avgs['triplet_d_neg'],
+                        avgs['triplet_gap'], avgs['triplet_active'],
+                        avgs['q_mean'], avgs['q_std'],
                         scheduler.get_last_lr()[0],
                     )
                 )
@@ -270,6 +317,19 @@ def train(args):
                 'rel_valid': loss_rel_valid_v.item(),
                 'rel_invalid': loss_rel_invalid_v.item(),
                 'temp': loss_temp_v.item(),
+            }, glob_iter)
+            writer.add_scalars('TripletDiagnostics', {
+                'weight': triplet_weight_v.item(),
+                'margin': out['triplet_margin'].mean().item(),
+                'd_pos': triplet_d_pos_v.item(),
+                'd_neg': triplet_d_neg_v.item(),
+                'gap': triplet_gap_v.item(),
+                'margin_gap': triplet_margin_gap_v.item(),
+                'active_ratio': triplet_active_v.item(),
+            }, glob_iter)
+            writer.add_scalars('ConsensusDiagnostics', {
+                'q_mean': q_mean_v.item(),
+                'q_std': q_std_v.item(),
             }, glob_iter)
             writer.add_scalar('lr', scheduler.get_last_lr()[0], glob_iter)
 
@@ -307,6 +367,17 @@ if __name__ == '__main__':
     parser.add_argument('--use_temporal', type=str2bool, default=False,
                         help='Enable optional temporal composition loss.')
     parser.add_argument('--lambda_temp', type=float, default=0.1)
+    parser.add_argument('--triplet_margin', type=float, default=0.2,
+                        help='Triplet hinge margin. Use 1.0 to reproduce the old v1-style setting.')
+    parser.add_argument('--lambda_triplet', type=float, default=0.1,
+                        help='Triplet loss weight. Lower default avoids constant-triplet domination.')
+    parser.add_argument('--triplet_warmup_iters', type=int, default=4000,
+                        help='Linearly ramp lambda_triplet over the first N iterations.')
+    parser.add_argument('--lambda_support', type=float, default=0.01)
+    parser.add_argument('--lambda_smooth', type=float, default=0.001)
+    parser.add_argument('--lambda_calib', type=float, default=0.05)
+    parser.add_argument('--lambda_offset', type=float, default=1e-4)
+    parser.add_argument('--lambda_rel', type=float, default=0.1)
 
     print('<==================== Loading data ===================>\n')
     args = parser.parse_args()

@@ -11,10 +11,10 @@ Architecture additions over Oneline-DLTv1:
 import torch
 import torch.nn as nn
 from utils import transform, DLT_solve
-from losses import (loss_align, loss_triplet,
+from losses import (loss_align, loss_triplet, triplet_diagnostics,
                     loss_support, loss_smooth, loss_calib,
                     loss_offset, loss_reliability, compute_total_loss,
-                    clamp_log_sigma)
+                    clamp_log_sigma, positive_sigma)
 
 __all__ = ['ResNetCDPC', 'resnet18_cdpc', 'resnet34_cdpc',
            'resnet50_cdpc', 'resnet101_cdpc']
@@ -175,9 +175,21 @@ class ResNetCDPC(nn.Module):
         pred_I2_d, patch_2_res_d, pred_F2_d, mask_ap_d          – visualisation
     """
 
-    def __init__(self, block, layers, num_classes=8):
+    def __init__(self, block, layers, num_classes=8,
+                 triplet_margin=0.2, lambda_triplet=0.1,
+                 lambda_support=0.01, lambda_smooth=0.001,
+                 lambda_calib=0.05, lambda_offset=1e-4,
+                 lambda_rel=0.1, lambda_temp=0.1):
         self.inplanes = 64
         super().__init__()
+        self.triplet_margin = triplet_margin
+        self.lambda_triplet = lambda_triplet
+        self.lambda_support = lambda_support
+        self.lambda_smooth = lambda_smooth
+        self.lambda_calib = lambda_calib
+        self.lambda_offset = lambda_offset
+        self.lambda_rel = lambda_rel
+        self.lambda_temp = lambda_temp
 
         # --- Backbone (2-channel input: concat of masked features) ---
         self.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2,
@@ -266,7 +278,7 @@ class ResNetCDPC(nn.Module):
         B = q.size(0)
         q_flat  = q.reshape(B, -1)
         r_flat  = r.reshape(B, -1)
-        sig_flat = torch.exp(log_sigma).reshape(B, -1)
+        sig_flat = positive_sigma(log_sigma).reshape(B, -1)
 
         q_mean   = q_flat.mean(1)
         q_var    = q_flat.var(1)
@@ -282,7 +294,8 @@ class ResNetCDPC(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, org_imges, input_tesnors, h4p, patch_indices,
-                rel_label=None, compute_geometric=True):
+                rel_label=None, compute_geometric=True,
+                triplet_weight=None):
         """
         org_imges    : [B, 2, H, W]   full image pair (normalised, grayscale)
         input_tesnors: [B, 2, Ph, Pw] patch pair
@@ -363,7 +376,7 @@ class ResNetCDPC(nn.Module):
         img_patch_b = input_tesnors[:, 1:, ...]   # for edge weights in L_smooth
 
         la  = loss_align(r_ab, log_sigma_ab, q_ab)
-        lt  = loss_triplet(r_ab, d_neg_ab, q_ab)
+        lt  = loss_triplet(r_ab, d_neg_ab, q_ab, m=self.triplet_margin)
         li  = la.new_tensor(0.0)
         ls  = loss_support(q_ab)
         lsm = loss_smooth(q_ab, img_patch_b)
@@ -371,8 +384,17 @@ class ResNetCDPC(nn.Module):
         lo  = loss_offset(offset_ab)
         lr = loss_reliability(s_ab, rel_label) if rel_label is not None else la.new_tensor(0.0)
         ltmp = la.new_tensor(0.0)
+        lt_diag = triplet_diagnostics(r_ab, d_neg_ab, q_ab, m=self.triplet_margin)
+        lam_triplet = self.lambda_triplet if triplet_weight is None else triplet_weight
         lt_total = compute_total_loss(
             la, lt, ls, lsm, lc, lo=lo, lr=lr,
+            lam_triplet=lam_triplet,
+            lam_support=self.lambda_support,
+            lam_smooth=self.lambda_smooth,
+            lam_calib=self.lambda_calib,
+            lam_offset=self.lambda_offset,
+            lam_rel=self.lambda_rel,
+            lam_temp=self.lambda_temp,
             include_geometric=compute_geometric,
         )
 
@@ -399,6 +421,9 @@ class ResNetCDPC(nn.Module):
             'loss_rel':     lr,
             'loss_temp':    ltmp,
             'loss_total':   lt_total,
+            'triplet_weight': la.new_tensor(float(lam_triplet)),
+            'triplet_margin': la.new_tensor(float(self.triplet_margin)),
+            **lt_diag,
             # Visualisation (first sample only)
             'pred_I2_d':            pred_I2[:1, ...],
             'patch_2_res_d':        F2_ab[:1, ...],

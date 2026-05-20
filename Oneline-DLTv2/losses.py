@@ -64,18 +64,46 @@ def loss_align(r_ab, log_sigma_ab, q_ab, eps=_EPS):
 # L_triplet  (Section 6.2)
 # ---------------------------------------------------------------------------
 
-def _triplet_single(d_pos, d_neg, q, m=1.0, eps=_EPS):
+def _triplet_hinge(d_pos, d_neg, m):
+    return torch.clamp(m + d_pos - d_neg, min=0.0)
+
+
+def _triplet_single(d_pos, d_neg, q, m=0.2, eps=_EPS):
     """
     d_pos = |F_b - W(F_a, H_ab)|  (residual after alignment)
     d_neg = |F_b - F_a|           (difference without alignment)
     q     : [B, 1, Ph, Pw]
     """
-    hinge = torch.clamp(m + d_pos - d_neg, min=0.0)
+    hinge = _triplet_hinge(d_pos, d_neg, m)
     return (q * hinge).sum() / (q.sum() + eps)
 
 
-def loss_triplet(r_ab, d_neg_ab, q_ab, m=1.0, eps=_EPS):
+def loss_triplet(r_ab, d_neg_ab, q_ab, m=0.2, eps=_EPS):
     return _triplet_single(r_ab, d_neg_ab, q_ab, m, eps)
+
+
+def triplet_diagnostics(r_ab, d_neg_ab, q_ab, m=0.2, eps=_EPS):
+    """Detached scalar diagnostics for checking whether the triplet is saturated."""
+    with torch.no_grad():
+        q_sum = q_ab.sum() + eps
+        d_pos_mean = (q_ab * r_ab).sum() / q_sum
+        d_neg_mean = (q_ab * d_neg_ab).sum() / q_sum
+        raw_gap = d_pos_mean - d_neg_mean
+        hinge = _triplet_hinge(r_ab, d_neg_ab, m)
+        active = (hinge > 0.0).to(dtype=q_ab.dtype)
+        active_ratio = (q_ab * active).sum() / q_sum
+        margin_gap = (q_ab * (m + r_ab - d_neg_ab)).sum() / q_sum
+        q_mean = q_ab.mean()
+        q_std = q_ab.std()
+    return {
+        'triplet_d_pos': d_pos_mean,
+        'triplet_d_neg': d_neg_mean,
+        'triplet_gap': raw_gap,
+        'triplet_margin_gap': margin_gap,
+        'triplet_active': active_ratio,
+        'q_mean': q_mean,
+        'q_std': q_std,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +192,7 @@ def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
 # ---------------------------------------------------------------------------
 
 def compute_total_loss(la, lt, ls, lsm, lc, lo=None, lr=None, ltmp=None,
-                       lam_triplet=1.0, lam_support=0.01,
+                       lam_triplet=0.1, lam_support=0.01,
                        lam_smooth=0.001, lam_calib=0.05,
                        lam_offset=1e-4, lam_rel=0.1, lam_temp=0.1,
                        include_geometric=True):
