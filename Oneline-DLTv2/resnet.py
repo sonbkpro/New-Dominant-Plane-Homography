@@ -5,13 +5,13 @@ Architecture additions over Oneline-DLTv1:
   ConsensusHead   – replaces genMask; outputs q_ab = P(z_i=1 | I_a, I_b)
   UncertaintyHead – predicts log_sigma_i (spatial uncertainty)
   ReliabilityHead – MLP predicting scalar s_ab = P(H reliable | I_a, I_b)
-  Bidirectional   – both H_ab and H_ba via shared backbone, swapped concat
+  Strict Oneline  – predicts only H_ab for stable single-homography training
 """
 
 import torch
 import torch.nn as nn
 from utils import transform, DLT_solve
-from losses import (loss_align, loss_triplet, loss_inv,
+from losses import (loss_align, loss_triplet,
                     loss_support, loss_smooth, loss_calib,
                     loss_offset, loss_reliability, compute_total_loss,
                     clamp_log_sigma)
@@ -165,13 +165,13 @@ class ResNetCDPC(nn.Module):
     Calibrated Dominant-Plane Consensus model.
 
     Outputs (forward dict):
-        H_ab, H_ba               – bidirectional homographies  [B,3,3]
-        offset_ab, offset_ba     – DLT corner offsets           [B,8]
-        validity_prob_ab/ba      – consensus posterior q_i       [B,1,Ph,Pw]
-        log_sigma_ab/ba          – spatial log-uncertainty       [B,1,Ph,Pw]
+        H_ab                     – Oneline homography            [B,3,3]
+        offset_ab                – DLT corner offsets            [B,8]
+        validity_prob_ab         – consensus posterior q_i       [B,1,Ph,Pw]
+        log_sigma_ab             – spatial log-uncertainty       [B,1,Ph,Pw]
         reliability_score        – pair-level reliability s_ab   [B,1]
-        residual_map_ab/ba       – |F_b - W(F_a,H)|             [B,1,Ph,Pw]
-        loss_align/triplet/inv/support/smooth/calib/total
+        residual_map_ab          – |F_b - W(F_a,H_ab)|          [B,1,Ph,Pw]
+        loss_align/triplet/support/smooth/calib/rel/total
         pred_I2_d, patch_2_res_d, pred_F2_d, mask_ap_d          – visualisation
     """
 
@@ -257,11 +257,11 @@ class ResNetCDPC(nn.Module):
         x = self.fc(x)                            # [B, 8]
         return x
 
-    def _reliability_features(self, q, r, log_sigma, H_ab, H_ba, tau=0.5):
+    def _reliability_features(self, q, r, log_sigma, offset_ab, tau=0.5):
         """
         Assemble the 7-dim reliability feature vector phi_ab (Section 5.6):
           [mean(q), var(q), area(q>tau), mean(r), mean(q*r),
-           mean(sigma), ||H_ab H_ba - I||_F]
+           mean(sigma), ||offset_ab||_2]
         """
         B = q.size(0)
         q_flat  = q.reshape(B, -1)
@@ -274,13 +274,10 @@ class ResNetCDPC(nn.Module):
         r_mean   = r_flat.mean(1)
         qr_mean  = (q_flat * r_flat).mean(1)
         s_mean   = sig_flat.mean(1)
-
-        I3 = torch.eye(3, device=H_ab.device, dtype=H_ab.dtype) \
-                   .unsqueeze(0).expand(B, -1, -1)
-        inv_err = torch.norm((torch.bmm(H_ab, H_ba) - I3).reshape(B, -1), dim=1)
+        offset_norm = torch.norm(offset_ab.reshape(B, -1), dim=1)
 
         return torch.stack(
-            [q_mean, q_var, q_area, r_mean, qr_mean, s_mean, inv_err], dim=1
+            [q_mean, q_var, q_area, r_mean, qr_mean, s_mean, offset_norm], dim=1
         )   # [B, 7]
 
     # ------------------------------------------------------------------
@@ -315,63 +312,37 @@ class ResNetCDPC(nn.Module):
         F1 = self.ShareFeature(input_tesnors[:, :1, ...])   # [B, 1, Ph, Pw]
         F2 = self.ShareFeature(input_tesnors[:, 1:, ...])   # [B, 1, Ph, Pw]
 
-        # ---- 2. Consensus posterior (full img → patch region) -------
-        # ConsensusHead receives 2-channel input (I_a, I_b).
-        # For H_ba direction, channels are swapped.
-        q_ab_full = self.ConsensusPriorHead(org_imges)                   # [B,1,H,W]
-        q_ba_full = self.ConsensusPriorHead(org_imges[:, [1, 0], ...])   # swapped
-
+        # ---- 2. Consensus prior (full img -> patch region) ----------
+        q_ab_full = self.ConsensusPriorHead(org_imges)   # [B,1,H,W]
         q_ab_prior = getPatchFromFullimg(Ph, Pw, patch_indices, batch_idx, q_ab_full)
-        q_ba_prior = getPatchFromFullimg(Ph, Pw, patch_indices, batch_idx, q_ba_full)
-
         q_ab_w = normMask(q_ab_prior)   # normalised for initial feature gating
-        q_ba_w = normMask(q_ba_prior)
 
         # ---- 3. Initial consensus-weighted estimate -----------------
         # H_ab: source = I_a (F1), target = I_b (F2)
         F1_ab = torch.mul(F1, q_ab_w)
         F2_ab = torch.mul(F2, q_ab_w)
-        # H_ba: source = I_b (F2), target = I_a (F1) – swapped concat
-        F2_ba = torch.mul(F2, q_ba_w)
-        F1_ba = torch.mul(F1, q_ba_w)
 
         offset_ab0 = self._run_backbone(F1_ab, F2_ab)   # [B, 8]
-        offset_ba0 = self._run_backbone(F2_ba, F1_ba)   # [B, 8]  (swapped)
-
         H_ab0 = DLT_solve(h4p, offset_ab0).squeeze(1)   # [B, 3, 3]
-        H_ba0 = DLT_solve(h4p, offset_ba0).squeeze(1)   # [B, 3, 3]
 
         pred_I2_0 = transform(Ph, Pw, M_tile_inv, H_ab0, M_tile,
                               org_imges[:, :1, ...],
                               patch_indices, batch_idx)
         pred_F2_0 = self.ShareFeature(pred_I2_0)
-        pred_I1_0 = transform(Ph, Pw, M_tile_inv, H_ba0, M_tile,
-                              org_imges[:, 1:, ...],
-                              patch_indices, batch_idx)
-        pred_F1_0 = self.ShareFeature(pred_I1_0)
 
         r_ab0 = torch.abs(F2 - pred_F2_0)
-        r_ba0 = torch.abs(F1 - pred_F1_0)
 
         # ---- 4. Residual-conditioned posterior and uncertainty ------
         q_ab = self.ConsensusHead(torch.cat((F1, F2, r_ab0), dim=1))
-        q_ba = self.ConsensusHead(torch.cat((F2, F1, r_ba0), dim=1))
         log_sigma_ab = clamp_log_sigma(self.UncertaintyHead(torch.cat((F1, F2, r_ab0), dim=1)))
-        log_sigma_ba = clamp_log_sigma(self.UncertaintyHead(torch.cat((F2, F1, r_ba0), dim=1)))
 
         # ---- 5. Final estimate with residual-conditioned consensus ---
         q_ab_w = normMask(q_ab)
-        q_ba_w = normMask(q_ba)
         F1_ab = torch.mul(F1, q_ab_w)
         F2_ab = torch.mul(F2, q_ab_w)
-        F2_ba = torch.mul(F2, q_ba_w)
-        F1_ba = torch.mul(F1, q_ba_w)
 
         offset_ab = self._run_backbone(F1_ab, F2_ab)
-        offset_ba = self._run_backbone(F2_ba, F1_ba)
-
         H_ab = DLT_solve(h4p, offset_ab).squeeze(1)
-        H_ba = DLT_solve(h4p, offset_ba).squeeze(1)
 
         # ---- 6. Warp and final residuals ---------------------------
         pred_I2 = transform(Ph, Pw, M_tile_inv, H_ab, M_tile,
@@ -379,39 +350,29 @@ class ResNetCDPC(nn.Module):
                             patch_indices, batch_idx)
         pred_F2 = self.ShareFeature(pred_I2)
 
-        pred_I1 = transform(Ph, Pw, M_tile_inv, H_ba, M_tile,
-                            org_imges[:, 1:, ...],
-                            patch_indices, batch_idx)
-        pred_F1 = self.ShareFeature(pred_I1)
-
         r_ab = torch.abs(F2 - pred_F2)
-        r_ba = torch.abs(F1 - pred_F1)
 
         # d_neg: feature distance without alignment
         d_neg_ab = torch.abs(F2 - F1)
-        d_neg_ba = torch.abs(F1 - F2)
 
         # ---- 7. Reliability score ----------------------------------
-        phi = self._reliability_features(q_ab, r_ab, log_sigma_ab, H_ab, H_ba)
+        phi = self._reliability_features(q_ab, r_ab, log_sigma_ab, offset_ab)
         s_ab = self.ReliabilityHead(phi.detach())   # [B, 1]
 
         # ---- 8. Losses ---------------------------------------------
         img_patch_b = input_tesnors[:, 1:, ...]   # for edge weights in L_smooth
-        img_patch_a = input_tesnors[:, :1, ...]
 
-        la  = loss_align(r_ab, log_sigma_ab, q_ab,
-                         r_ba, log_sigma_ba, q_ba)
-        lt  = loss_triplet(r_ab, d_neg_ab, q_ab,
-                           r_ba, d_neg_ba, q_ba)
-        li  = loss_inv(H_ab, H_ba)
-        ls  = loss_support(q_ab, q_ba)
-        lsm = loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a)
-        lc  = loss_calib(log_sigma_ab, r_ab, log_sigma_ba, r_ba)
-        lo  = loss_offset(offset_ab, offset_ba)
+        la  = loss_align(r_ab, log_sigma_ab, q_ab)
+        lt  = loss_triplet(r_ab, d_neg_ab, q_ab)
+        li  = la.new_tensor(0.0)
+        ls  = loss_support(q_ab)
+        lsm = loss_smooth(q_ab, img_patch_b)
+        lc  = loss_calib(log_sigma_ab, r_ab)
+        lo  = loss_offset(offset_ab)
         lr = loss_reliability(s_ab, rel_label) if rel_label is not None else la.new_tensor(0.0)
         ltmp = la.new_tensor(0.0)
         lt_total = compute_total_loss(
-            la, lt, li, ls, lsm, lc, lo=lo, lr=lr,
+            la, lt, ls, lsm, lc, lo=lo, lr=lr,
             include_geometric=compute_geometric,
         )
 
@@ -419,19 +380,14 @@ class ResNetCDPC(nn.Module):
         return {
             # Homographies
             'H_ab': H_ab,
-            'H_ba': H_ba,
             'H_mat': H_ab,          # backward-compat alias for test.py
             'offset_ab': offset_ab,
-            'offset_ba': offset_ba,
             # Probabilistic outputs
             'validity_prob_ab': q_ab,
-            'validity_prob_ba': q_ba,
             'log_sigma_ab': log_sigma_ab,
-            'log_sigma_ba': log_sigma_ba,
             'reliability_score': s_ab,
             # Residuals
             'residual_map_ab': r_ab,
-            'residual_map_ba': r_ba,
             # Losses
             'loss_align':   la,
             'loss_triplet': lt,

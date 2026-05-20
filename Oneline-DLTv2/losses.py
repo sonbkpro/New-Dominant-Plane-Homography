@@ -2,9 +2,8 @@
 Loss functions for Calibrated Dominant-Plane Consensus Homography Estimation.
 
 Active losses (Milestones 2-4):
-  L_align   – robust uncertainty-weighted feature alignment (bidirectional)
-  L_triplet – consensus-weighted triplet margin loss (bidirectional)
-  L_inv     – inverse consistency  ||H_ab H_ba - I||_F^2
+  L_align   – robust uncertainty-weighted feature alignment (Oneline H_ab)
+  L_triplet – consensus-weighted triplet margin loss (Oneline H_ab)
   L_support – prevent posterior collapse:  max(0, alpha - mean(q))^2
   L_smooth  – edge-aware TV on consensus map q
   L_calib   – uncertainty calibration via stop-gradient residuals
@@ -40,13 +39,6 @@ def positive_sigma(log_sigma):
     return F.softplus(clamp_log_sigma(log_sigma)) + _EPS
 
 
-def normalize_homography(H):
-    """Normalize homographies before matrix consistency losses."""
-    scale = H[:, 2:3, 2:3]
-    scale = torch.where(scale.abs() < _EPS, torch.ones_like(scale) * _EPS, scale)
-    return H / scale
-
-
 # ---------------------------------------------------------------------------
 # L_align  (Section 6.1)
 # ---------------------------------------------------------------------------
@@ -64,10 +56,8 @@ def _align_single(r, log_sigma, q, eps=_EPS):
     return per_pixel.sum() / (q.sum() + eps)
 
 
-def loss_align(r_ab, log_sigma_ab, q_ab,
-               r_ba, log_sigma_ba, q_ba, eps=_EPS):
-    return _align_single(r_ab, log_sigma_ab, q_ab, eps) + \
-           _align_single(r_ba, log_sigma_ba, q_ba, eps)
+def loss_align(r_ab, log_sigma_ab, q_ab, eps=_EPS):
+    return _align_single(r_ab, log_sigma_ab, q_ab, eps)
 
 
 # ---------------------------------------------------------------------------
@@ -84,56 +74,37 @@ def _triplet_single(d_pos, d_neg, q, m=1.0, eps=_EPS):
     return (q * hinge).sum() / (q.sum() + eps)
 
 
-def loss_triplet(r_ab, d_neg_ab, q_ab,
-                 r_ba, d_neg_ba, q_ba, m=1.0, eps=_EPS):
-    return _triplet_single(r_ab, d_neg_ab, q_ab, m, eps) + \
-           _triplet_single(r_ba, d_neg_ba, q_ba, m, eps)
-
-
-# ---------------------------------------------------------------------------
-# L_inv  (Section 6.3)
-# ---------------------------------------------------------------------------
-
-def loss_inv(H_ab, H_ba):
-    """||H_ab H_ba - I||_F^2 averaged over batch."""
-    B = H_ab.size(0)
-    H_ab = normalize_homography(H_ab)
-    H_ba = normalize_homography(H_ba)
-    prod = normalize_homography(torch.bmm(H_ab, H_ba))
-    I = torch.eye(3, device=H_ab.device, dtype=H_ab.dtype) \
-             .unsqueeze(0).expand(B, -1, -1)
-    diff = prod - I
-    return (diff ** 2).sum() / B
+def loss_triplet(r_ab, d_neg_ab, q_ab, m=1.0, eps=_EPS):
+    return _triplet_single(r_ab, d_neg_ab, q_ab, m, eps)
 
 
 # ---------------------------------------------------------------------------
 # L_offset
 # ---------------------------------------------------------------------------
 
-def loss_offset(offset_ab, offset_ba):
+def loss_offset(offset_ab):
     """Small stabilizer that discourages wild early DLT corner offsets."""
-    return 0.5 * (offset_ab.pow(2).mean() + offset_ba.pow(2).mean())
+    return offset_ab.pow(2).mean()
 
 
 # ---------------------------------------------------------------------------
 # L_support  (Section 6.4)
 # ---------------------------------------------------------------------------
 
-def loss_support(q_ab, q_ba, alpha=0.05):
+def loss_support(q_ab, alpha=0.05):
     """Prevent q from collapsing to zero support."""
-    q_mean = (q_ab.mean() + q_ba.mean()) * 0.5
-    return torch.clamp(alpha - q_mean, min=0.0) ** 2
+    return torch.clamp(alpha - q_ab.mean(), min=0.0) ** 2
 
 
 # ---------------------------------------------------------------------------
 # L_smooth  (Section 6.5)
 # ---------------------------------------------------------------------------
 
-def loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a, gamma=5.0):
+def loss_smooth(q_ab, img_patch_b, gamma=5.0):
     """
-    Edge-aware TV regularizer on the consensus maps.
-    q_ab, q_ba    : [B, 1, Ph, Pw]
-    img_patch_b/a : [B, 1, Ph, Pw]  – used for edge weighting
+    Edge-aware TV regularizer on the consensus map.
+    q_ab        : [B, 1, Ph, Pw]
+    img_patch_b : [B, 1, Ph, Pw]  – used for edge weighting
     """
     def _tv(q, img):
         dq_x = torch.abs(q[:, :, :, 1:] - q[:, :, :, :-1])
@@ -142,20 +113,20 @@ def loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a, gamma=5.0):
         dI_y = torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :])
         return (dq_x * torch.exp(-gamma * dI_x)).mean() + \
                (dq_y * torch.exp(-gamma * dI_y)).mean()
-    return _tv(q_ab, img_patch_b) + _tv(q_ba, img_patch_a)
+    return _tv(q_ab, img_patch_b)
 
 
 # ---------------------------------------------------------------------------
 # L_calib  (Section 6.6)
 # ---------------------------------------------------------------------------
 
-def loss_calib(log_sigma_ab, r_ab, log_sigma_ba, r_ba, eps=_EPS):
+def loss_calib(log_sigma_ab, r_ab, eps=_EPS):
     """Weak self-supervised calibration via stop-gradient residual targets."""
     def _single(log_sigma, r):
         log_sigma = torch.log(positive_sigma(log_sigma))
         log_r_sg = clamp_log_sigma(torch.log(r.detach() + eps))
         return torch.abs(log_sigma - log_r_sg).mean()
-    return _single(log_sigma_ab, r_ab) + _single(log_sigma_ba, r_ba)
+    return _single(log_sigma_ab, r_ab)
 
 
 # ---------------------------------------------------------------------------
@@ -192,28 +163,29 @@ def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
 # Total loss  (Section 6.9)
 # ---------------------------------------------------------------------------
 
-def compute_total_loss(la, lt, li, ls, lsm, lc, lo=None, lr=None, ltmp=None,
-                       lam1=1.0, lam2=0.01, lam3=0.01,
-                       lam4=0.001, lam5=0.1, lam6=1e-4, lam7=0.1, lam8=0.1,
+def compute_total_loss(la, lt, ls, lsm, lc, lo=None, lr=None, ltmp=None,
+                       lam_triplet=1.0, lam_support=0.01,
+                       lam_smooth=0.001, lam_calib=0.05,
+                       lam_offset=1e-4, lam_rel=0.1, lam_temp=0.1,
                        include_geometric=True):
     """
     la  = L_align
-    lt  = L_triplet  (weight lam1)
-    li  = L_inv      (weight lam2)
-    ls  = L_support  (weight lam3)
-    lsm = L_smooth   (weight lam4)
-    lc  = L_calib    (weight lam5)
-    lo  = L_offset   (weight lam6)
-    lr  = L_rel      (weight lam7)
-    ltmp= L_temp     (weight lam8)
+    lt  = L_triplet  (weight lam_triplet)
+    ls  = L_support  (weight lam_support)
+    lsm = L_smooth   (weight lam_smooth)
+    lc  = L_calib    (weight lam_calib)
+    lo  = L_offset   (weight lam_offset)
+    lr  = L_rel      (weight lam_rel)
+    ltmp= L_temp     (weight lam_temp)
     """
     total = la.new_tensor(0.0)
     if include_geometric:
-        total = total + la + lam1 * lt + lam2 * li + lam3 * ls + lam4 * lsm + lam5 * lc
+        total = total + la + lam_triplet * lt + lam_support * ls + \
+                lam_smooth * lsm + lam_calib * lc
         if lo is not None:
-            total = total + lam6 * lo
+            total = total + lam_offset * lo
     if lr is not None:
-        total = total + lam7 * lr
+        total = total + lam_rel * lr
     if ltmp is not None:
-        total = total + lam8 * ltmp
+        total = total + lam_temp * ltmp
     return total
