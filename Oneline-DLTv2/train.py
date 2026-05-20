@@ -21,6 +21,7 @@ from datetime import datetime
 from torch_homography_model import build_model
 from dataset import TrainDataset
 from utils import display_using_tensorboard
+from losses import loss_temporal
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -37,6 +38,22 @@ os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    return value.lower() in ('true', '1', 'yes', 'y')
+
+
+def _maybe_join(base, path):
+    return path if os.path.isabs(path) else os.path.join(base, path)
+
+
+def _to_device(tensor):
+    if torch.cuda.is_available():
+        return tensor.cuda()
+    return tensor
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -46,7 +63,7 @@ def train(args):
     net = build_model(args.model_name, pretrained=args.pretrained)
 
     if args.finetune:
-        model_path = os.path.join(exp_name, args.model_path)
+        model_path = _maybe_join(exp_name, args.model_path)
         print('Loading checkpoint:', model_path)
         from collections import OrderedDict
         checkpoint = torch.load(model_path, map_location='cpu')
@@ -73,6 +90,8 @@ def train(args):
     train_data = TrainDataset(
         data_path=train_path, exp_path=exp_name,
         patch_w=args.patch_size_w, patch_h=args.patch_size_h, rho=16,
+        return_invalid=args.use_invalid,
+        return_triplet=args.use_temporal,
     )
     train_loader = DataLoader(
         dataset=train_data, batch_size=args.batch_size,
@@ -91,7 +110,8 @@ def train(args):
 
     # Running sums for periodic logging
     _sums = {k: 0.0 for k in
-             ('total', 'align', 'triplet', 'inv', 'support', 'smooth', 'calib')}
+             ('total', 'align', 'triplet', 'inv', 'support', 'smooth',
+              'calib', 'rel_valid', 'rel_invalid', 'temp')}
 
     for epoch in range(args.max_epoch):
         net.train()
@@ -111,28 +131,32 @@ def train(args):
                                              layer.cpu().data.numpy(), glob_iter)
 
             # ---- Batch preparation ----
-            org_imges     = batch_value[0].float()
-            input_tesnors = batch_value[1].float()
-            patch_indices = batch_value[2].float()
-            h4p           = batch_value[3].float()
+            org_imges     = batch_value['org'].float()
+            input_tesnors = batch_value['input'].float()
+            patch_indices = batch_value['patch_indices'].float()
+            h4p           = batch_value['h4p'].float()
 
             # Individual images for tensorboard display
             I          = org_imges[:, 0:1, ...]
             I2_ori_img = org_imges[:, 1:2, ...]
             I2_patch   = input_tesnors[:, 1:2, ...]
 
-            if torch.cuda.is_available():
-                org_imges     = org_imges.cuda()
-                input_tesnors = input_tesnors.cuda()
-                patch_indices = patch_indices.cuda()
-                h4p           = h4p.cuda()
-                I             = I.cuda()
-                I2_ori_img    = I2_ori_img.cuda()
-                I2_patch      = I2_patch.cuda()
+            org_imges     = _to_device(org_imges)
+            input_tesnors = _to_device(input_tesnors)
+            patch_indices = _to_device(patch_indices)
+            h4p           = _to_device(h4p)
+            I             = _to_device(I)
+            I2_ori_img    = _to_device(I2_ori_img)
+            I2_patch      = _to_device(I2_patch)
 
             # ---- Forward / backward ----
             optimizer.zero_grad()
-            out = net(org_imges, input_tesnors, h4p, patch_indices)
+            valid_label = torch.ones(org_imges.size(0), 1, device=org_imges.device)
+            out = net(
+                org_imges, input_tesnors, h4p, patch_indices,
+                rel_label=valid_label,
+                compute_geometric=True,
+            )
 
             loss_total   = out['loss_total'].mean()
             loss_align_v = out['loss_align'].mean()
@@ -141,6 +165,51 @@ def train(args):
             loss_sup_v   = out['loss_support'].mean()
             loss_smo_v   = out['loss_smooth'].mean()
             loss_cal_v   = out['loss_calib'].mean()
+            loss_rel_valid_v = out['loss_rel'].mean()
+            loss_rel_invalid_v = loss_total.new_tensor(0.0)
+            loss_temp_v = loss_total.new_tensor(0.0)
+
+            if args.use_invalid:
+                invalid_org = _to_device(batch_value['invalid_org'].float())
+                invalid_input = _to_device(batch_value['invalid_input'].float())
+                invalid_patch_indices = _to_device(batch_value['invalid_patch_indices'].float())
+                invalid_h4p = _to_device(batch_value['invalid_h4p'].float())
+                invalid_label = torch.zeros(
+                    invalid_org.size(0), 1, device=invalid_org.device,
+                )
+                out_invalid = net(
+                    invalid_org, invalid_input, invalid_h4p, invalid_patch_indices,
+                    rel_label=invalid_label,
+                    compute_geometric=False,
+                )
+                loss_total = loss_total + out_invalid['loss_total'].mean()
+                loss_rel_invalid_v = out_invalid['loss_rel'].mean()
+
+            if args.use_temporal and 'triplet01_org' in batch_value:
+                t01 = net(
+                    _to_device(batch_value['triplet01_org'].float()),
+                    _to_device(batch_value['triplet01_input'].float()),
+                    _to_device(batch_value['triplet01_h4p'].float()),
+                    _to_device(batch_value['triplet01_patch_indices'].float()),
+                    compute_geometric=False,
+                )
+                t12 = net(
+                    _to_device(batch_value['triplet12_org'].float()),
+                    _to_device(batch_value['triplet12_input'].float()),
+                    _to_device(batch_value['triplet12_h4p'].float()),
+                    _to_device(batch_value['triplet12_patch_indices'].float()),
+                    compute_geometric=False,
+                )
+                t02 = net(
+                    _to_device(batch_value['triplet02_org'].float()),
+                    _to_device(batch_value['triplet02_input'].float()),
+                    _to_device(batch_value['triplet02_h4p'].float()),
+                    _to_device(batch_value['triplet02_patch_indices'].float()),
+                    compute_geometric=False,
+                )
+                triplet_available = _to_device(batch_value['triplet_available'].float()).mean()
+                loss_temp_v = loss_temporal(t02['H_ab'], t12['H_ab'], t01['H_ab']) * triplet_available
+                loss_total = loss_total + args.lambda_temp * loss_temp_v
 
             loss_total.backward()
             optimizer.step()
@@ -153,6 +222,9 @@ def train(args):
             _sums['support'] += loss_sup_v.item()
             _sums['smooth']  += loss_smo_v.item()
             _sums['calib']   += loss_cal_v.item()
+            _sums['rel_valid']   += loss_rel_valid_v.item()
+            _sums['rel_invalid'] += loss_rel_invalid_v.item()
+            _sums['temp']        += loss_temp_v.item()
 
             if i % PRINT_FREQ == 0 and i != 0:
                 avgs = {k: v / PRINT_FREQ for k, v in _sums.items()}
@@ -160,10 +232,12 @@ def train(args):
                     'Ep[{:03d}/{:03d}] It[{:05d}/{:05d}] '
                     'Total={:.4f} Align={:.4f} Tri={:.4f} '
                     'Inv={:.4f} Sup={:.4f} Smo={:.4f} Cal={:.4f} '
+                    'Rel+={:.4f} Rel-={:.4f} Temp={:.4f} '
                     'lr={:.2e}'.format(
                         epoch + 1, args.max_epoch, i + 1, len(train_loader),
                         avgs['total'], avgs['align'], avgs['triplet'],
                         avgs['inv'], avgs['support'], avgs['smooth'], avgs['calib'],
+                        avgs['rel_valid'], avgs['rel_invalid'], avgs['temp'],
                         scheduler.get_last_lr()[0],
                     )
                 )
@@ -190,6 +264,9 @@ def train(args):
                 'support': loss_sup_v.item(),
                 'smooth':  loss_smo_v.item(),
                 'calib':   loss_cal_v.item(),
+                'rel_valid': loss_rel_valid_v.item(),
+                'rel_invalid': loss_rel_invalid_v.item(),
+                'temp': loss_temp_v.item(),
             }, glob_iter)
             writer.add_scalar('lr', scheduler.get_last_lr()[0], glob_iter)
 
@@ -219,9 +296,14 @@ if __name__ == '__main__':
     parser.add_argument('--lr',          type=float, default=1e-4)
 
     parser.add_argument('--model_name',  type=str,  default='resnet34')
-    parser.add_argument('--pretrained',  type=bool, default=False)
-    parser.add_argument('--finetune',    type=bool, default=False)
+    parser.add_argument('--pretrained',  type=str2bool, default=False)
+    parser.add_argument('--finetune',    type=str2bool, default=False)
     parser.add_argument('--model_path',  type=str,  default='')
+    parser.add_argument('--use_invalid', type=str2bool, default=True,
+                        help='Train reliability with generated invalid pairs.')
+    parser.add_argument('--use_temporal', type=str2bool, default=False,
+                        help='Enable optional temporal composition loss.')
+    parser.add_argument('--lambda_temp', type=float, default=0.1)
 
     print('<==================== Loading data ===================>\n')
     args = parser.parse_args()

@@ -87,6 +87,12 @@ def save_heatmap(tensor_2d, path):
     cv2.imwrite(path, colored)
 
 
+def default_coord_dir(work_dir):
+    coord_v2 = os.path.join(work_dir, 'Coordinate-v2', 'Coordinate-v2')
+    coord_v1 = os.path.join(work_dir, 'Coordinate')
+    return coord_v2 if os.path.isdir(coord_v2) else coord_v1
+
+
 # ---------------------------------------------------------------------------
 # Risk-coverage and calibration helpers
 # ---------------------------------------------------------------------------
@@ -104,6 +110,59 @@ def auroc(labels, scores):
                 if p > n) + 0.5 * sum(1 for p, n in product(pos, neg)
                                        if p == n)
     return count / (len(pos) * len(neg))
+
+
+def auprc(labels, scores):
+    """Average precision. labels=1 means failure."""
+    labels = np.asarray(labels).astype(np.float32)
+    scores = np.asarray(scores)
+    if labels.sum() == 0:
+        return float('nan')
+    order = np.argsort(scores)[::-1]
+    labels = labels[order]
+    tp = np.cumsum(labels)
+    fp = np.cumsum(1.0 - labels)
+    precision = tp / np.maximum(tp + fp, 1e-12)
+    recall = tp / np.maximum(labels.sum(), 1e-12)
+    recall_prev = np.concatenate(([0.0], recall[:-1]))
+    return float(np.sum((recall - recall_prev) * precision))
+
+
+def binary_nll(success_labels, reliability_scores):
+    """NLL for reliability as P(success)."""
+    y = np.asarray(success_labels).astype(np.float64)
+    p = np.clip(np.asarray(reliability_scores).astype(np.float64), 1e-6, 1.0 - 1e-6)
+    return float(-(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)).mean())
+
+
+def expected_calibration_error(success_labels, reliability_scores, n_bins=10):
+    """ECE for reliability score interpreted as P(success)."""
+    y = np.asarray(success_labels).astype(np.float64)
+    p = np.asarray(reliability_scores).astype(np.float64)
+    ece = 0.0
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
+        if not np.any(mask):
+            continue
+        conf = p[mask].mean()
+        acc = y[mask].mean()
+        ece += (mask.mean()) * abs(conf - acc)
+    return float(ece)
+
+
+def calibration_curve(success_labels, reliability_scores, n_bins=10):
+    """Return bin confidence/accuracy/count data for reliability diagrams."""
+    y = np.asarray(success_labels).astype(np.float64)
+    p = np.asarray(reliability_scores).astype(np.float64)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    confs, accs, counts = [], [], []
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
+        counts.append(int(mask.sum()))
+        confs.append(float(p[mask].mean()) if np.any(mask) else float('nan'))
+        accs.append(float(y[mask].mean()) if np.any(mask) else float('nan'))
+    return bins, np.asarray(confs), np.asarray(accs), np.asarray(counts)
 
 
 def risk_coverage(errors, reliability_scores, tau=3.0):
@@ -139,7 +198,8 @@ def test(args):
         os.path.join(os.path.dirname('__file__'), os.path.pardir))
     work_dir  = os.path.join(exp_name, 'Data')
     pair_list = list(open(os.path.join(work_dir, 'Test_List.txt')))
-    npy_path  = os.path.join(work_dir, 'Coordinate/')
+    npy_path  = args.coord_dir or default_coord_dir(work_dir)
+    npy_path  = npy_path if npy_path.endswith(os.sep) else npy_path + os.sep
 
     result_name  = 'exp_result_CDPC'
     result_files = os.path.join(exp_name, result_name)
@@ -172,6 +232,7 @@ def test(args):
         data_path=exp_name,
         patch_w=args.patch_size_w, patch_h=args.patch_size_h,
         rho=16, WIDTH=args.img_w, HEIGHT=args.img_h,
+        coord_dir=npy_path,
     )
     test_loader = DataLoader(
         dataset=test_data, batch_size=1,
@@ -229,7 +290,7 @@ def test(args):
         all_reliability.append(reliability_val)
 
         name = '{:08d}'.format(i)
-        f.write('{}:{}\n'.format(name, err_avg))
+        f.write('{}:{} reliability={:.6f}\n'.format(name, err_avg, reliability_val))
         print('{}:{:.4f}  s={:.4f}'.format(i, err_avg, reliability_val))
 
         if video_name in RE:
@@ -282,16 +343,34 @@ def test(args):
         # Use (1 - reliability) as failure score so high score = likely failure
         fail_scores = [1.0 - r for r in all_reliability]
         auc = auroc(fail_labels, fail_scores)
+        ap = auprc(fail_labels, fail_scores)
+        success_labels = [1 if e <= tau else 0 for e in all_errors]
+        ece = expected_calibration_error(success_labels, all_reliability)
+        nll = binary_nll(success_labels, all_reliability)
+        cal_bins, cal_conf, cal_acc, cal_count = calibration_curve(
+            success_labels, all_reliability,
+        )
         cov, risk = risk_coverage(all_errors, all_reliability, tau)
 
-        print('AUROC (tau={}) = {:.4f}'.format(tau, auc))
+        print('AUROC (tau={}) = {:.4f}  AUPRC={:.4f}  ECE={:.4f}  NLL={:.4f}'.format(
+            tau, auc, ap, ece, nll,
+        ))
         f.write('AUROC_tau{}={:.4f}\n'.format(int(tau), auc))
+        f.write('AUPRC_tau{}={:.4f}\n'.format(int(tau), ap))
+        f.write('ECE_tau{}={:.4f}\n'.format(int(tau), ece))
+        f.write('NLL_tau{}={:.4f}\n'.format(int(tau), nll))
 
         # Save risk-coverage arrays
         rc_path = os.path.join(
             result_files, 'risk_coverage_tau{}.npz'.format(int(tau)))
         np.savez(rc_path, coverage=cov, risk=risk,
-                 errors=all_errors, reliability=all_reliability)
+                 errors=all_errors, reliability=all_reliability,
+                 fail_labels=fail_labels, fail_scores=fail_scores,
+                 success_labels=success_labels,
+                 calibration_bins=cal_bins,
+                 calibration_confidence=cal_conf,
+                 calibration_accuracy=cal_acc,
+                 calibration_counts=cal_count)
 
     f.close()
     print('Results saved to', result_files)
@@ -316,6 +395,8 @@ if __name__ == '__main__':
     parser.add_argument('--pretrained',  type=str2bool, default=False)
     parser.add_argument('--finetune',    type=str2bool, default=True)
     parser.add_argument('--model_path',  type=str,      default=None)
+    parser.add_argument('--coord_dir', type=str, default=None,
+                        help='Coordinate label directory. Defaults to Coordinate-v2 when available.')
 
     print('<==================== Loading data ===================>\n')
     args = parser.parse_args()

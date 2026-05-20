@@ -9,14 +9,17 @@ Active losses (Milestones 2-4):
   L_smooth  – edge-aware TV on consensus map q
   L_calib   – uncertainty calibration via stop-gradient residuals
 
-Deferred (Milestones 5-6):
+Active optional losses (Milestones 5-6):
   L_rel     – reliability BCE with synthetic invalid pairs
   L_temp    – temporal composition consistency
 """
 
 import torch
+import torch.nn.functional as F
 
 _EPS = 1e-6
+_LOG_SIGMA_MIN = -5.0
+_LOG_SIGMA_MAX = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +28,11 @@ _EPS = 1e-6
 
 def charbonnier(x, eps=1e-3):
     return torch.sqrt(x.pow(2) + eps ** 2)
+
+
+def clamp_log_sigma(log_sigma):
+    """Keep heteroscedastic likelihood numerically bounded."""
+    return torch.clamp(log_sigma, _LOG_SIGMA_MIN, _LOG_SIGMA_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +44,7 @@ def _align_single(r, log_sigma, q, eps=_EPS):
     r, log_sigma, q : [B, 1, Ph, Pw]
     Returns scalar.
     """
+    log_sigma = clamp_log_sigma(log_sigma)
     sigma = torch.exp(log_sigma).clamp(min=eps)
     robust = charbonnier(r / sigma)
     per_pixel = q * (robust + log_sigma)
@@ -118,18 +127,50 @@ def loss_smooth(q_ab, q_ba, img_patch_b, img_patch_a, gamma=5.0):
 def loss_calib(log_sigma_ab, r_ab, log_sigma_ba, r_ba, eps=_EPS):
     """Weak self-supervised calibration via stop-gradient residual targets."""
     def _single(log_sigma, r):
-        log_r_sg = torch.log(r.detach() + eps)
+        log_sigma = clamp_log_sigma(log_sigma)
+        log_r_sg = clamp_log_sigma(torch.log(r.detach() + eps))
         return torch.abs(log_sigma - log_r_sg).mean()
     return _single(log_sigma_ab, r_ab) + _single(log_sigma_ba, r_ba)
+
+
+# ---------------------------------------------------------------------------
+# L_rel  (Section 6.7)
+# ---------------------------------------------------------------------------
+
+def loss_reliability(reliability_score, rel_label):
+    """
+    Binary reliability loss.
+
+    reliability_score : [B, 1], high means a valid/reliable homography pair.
+    rel_label         : [B] or [B, 1], 1=valid pair, 0=invalid generated pair.
+    """
+    rel_label = rel_label.to(
+        device=reliability_score.device,
+        dtype=reliability_score.dtype,
+    ).reshape_as(reliability_score)
+    score = reliability_score.clamp(min=_EPS, max=1.0 - _EPS)
+    return F.binary_cross_entropy(score, rel_label)
+
+
+# ---------------------------------------------------------------------------
+# L_temp  (Section 6.8)
+# ---------------------------------------------------------------------------
+
+def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
+    """||H_t,t+2 - H_t+1,t+2 H_t,t+1||_F^2 averaged over batch."""
+    composed = torch.bmm(H_t1_t2, H_t_t1)
+    diff = H_t_t2 - composed
+    return (diff ** 2).reshape(diff.size(0), -1).sum(1).mean()
 
 
 # ---------------------------------------------------------------------------
 # Total loss  (Section 6.9)
 # ---------------------------------------------------------------------------
 
-def compute_total_loss(la, lt, li, ls, lsm, lc,
+def compute_total_loss(la, lt, li, ls, lsm, lc, lr=None, ltmp=None,
                        lam1=1.0, lam2=0.01, lam3=0.01,
-                       lam4=0.001, lam5=0.05):
+                       lam4=0.001, lam5=0.05, lam6=0.1, lam7=0.1,
+                       include_geometric=True):
     """
     la  = L_align
     lt  = L_triplet  (weight lam1)
@@ -137,5 +178,14 @@ def compute_total_loss(la, lt, li, ls, lsm, lc,
     ls  = L_support  (weight lam3)
     lsm = L_smooth   (weight lam4)
     lc  = L_calib    (weight lam5)
+    lr  = L_rel      (weight lam6)
+    ltmp= L_temp     (weight lam7)
     """
-    return la + lam1 * lt + lam2 * li + lam3 * ls + lam4 * lsm + lam5 * lc
+    total = la.new_tensor(0.0)
+    if include_geometric:
+        total = total + la + lam1 * lt + lam2 * li + lam3 * ls + lam4 * lsm + lam5 * lc
+    if lr is not None:
+        total = total + lam6 * lr
+    if ltmp is not None:
+        total = total + lam7 * ltmp
+    return total
