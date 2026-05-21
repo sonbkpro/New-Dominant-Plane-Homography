@@ -25,7 +25,11 @@ class Config:
                                         # 5-10 px range, enough for the triplet
                                         # to drive H out of the identity basin.
     post_init_prob: float = 0.7
-    log_sigma_min: float = -5.0
+    log_sigma_min: float = -0.3    # sigma >= 0.74; tight enough to block the
+                                    # Kendall-Gal shrink-sigma shortcut without
+                                    # killing all uncertainty adaptation. Was
+                                    # -5.0 (sigma_min ~0.007) which permitted
+                                    # arbitrary alignment-loss free lunch.
     log_sigma_max: float = 5.0
 
     # ---- EM posterior
@@ -67,10 +71,13 @@ class Config:
                                         # identity during early training. Turn
                                         # on (e.g. 0.01) only for the ablation
                                         # row in the paper.
-    lambda_sigma_reg: float = 0.01     # soft pull of log(sigma) toward 0
-                                        # (sigma toward 1); blocks the Kendall-
-                                        # Gal sigma-shrinking shortcut without
-                                        # hard-clamping log_sigma.
+    lambda_sigma_reg: float = 0.1      # was 0.01; observed sigma drifting from
+                                        # 1.0 to 0.55 during align ramp, with
+                                        # triplet climbing toward the margin
+                                        # in lockstep. 10x stronger nudge keeps
+                                        # sigma near 1.0; combined with the
+                                        # tightened log_sigma_min clamp this
+                                        # closes the sigma-shortcut.
     alpha_support: float = 0.25        # was 0.10; observed q_bar collapsing
                                         # to 0.04 during align ramp, way below
                                         # the floor.
