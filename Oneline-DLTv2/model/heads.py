@@ -42,11 +42,11 @@ class HomographyHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(256, 8),
         )
-        # Small weight init + zero bias keeps the initial offset close to zero
-        # (so the predicted homography is near identity) WITHOUT killing the
-        # upstream gradient — fully zero weights cut off correlation/backbone
-        # on the first step.
-        nn.init.normal_(self.fc[-1].weight, std=1e-3)
+        # Init scale chosen so that initial corner offsets are ~5-10 px (inf
+        # norm). Smaller inits collapse H to identity and the triplet sees
+        # d_pos == d_neg (hinge pinned at margin), preventing H from escaping
+        # the identity basin. Bias stays zero so the *mean* offset is zero.
+        nn.init.normal_(self.fc[-1].weight, std=0.03)
         nn.init.zeros_(self.fc[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

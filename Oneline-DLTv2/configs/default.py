@@ -20,7 +20,10 @@ class Config:
     bb_eighth_channels: int = 128
     corr_radius: int = 4
     corr_out_channels: int = 32
-    homography_rho: float = 32.0
+    homography_rho: float = 16.0       # was 32; smaller rho + larger FC init
+                                        # together give initial offsets in the
+                                        # 5-10 px range, enough for the triplet
+                                        # to drive H out of the identity basin.
     post_init_prob: float = 0.7
     log_sigma_min: float = -5.0
     log_sigma_max: float = 5.0
@@ -55,7 +58,12 @@ class Config:
     lambda_support: float = 0.01
     lambda_smooth: float = 1.0e-3
     lambda_rel: float = 0.1
-    lambda_cycle: float = 0.05
+    lambda_cycle: float = 0.0          # off by default: identity is the unique
+                                        # global minimizer of the analytic cycle,
+                                        # so this loss actively pulls H toward
+                                        # identity during early training. Turn
+                                        # on (e.g. 0.01) only for the ablation
+                                        # row in the paper.
     alpha_support: float = 0.10
     smoothness_gamma: float = 10.0
     triplet_margin: float = 1.0
