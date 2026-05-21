@@ -1,0 +1,662 @@
+# Calibrated Dominant-Plane Consensus for Trustworthy Unsupervised Deep Homography Estimation
+# Revised plan (planv1) — one-direction prediction, EM-grounded posterior, pruned loss set.
+
+## 0. Changelog Relative To plan.txt
+
+1. Switched from bidirectional (\(H_{ab}, H_{ba}\)) to one-direction prediction (\(H_{ab}\) only).
+   The inverse mapping \(H_{ab}^{-1}\) is obtained in closed form from the predicted matrix and
+   used only inside losses, not as a second prediction head.
+2. Replaced the bidirectional inverse-consistency loss \(\mathcal{L}_{\text{inv}}\) with a
+   feature-space cycle loss \(\mathcal{L}_{\text{cycle}}\) computed using the analytic inverse.
+3. Grounded the dominant-plane posterior \(q_i\) in an explicit two-component generative
+   residual model and trained it with an EM-style loss \(\mathcal{L}_{\text{em}}\).
+   This converts \(q_i\) from "renamed attention mask" to amortized variational inference.
+4. Dropped \(\mathcal{L}_{\text{calib}}\): it duplicates the uncertainty term inside
+   \(\mathcal{L}_{\text{align}}\) (Kendall-Gal likelihood) and risks fighting it.
+5. Dropped \(\mathcal{L}_{\text{temp}}\): the current CA-Homography pair list does not
+   expose ordered triplets, so temporal composition is not implementable without a new sampler.
+6. Restricted invalid-pair generation to intra-batch random shuffle and patch reshuffle.
+   Cross-video and large-temporal-gap pairs are removed because video-id metadata is unavailable.
+7. Added a hard-negative mining channel for the reliability head to prevent it from
+   collapsing onto trivial "content mismatch" cues.
+8. Specified the cross-image feature interaction: a correlation block whose output feeds
+   the posterior and uncertainty heads.
+
+Net result: 5 essential losses + 1 optional (cycle), down from 8 in plan.txt.
+
+## 1. Central Thesis
+
+Reformulate unsupervised deep homography estimation as a probabilistic dominant-plane
+consensus problem. Given two real images \(I_a\) and \(I_b\), the method jointly estimates:
+
+\[
+\bigl( H_{ab},\; q_{ab}(i),\; \sigma_{ab}(i),\; s_{ab} \bigr),
+\]
+
+where
+
+1. \(H_{ab}\) is the dominant-plane homography from \(I_a\) to \(I_b\).
+2. \(q_{ab}(i) = P(z_i = 1 \mid I_a, I_b)\) is the posterior that pixel \(i\) belongs to
+   the dominant-plane support, derived from a two-component generative residual model.
+3. \(\sigma_{ab}(i)\) is the spatial aleatoric uncertainty.
+4. \(s_{ab} \in [0,1]\) is the pair-level reliability score: the probability that the
+   image pair admits a reliable single dominant homography.
+
+The paper is framed as "trustworthy" homography estimation, not as "yet another mask or
+backbone." The model answers three questions for every pair:
+
+1. What is the best dominant homography?
+2. Where is this homography valid?
+3. Should this homography be trusted?
+
+## 2. Motivation From The Existing Repository
+
+The repository implements Oneline-DLT (file: Oneline-DLTv1/resnet.py):
+
+1. ResNet-34 backbone consumes the channel-stacked patch pair and regresses an
+   8-dimensional four-corner offset \(\Delta p_{ab}\).
+2. A single-channel feature extractor (`ShareFeature`) is applied to each patch.
+3. A sigmoid mask predictor (`genMask`) produces an attention mask reused as loss
+   weighting.
+4. The training loss is the masked feature-space triplet:
+   \[
+   \mathcal{L}_{\text{triplet}}
+   = \frac{\sum_i M_i \max(0,\; 1 + d_i^+ - d_i^-)}{\sum_i M_i},
+   \]
+   with \(d_i^+ = \lVert F_b(i) - F_a'(i) \rVert_1\) and
+   \(d_i^- = \lVert F_b(i) - F_a(i) \rVert_1\).
+
+What is missing relative to a TIP-level proposal:
+
+1. The mask is not a probabilistic posterior over a defined latent.
+2. There is no notion of spatial uncertainty.
+3. There is no notion of pair-level reliability.
+4. There is no calibration metric or failure-detection protocol.
+5. There is no anti-collapse or support regularization on the mask beyond `normMask`.
+6. There is no cross-image correspondence module: the two patches are simply
+   channel-concatenated before the ResNet.
+
+These are the gaps the revised plan fills.
+
+## 3. Novelty Positioning
+
+The contribution is positioned along two axes:
+
+1. **Probabilistic reformulation**: \(q_i\) is the posterior of a two-component
+   generative residual model; the network is the amortized recognition function;
+   training uses an EM-style alignment loss. This is qualitatively different from
+   any prior content-aware mask (Zhang et al. ECCV 2020), dynamic mask (Le et al.),
+   or pseudo-plane mask (Mask-Homo).
+2. **Trustworthiness evaluation protocol** for homography estimation: failure
+   detection (AUROC, AUPRC), calibration (ECE, NLL), and risk-coverage curves
+   driven by \(s_{ab}\). To the best of our knowledge, no prior deep-homography
+   paper reports this protocol.
+
+The paper does NOT claim novelty in backbones, attention mechanisms,
+multi-homography decomposition, transformer matching, or foundation-model
+distillation. It also does NOT claim novelty in aleatoric uncertainty as a
+technique; the novelty is its integration with dominant-plane consensus and a
+calibrated reliability head, evaluated under a new trustworthiness protocol.
+
+## 4. Literature Boundaries
+
+The proposal explicitly distinguishes itself from:
+
+1. Supervised deep homography (DeTone et al.).
+2. Photometric unsupervised homography (Nguyen et al.).
+3. Content-aware mask learning (Zhang et al., ECCV 2020).
+4. Dynamic-scene masks (Le et al.).
+5. Motion-basis homography (BasesHomo).
+6. Transformer / recurrent refinement (RHWF).
+7. Geometrized transformer matching (GeoFormer).
+8. Multi-homography plane masks (Mask-Homo).
+9. Adaptive query masking (AGNet).
+10. Foundation-model feature teaching (SAMFeat).
+
+## 5. Proposed Method
+
+### 5.1 Inputs And Outputs
+
+Input: \((I_a, I_b)\), small-baseline real image pair.
+
+Outputs:
+
+\[
+H_{ab},\quad
+q_{ab}(i) = P(z_i = 1 \mid I_a, I_b),\quad
+\log \sigma_{ab}(i),\quad
+s_{ab} \in [0,1].
+\]
+
+\(H_{ab}^{-1}\) is computed in closed form when needed for the cycle loss; it is
+not a separate network output.
+
+### 5.2 Feature Extractor
+
+A lightweight multi-scale CNN (ResNet-18 / 34 backbone reused from the existing
+repository) produces shared features \(F_a^{(l)}, F_b^{(l)}\) at two scales
+\(l \in \{1/4, 1/8\}\). The 1/4 features feed alignment losses; the 1/8 features
+feed the cross-image correspondence module.
+
+### 5.3 Cross-Image Correspondence Module (new)
+
+A compact correlation block computes local cost volumes:
+
+\[
+C(i, d) = \langle F_a^{(1/8)}(i),\; F_b^{(1/8)}(i + d) \rangle, \quad d \in [-R, R]^2,
+\]
+
+with a small radius \(R\) (e.g. \(R = 4\)). The cost volume is reduced via a few
+conv layers to a per-pixel feature \(c_i\) used as input to:
+
+1. The dominant-plane posterior head \(q_i\).
+2. The spatial uncertainty head \(\log \sigma_i\).
+
+This module is what makes \(q_i\) and \(\sigma_i\) actually depend on
+inter-image correspondence quality, rather than only on single-image content.
+
+### 5.4 Homography Estimator (unchanged interface)
+
+Keep the four-corner offset representation and the differentiable DLT solver
+(`DLT_solve` in utils.py):
+
+\[
+\Delta p_{ab} \in \mathbb{R}^{8},\quad
+p' = p + \Delta p_{ab},\quad
+H_{ab} = \mathrm{DLT}(p, p').
+\]
+
+The 8-DoF regression head takes the concatenation of \([F_a, F_b]\) features
+(as in the current code) plus the pooled correlation feature.
+
+### 5.5 Generative Residual Model And EM-Style Posterior
+
+This is the principal novelty.
+
+Define the photometric / feature residual after warping:
+
+\[
+r_i = \lVert F_b(i) - W(F_a, H_{ab})(i) \rVert_1.
+\]
+
+Posit a two-component mixture model over residuals:
+
+1. Inlier (dominant-plane consistent): \(p(r_i \mid z_i = 1) \propto \exp(-r_i / \sigma_i)\)
+   (Laplacian with predicted scale).
+2. Outlier (non-planar, dynamic, occluded, low-texture):
+   \(p(r_i \mid z_i = 0) = 1 / r_{\max}\), a broad uniform on \([0, r_{\max}]\).
+   \(r_{\max}\) is a constant chosen from data statistics.
+
+With a learned prior \(\pi_i = P(z_i = 1)\) produced by the network, the
+posterior in the E-step is
+
+\[
+\tilde q_i =
+\frac{\pi_i\, p(r_i \mid z_i = 1)}
+     {\pi_i\, p(r_i \mid z_i = 1) + (1 - \pi_i)\, p(r_i \mid z_i = 0)}.
+\]
+
+The network's amortized posterior head outputs \(q_i\). It is trained to match
+the stop-gradient E-step posterior \(\tilde q_i\) (loss \(\mathcal{L}_{\text{em}}\),
+Section 6.3). The M-step is implicit: gradient descent on \(H\) under the
+\(q_i\)-weighted alignment loss.
+
+This grounding is what distinguishes the work from a content-aware mask: \(q_i\)
+is the amortized posterior of a defined generative model, and convergence
+arguments follow the standard variational EM template.
+
+### 5.6 Spatial Uncertainty
+
+The uncertainty head outputs \(\log \sigma_i\). It is trained jointly with
+\(H_{ab}\) via the Kendall-Gal heteroscedastic likelihood inside
+\(\mathcal{L}_{\text{align}}\); no separate calibration loss is used.
+
+### 5.7 Pair-Level Reliability
+
+The reliability head consumes pooled statistics:
+
+\[
+\phi_{ab}
+=
+\bigl[
+\bar{q},\; \mathrm{var}(q),\; |\{i : q_i > \tau\}| / N,
+\;
+\bar{r},\; \overline{q \cdot r},\; \overline{\sigma},
+\;
+\bar{c}_{\text{cycle}}
+\bigr],
+\]
+
+where \(\bar{c}_{\text{cycle}}\) is the mean feature residual of the analytic
+cycle check
+\(\big\lVert F_a - W\bigl(W(F_a, H_{ab}), H_{ab}^{-1}\bigr) \big\rVert_1\).
+
+No bidirectional consistency term appears in \(\phi_{ab}\), because the network
+predicts only one homography.
+
+\(s_{ab} = \mathrm{MLP}(\phi_{ab})\).
+
+## 6. Loss Functions (revised — 5 essential, 1 optional)
+
+The total loss is
+
+\[
+\mathcal{L}
+=
+\mathcal{L}_{\text{triplet}}
++ \lambda_a \mathcal{L}_{\text{align}}
++ \lambda_e \mathcal{L}_{\text{em}}
++ \lambda_s \mathcal{L}_{\text{support}}
++ \lambda_v \mathcal{L}_{\text{smooth}}
++ \lambda_r \mathcal{L}_{\text{rel}}
++ \lambda_c \mathcal{L}_{\text{cycle}}.
+\]
+
+The classical bidirectional \(\mathcal{L}_{\text{inv}}\), the redundant
+\(\mathcal{L}_{\text{calib}}\), and the data-incompatible
+\(\mathcal{L}_{\text{temp}}\) are removed.
+
+### 6.1 Consensus-Weighted Triplet (essential, anti-collapse)
+
+\[
+d_i^+ = \lVert F_b(i) - W(F_a, H_{ab})(i) \rVert_1,\quad
+d_i^- = \lVert F_b(i) - F_a(i) \rVert_1.
+\]
+
+\[
+\mathcal{L}_{\text{triplet}}
+=
+\frac{\sum_i q_i \max(0,\; m + d_i^+ - d_i^-)}{\sum_i q_i + \epsilon},
+\quad m = 1.
+\]
+
+This loss is kept because its negative term \(d_i^-\) is the only mechanism
+preventing the feature extractor from collapsing to a constant map. The mask
+is replaced by the consensus posterior \(q_i\).
+
+### 6.2 Uncertainty-Weighted Alignment (essential)
+
+Charbonnier penalty \(\rho(x) = \sqrt{x^2 + \epsilon^2}\) and Kendall-Gal
+heteroscedastic likelihood:
+
+\[
+\mathcal{L}_{\text{align}}
+=
+\frac{\sum_i q_i \bigl[ \rho(r_i / \sigma_i) + \log \sigma_i \bigr]}
+     {\sum_i q_i + \epsilon}.
+\]
+
+This single loss does two jobs: it trains \(H_{ab}\) under a robust
+likelihood and it trains \(\log \sigma_i\) via the \(\log \sigma\) penalty.
+A separate calibration loss is therefore unnecessary and is removed.
+
+### 6.3 EM Posterior Loss (essential — grounds the posterior claim)
+
+Compute the E-step target
+
+\[
+\tilde q_i =
+\frac{\pi_i\, p(r_i \mid z_i = 1)}
+     {\pi_i\, p(r_i \mid z_i = 1) + (1 - \pi_i)\, p(r_i \mid z_i = 0)},
+\]
+
+with stop-gradient on \(r_i\), \(\sigma_i\), and \(\pi_i\). Train the network's
+posterior \(q_i\) to match \(\tilde q_i\) via binary cross entropy:
+
+\[
+\mathcal{L}_{\text{em}}
+=
+\frac{1}{N} \sum_i
+\Bigl[ -\tilde q_i \log q_i - (1 - \tilde q_i) \log(1 - q_i) \Bigr].
+\]
+
+This is the substitute for any ad hoc "make q look like the residual" term.
+\(\pi_i\) may simply be set to a constant prior (e.g. 0.5) for simplicity;
+ablate constant vs. learned prior.
+
+### 6.4 Support Regularization (essential — prevents trivial degeneracy)
+
+Floor the average posterior to avoid collapse:
+
+\[
+\bar q = \frac{1}{N} \sum_i q_i,\quad
+\mathcal{L}_{\text{support}} = \max(0,\; \alpha - \bar q)^2,
+\]
+
+with \(\alpha = 0.10\) as the default. With \(\mathcal{L}_{\text{em}}\) in
+play this term can be weighted smaller than in plan.txt, but it is still
+needed because in early training residuals are uninformative and the E-step
+can drive \(q\) toward zero.
+
+### 6.5 Edge-Aware Smoothness Of Consensus (small weight)
+
+\[
+\mathcal{L}_{\text{smooth}}
+=
+\sum_i \bigl(|\partial_x q_i| + |\partial_y q_i|\bigr)
+\exp\bigl(-\gamma |\nabla I_b(i)|\bigr).
+\]
+
+### 6.6 Reliability Loss With Hardened Negatives (essential)
+
+Without video-id metadata, invalid pairs are generated by:
+
+1. Intra-batch shuffle: pair \(I_a\) from sample \(k\) with \(I_b\) from sample \(k'\).
+2. Patch reshuffle: extract two non-overlapping patches from the same image and
+   pair them as if they were different images.
+3. **Hard-negative mining (added)**: at each iteration, treat in-batch pairs
+   whose current point-residual proxy (mean of \(r_i\) over the patch) is above
+   a running percentile threshold as soft negatives, with target label \(0.5\)
+   rather than \(0\) or \(1\). This mitigates the shortcut where the head
+   learns to detect "any image-content mismatch" rather than "geometric
+   infeasibility."
+
+Loss:
+
+\[
+\mathcal{L}_{\text{rel}}
+=
+-\bigl[\, y_{ab} \log s_{ab} + (1 - y_{ab}) \log(1 - s_{ab}) \,\bigr].
+\]
+
+\(y_{ab} = 1\) for the natural pair, \(y_{ab} = 0\) for shuffled and patch-
+reshuffle pairs, \(y_{ab} = 0.5\) for hard-mined pairs.
+
+### 6.7 Analytic-Inverse Cycle (optional, recommended)
+
+Use the closed-form inverse of the predicted \(H_{ab}\):
+
+\[
+\mathcal{L}_{\text{cycle}}
+=
+\frac{1}{N} \sum_i
+\Bigl\lVert F_a(i) - W\bigl(W(F_a, H_{ab}),\; H_{ab}^{-1}\bigr)(i) \Bigr\rVert_1.
+\]
+
+No second prediction head is introduced. This replaces \(\mathcal{L}_{\text{inv}}\)
+from plan.txt and provides geometric regularization within the strict
+one-direction prediction setting.
+
+### 6.8 Initial Weights (to be ablated)
+
+\[
+\lambda_a = 1.0,\;
+\lambda_e = 0.5,\;
+\lambda_s = 0.01,\;
+\lambda_v = 0.001,\;
+\lambda_r = 0.1,\;
+\lambda_c = 0.05.
+\]
+
+The unweighted term is \(\mathcal{L}_{\text{triplet}}\) (coefficient 1).
+
+### 6.9 Why The Removed Losses Are Removed
+
+1. \(\mathcal{L}_{\text{inv}} = \lVert H_{ab} H_{ba} - I \rVert_F^2\): requires
+   bidirectional prediction; removed by design choice. Replaced by
+   \(\mathcal{L}_{\text{cycle}}\).
+2. \(\mathcal{L}_{\text{calib}} = |\log \sigma_i - \log r_i|\) (stop-grad):
+   redundant with the \(\log \sigma\) term in \(\mathcal{L}_{\text{align}}\)
+   under the Kendall-Gal likelihood. Keeping both creates two conflicting
+   signals on \(\sigma_i\) and risks collapsing \(\sigma_i\) onto \(r_i\) (the
+   exact failure mode the original "Risk 3" tried to avoid).
+3. \(\mathcal{L}_{\text{temp}}\): requires same-video frame triplets. The
+   current `Train_List.txt` is a list of pairs and the dataset loader does
+   not expose video-id or frame order. Implementing this requires a new
+   metadata file; deferred to future work.
+
+## 7. Architecture Plan
+
+### 7.1 Base Network
+
+Reuse the existing model as the skeleton:
+
+1. Keep `DLT_solve` and `transform` from utils.py.
+2. Keep `ShareFeature` as the single-scale feature extractor (extend to a
+   1/4 + 1/8 multi-scale variant).
+3. Replace `genMask` with a posterior head that consumes \([F_a^{(1/4)}, F_b'^{(1/4)}, c]\),
+   where \(F_b'\) is \(F_b\) warped to \(I_a\)'s patch coordinates with the
+   identity initialization, and \(c\) is the reduced correlation feature.
+   Critically, \(q\) depends on the current \(H_{ab}\): re-evaluate after
+   the homography head fires (one inner iteration is sufficient).
+
+### 7.2 New Heads
+
+1. Homography head \(g_H(F_a, F_b, c) \to \Delta p_{ab}\).
+2. Posterior head \(g_q(F_a, F_b, c, r) \to q_{ab} \in [0,1]\).
+3. Uncertainty head \(g_\sigma(F_a, F_b, c) \to \log \sigma_{ab}\).
+4. Reliability head \(g_s(\phi_{ab}) \to s_{ab} \in [0,1]\).
+
+### 7.3 Forward Output Dictionary
+
+```
+{
+    "H_ab": H_ab,
+    "H_ab_inv": H_ab_inv,                 # closed-form, not a learned output
+    "offset_ab": offset_ab,
+    "q_ab": q_ab,                          # posterior P(z=1 | I_a, I_b)
+    "log_sigma_ab": log_sigma_ab,
+    "reliability_score": s_ab,
+    "residual_map_ab": r_ab,
+    "feature_a": F_a, "feature_b": F_b,
+    "loss_triplet": L_triplet,
+    "loss_align":   L_align,
+    "loss_em":      L_em,
+    "loss_support": L_support,
+    "loss_smooth":  L_smooth,
+    "loss_rel":     L_rel,
+    "loss_cycle":   L_cycle,
+    "loss_total":   L_total
+}
+```
+
+## 8. Dataset Plan
+
+### 8.1 Existing Dataset
+
+Use CA-Homography (RE / LT / LL / SF / LF). Manual coordinate labels are kept
+only for evaluation. No new annotation is required for training.
+
+### 8.2 Pair Sampling
+
+1. Natural pair \((I_a, I_b)\): from `Train_List.txt` as in the current loader.
+2. Intra-batch shuffle for invalid pairs: at each iteration, draw a permutation
+   \(\pi\) and form auxiliary pairs \((I_a^{(k)}, I_b^{(\pi(k))})\) with target
+   \(y = 0\).
+3. Patch reshuffle for invalid pairs: from a single image, extract two
+   non-overlapping patches with the same crop geometry and present them as a
+   pair with target \(y = 0\).
+4. Hard-negative mining: within natural pairs, flag the highest-residual
+   fraction (e.g. top 10 %) as label-smoothed negatives \(y = 0.5\).
+
+Temporal triplets and cross-video pairing are not used (no metadata).
+
+## 9. Evaluation Plan
+
+### 9.1 Accuracy Metrics (geometric)
+
+Per-pair reprojection error from the manual point correspondences:
+
+\[
+e_j = \lVert \pi(H_{ab}\, x_j^a) - x_j^b \rVert_2,\quad
+E = \frac{1}{K} \sum_j e_j.
+\]
+
+Report mean and median \(E\); AUC at 1, 3, 5 pixels; inlier ratio at 1, 3, 5
+pixels; category-wise results (RE, LT, LL, SF, LF) plus average.
+
+### 9.2 Trustworthiness Metrics (the methodological contribution)
+
+Define a pair as a "failure" if \(E > \tau\), with \(\tau \in \{3, 5\}\) px.
+Report:
+
+1. AUROC for failure detection driven by \(1 - s_{ab}\).
+2. AUPRC for failure detection.
+3. Expected Calibration Error (ECE) of \(s_{ab}\).
+4. Negative log-likelihood of the failure label under \(s_{ab}\).
+5. Risk-coverage curves: sort by \(s_{ab}\), reject the lowest fraction \(c\),
+   report mean \(E\) on the kept set.
+6. Reliability diagrams.
+
+### 9.3 Qualitative
+
+For each scene category and for selected invalid pairs: input pair, warped
+result, \(q_{ab}\) heatmap, \(\sigma_{ab}\) heatmap, \(s_{ab}\) scalar,
+point-reprojection visualization.
+
+## 10. Baselines
+
+Identity homography; SIFT + RANSAC; SIFT + MAGSAC; ORB + RANSAC;
+SuperPoint + MAGSAC (if available); LoFTR + MAGSAC (if available);
+DeTone et al.; Nguyen et al.; Zhang et al. (Content-Aware);
+the current Oneline-DLT repository; BasesHomo / RHWF / GeoFormer /
+Mask-Homo / AGNet where reproducible. For non-reproducible baselines, report
+the obstacle (no code / no weights / incompatible format) rather than
+fabricating numbers.
+
+## 11. Ablation Studies
+
+Essential ablations (each is a binary toggle relative to the full model unless
+noted):
+
+1. Base Oneline-DLT (sigmoid mask, triplet only) — sanity baseline.
+2. \(+\) consensus posterior \(q_i\) trained only by \(\mathcal{L}_{\text{triplet}}\)
+   (no EM, no align).
+3. \(+\) Kendall-Gal alignment loss (uncertainty added).
+4. \(+\) EM posterior loss \(\mathcal{L}_{\text{em}}\).
+5. \(+\) support regularization.
+6. \(+\) edge-aware smoothness.
+7. \(+\) reliability head and \(\mathcal{L}_{\text{rel}}\).
+8. \(+\) cycle loss \(\mathcal{L}_{\text{cycle}}\).
+9. Posterior prior \(\pi_i\): constant \(0.5\) vs. learned head.
+10. Cross-image correspondence module on vs. off.
+11. Single-scale vs. multi-scale features.
+12. Reliability training without hard-negative mining vs. with.
+
+The single most important ablation: "sigmoid attention mask + triplet only"
+(item 1) vs. "consensus posterior + EM + Kendall-Gal" (items 2 + 3 + 4 stacked).
+This isolates the conceptual contribution and is the cleanest defense against
+the "renamed mask" objection.
+
+## 12. Claimed Contributions
+
+1. A two-component generative residual model for unsupervised deep homography
+   estimation, with an amortized posterior \(q_i\) trained by an EM-style loss.
+2. A unified probabilistic framework producing \((H, q, \sigma, s)\) with a
+   single one-direction prediction head, in which inverse-related regularization
+   is recovered via the closed-form inverse of the predicted homography.
+3. A pruned, justified loss design: five essential losses plus one optional
+   cycle loss, removing redundancy that appears in prior multi-loss formulations.
+4. A reliability head trained with shuffled and patch-reshuffled negatives plus
+   in-batch hard-negative mining, defended against the "content-mismatch
+   shortcut" failure mode.
+5. A trustworthiness evaluation protocol for homography estimation (AUROC,
+   AUPRC, ECE, NLL, risk-coverage, reliability diagrams) and improved accuracy
+   and reliability across the five CA-Homography scene categories.
+
+## 13. Implementation Milestones
+
+### Milestone 1 — Reproduce Baseline
+Train current Oneline-DLT to convergence; record per-category reprojection error.
+Deliverable: baseline numbers and qualitative outputs.
+
+### Milestone 2 — Architectural Refactor
+Add the cross-image correspondence module; add the posterior, uncertainty, and
+reliability heads. Verify forward pass and gradient flow on a single batch.
+Deliverable: forward-pass smoke test, parameter count, runtime.
+
+### Milestone 3 — Consensus Posterior + Alignment
+Implement \(\mathcal{L}_{\text{triplet}}\) (q-weighted),
+\(\mathcal{L}_{\text{align}}\) (Kendall-Gal), and \(\mathcal{L}_{\text{support}}\).
+Compare against the sigmoid-mask baseline.
+Deliverable: ablation rows 1–3.
+
+### Milestone 4 — EM Posterior
+Add \(\mathcal{L}_{\text{em}}\) with both constant and learned \(\pi_i\);
+add \(\mathcal{L}_{\text{smooth}}\). Produce posterior diagnostic plots
+(distribution of \(q\) per scene category).
+Deliverable: ablation rows 4–5–6 + posterior diagnostics.
+
+### Milestone 5 — Cycle Loss
+Add \(\mathcal{L}_{\text{cycle}}\) using \(H_{ab}^{-1}\). Verify that the
+analytic inverse is numerically stable inside the training loop (clamp small
+singular values; skip the loss in steps with ill-conditioned \(H_{ab}\)).
+Deliverable: ablation row 8 + stability report.
+
+### Milestone 6 — Reliability Head
+Add invalid-pair sampling (shuffle + patch reshuffle), hard-negative mining,
+and \(\mathcal{L}_{\text{rel}}\). Train; evaluate AUROC, AUPRC, ECE, NLL,
+risk-coverage.
+Deliverable: trustworthiness table, reliability diagrams, ablation rows 7, 12.
+
+### Milestone 7 — Final Experiments
+Run all baselines that can be reproduced; complete all ablations; generate
+qualitative figures; write the TIP manuscript.
+
+## 14. Risks And Mitigations
+
+1. **"Posterior is just a mask" objection.**
+   Mitigation: ground \(q_i\) in the two-component generative residual model,
+   show the EM target \(\tilde q_i\), and report the ablation that turns
+   \(\mathcal{L}_{\text{em}}\) off.
+
+2. **Reliability head shortcuts.**
+   Mitigation: include hard-negative mining and report ablation row 12 to
+   demonstrate the contribution of the mined negatives.
+
+3. **Uncertainty copies residuals.**
+   Mitigation: the Kendall-Gal likelihood (and the absence of a separate
+   stop-gradient calibration loss) makes "copying" the residual non-trivial,
+   because the model pays for it in the alignment term. Verify via reliability
+   diagrams.
+
+4. **Closed-form \(H_{ab}^{-1}\) numerical issues.**
+   Mitigation: condition-number guard at each step; skip cycle loss on
+   ill-conditioned matrices; the term is optional anyway.
+
+5. **Non-reproducible recent baselines.**
+   Mitigation: clearly report code/weights/format availability; no fabricated
+   numbers.
+
+## 15. Recommended Paper Title
+
+Calibrated Dominant-Plane Consensus for Trustworthy Unsupervised Deep
+Homography Estimation.
+
+Alternatives:
+
+1. Trustworthy Deep Homography Estimation via Calibrated Dominant-Plane
+   Consensus.
+2. Learning When A Homography Is Valid: Calibrated Consensus for Deep Image
+   Alignment.
+3. Reliability-Aware Dominant-Plane Homography Estimation in Real-World Scenes.
+
+## 16. Final Recommendation
+
+The original plan was strong but carried three structural issues for a TIP
+submission: a bidirectional commitment that the user did not want, a loss
+suite with two redundant terms, and a "posterior" claim that was not
+mathematically grounded.
+
+The revised plan addresses all three:
+
+1. Strict one-direction prediction with an analytic-inverse cycle loss.
+2. Pruned loss set: 5 essential + 1 optional, with explicit justification for
+   every retained term and every removed term.
+3. EM/variational grounding for \(q_i\) under a two-component residual model.
+
+The transformation is from
+
+\[
+(I_a, I_b) \to H_{ab}
+\]
+
+to
+
+\[
+(I_a, I_b) \to \bigl( H_{ab},\; P(z_i = 1 \mid I_a, I_b),\; \sigma_i,\; s_{ab} \bigr),
+\]
+
+framed as amortized variational inference over dominant-plane consensus and
+evaluated under a trustworthiness protocol that the homography subfield does
+not yet have.
