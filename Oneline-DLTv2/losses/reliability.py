@@ -27,9 +27,10 @@ def build_invalid_pair_labels(
     relabeled to 0.5 (label smoothing for hard negatives); everyone else is 1.
     The shuffled half (always label 0) is added by the caller.
     """
-    threshold = torch.quantile(natural_residual_mean.detach(),
-                               hard_negative_percentile)
-    is_hard = (natural_residual_mean >= threshold).float()
+    # torch.quantile requires fp32/fp64; upcast in case the caller is under AMP.
+    residual_fp32 = natural_residual_mean.detach().float()
+    threshold = torch.quantile(residual_fp32, hard_negative_percentile)
+    is_hard = (residual_fp32 >= threshold).float()
     return 1.0 - 0.5 * is_hard               # 1.0 if easy, 0.5 if hard
 
 

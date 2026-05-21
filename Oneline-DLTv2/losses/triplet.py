@@ -19,8 +19,11 @@ def triplet_loss(
     d^-_i = ||F_b(i) - F_a(i)||_1             (negative: should be larger)
     L = sum_i w_i max(0, m + d^+ - d^-) / sum_i w_i,  where w_i = q_i * valid_i
     """
-    d_pos = (F_b - F_a_warped).abs().sum(dim=1, keepdim=True)
-    d_neg = (F_b - F_a).abs().sum(dim=1, keepdim=True)
+    # Channel-MEAN (not sum) so per-pixel distances are O(1) regardless of C.
+    # With sum-over-channels the margin is effectively zero relative to typical
+    # distances and the hinge stays pinned at m, preventing H from learning.
+    d_pos = (F_b - F_a_warped).abs().mean(dim=1, keepdim=True)
+    d_neg = (F_b - F_a).abs().mean(dim=1, keepdim=True)
     hinge = (margin + d_pos - d_neg).clamp(min=0.0)
 
     w = q * valid_mask

@@ -28,13 +28,22 @@ class Config:
     # ---- EM posterior
     em_prior_pi: float = 0.5
     em_r_max: float = 4.0
-    em_warmup_iters: int = 2000     # disable L_em during this many iters
+    em_warmup_iters: int = 5000     # disable L_em during this many iters
+
+    # ---- Alignment ramp
+    # L_align is disabled (lambda=0) for `align_warmup_iters`, then linearly
+    # ramped to `lambda_align` over `align_ramp_iters`. Reason: at init H is
+    # near identity so triplet has weak gradient; if L_align fires immediately
+    # the network exploits sigma-shrinking instead of learning H.
+    align_warmup_iters: int = 3000
+    align_ramp_iters: int = 2000
+    em_ramp_iters: int = 2000
 
     # ---- Reliability head
     rel_shuffle_frac: float = 0.5
     rel_reshuffle_frac: float = 0.25
     rel_hard_neg_percentile: float = 0.85
-    rel_warmup_iters: int = 4000    # disable L_rel during this many iters
+    rel_warmup_iters: int = 7000    # disable L_rel during this many iters
 
     # ---- Cycle loss
     cycle_cond_max: float = 1.0e4

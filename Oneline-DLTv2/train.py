@@ -242,10 +242,24 @@ def train(args, cfg: Config):
                     F_a_nat, F_a_rec_nat, cycle_valid_nat, cond_valid_nat,
                 )
 
+                # Linear ramps for L_align and L_em: zero during warmup, then
+                # ramp to the configured weight. Lets L_triplet drive H first.
+                def _ramp(it, warmup, ramp):
+                    if it < warmup:
+                        return 0.0
+                    if ramp <= 0:
+                        return 1.0
+                    return min(1.0, (it - warmup) / float(ramp))
+
+                lam_align_eff = cfg.lambda_align * _ramp(
+                    glob_iter, cfg.align_warmup_iters, cfg.align_ramp_iters)
+                lam_em_eff = cfg.lambda_em * _ramp(
+                    glob_iter, cfg.em_warmup_iters, cfg.em_ramp_iters)
+
                 L_total = (
                     cfg.lambda_triplet * L_triplet
-                    + cfg.lambda_align   * L_align
-                    + cfg.lambda_em      * L_em
+                    + lam_align_eff      * L_align
+                    + lam_em_eff         * L_em
                     + cfg.lambda_support * L_support
                     + cfg.lambda_smooth  * L_smooth
                     + cfg.lambda_rel     * L_rel
@@ -258,6 +272,13 @@ def train(args, cfg: Config):
             scaler.step(optimizer)
             scaler.update()
 
+            # Diagnostic: is H actually learning? offset_inf is the largest
+            # corner-offset magnitude in pixels; should grow from ~0 at init
+            # toward ~5-20 px as the homography converges.
+            offset_nat = out["offset_ab"][:B].detach().float()
+            offset_inf = float(offset_nat.abs().max())
+            offset_mean = float(offset_nat.abs().mean())
+
             writer.add_scalar("loss/total",   float(L_total),   glob_iter)
             writer.add_scalar("loss/triplet", float(L_triplet), glob_iter)
             writer.add_scalar("loss/align",   float(L_align),   glob_iter)
@@ -267,8 +288,12 @@ def train(args, cfg: Config):
             writer.add_scalar("loss/rel",     float(L_rel),     glob_iter)
             writer.add_scalar("loss/cycle",   float(L_cycle),   glob_iter)
             writer.add_scalar("opt/lr",       scheduler.get_last_lr()[0], glob_iter)
+            writer.add_scalar("opt/lambda_align_eff", lam_align_eff,    glob_iter)
+            writer.add_scalar("opt/lambda_em_eff",    lam_em_eff,       glob_iter)
             writer.add_scalar("q/mean",       float(q_nat.mean()), glob_iter)
             writer.add_scalar("sigma/mean",   float(log_sigma_nat.exp().mean()), glob_iter)
+            writer.add_scalar("H/offset_inf_px",  offset_inf,  glob_iter)
+            writer.add_scalar("H/offset_mean_px", offset_mean, glob_iter)
 
             if batch_idx % cfg.score_print_freq == 0:
                 msg = (f"[ep {epoch+1:02d} it {glob_iter:06d}] "
@@ -276,7 +301,11 @@ def train(args, cfg: Config):
                        f"trip={float(L_triplet):.3f} align={float(L_align):.3f} "
                        f"em={float(L_em):.3f} sup={float(L_support):.3f} "
                        f"sm={float(L_smooth):.4f} rel={float(L_rel):.3f} "
-                       f"cyc={float(L_cycle):.3f} q_bar={float(q_nat.mean()):.3f}")
+                       f"cyc={float(L_cycle):.3f}  "
+                       f"q={float(q_nat.mean()):.3f} "
+                       f"sig={float(log_sigma_nat.exp().mean()):.3f} "
+                       f"off_inf={offset_inf:.2f}px off_avg={offset_mean:.2f}px "
+                       f"|lam_a={lam_align_eff:.2f}")
                 print(msg, flush=True)
 
             if glob_iter % cfg.viz_freq == 0:

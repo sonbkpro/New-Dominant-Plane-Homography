@@ -146,7 +146,10 @@ class CDPCNet(nn.Module):
         )
 
         # --- residual map ---------------------------------------------------
-        r = (F_b4 - F_a_warped).abs().sum(dim=1, keepdim=True)      # (B, 1, H/4, W/4)
+        # Channel-MEAN (not sum) so per-pixel residual stays in ~[0, 5] regardless
+        # of channel count. With channel-sum, residual ~ O(C) makes the triplet
+        # margin m=1 effectively zero and lets L_align numerics misbehave.
+        r = (F_b4 - F_a_warped).abs().mean(dim=1, keepdim=True)     # (B, 1, H/4, W/4)
 
         # --- posterior + uncertainty ----------------------------------------
         # Upsample correlation feature from 1/8 to 1/4 so it can feed the
@@ -169,7 +172,7 @@ class CDPCNet(nn.Module):
             out_size=F_a4.shape[-2:],
             in_size=F_a_warped.shape[-2:],
         )
-        cycle_r = (F_a4 - F_a_recovered).abs().sum(dim=1, keepdim=True)
+        cycle_r = (F_a4 - F_a_recovered).abs().mean(dim=1, keepdim=True)
 
         # --- reliability features -------------------------------------------
         tau = 0.5
