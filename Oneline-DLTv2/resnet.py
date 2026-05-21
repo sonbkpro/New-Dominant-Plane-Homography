@@ -195,6 +195,7 @@ class ResNetCDPC(nn.Module):
     """
 
     def __init__(self, block, layers, num_classes=8,
+                 lambda_align=1.0,
                  triplet_margin=0.2, lambda_triplet=0.1,
                  lambda_support=0.01, lambda_smooth=0.001,
                  lambda_offset=1e-4,
@@ -202,6 +203,7 @@ class ResNetCDPC(nn.Module):
                  fc_init_std=1e-2):
         self.inplanes = 64
         super().__init__()
+        self.lambda_align = lambda_align
         self.triplet_margin = triplet_margin
         self.lambda_triplet = lambda_triplet
         self.lambda_support = lambda_support
@@ -321,7 +323,7 @@ class ResNetCDPC(nn.Module):
     # ------------------------------------------------------------------
     def forward(self, org_imges, input_tesnors, h4p, patch_indices,
                 rel_label=None, compute_geometric=True,
-                triplet_weight=None):
+                align_weight=None, triplet_weight=None):
         """
         org_imges    : [B, 2, H, W]   full image pair (normalised, grayscale)
         input_tesnors: [B, 2, Ph, Pw] patch pair
@@ -401,6 +403,8 @@ class ResNetCDPC(nn.Module):
         # ---- 8. Losses ---------------------------------------------
         img_patch_b = input_tesnors[:, 1:, ...]   # for edge weights in L_smooth
 
+        sigma_ab = positive_sigma(log_sigma_ab)
+
         la  = loss_align(r_ab, log_sigma_ab, q_ab)
         lt  = loss_triplet(r_ab, d_neg_ab, q_ab, m=self.triplet_margin)
         li  = la.new_tensor(0.0)
@@ -410,9 +414,11 @@ class ResNetCDPC(nn.Module):
         lr = loss_reliability(s_ab, rel_label) if rel_label is not None else la.new_tensor(0.0)
         ltmp = la.new_tensor(0.0)
         lt_diag = triplet_diagnostics(r_ab, d_neg_ab, q_ab, m=self.triplet_margin)
+        lam_align = self.lambda_align if align_weight is None else align_weight
         lam_triplet = self.lambda_triplet if triplet_weight is None else triplet_weight
         lt_total = compute_total_loss(
             la, lt, ls, lsm, lo=lo, lr=lr,
+            lam_align=lam_align,
             lam_triplet=lam_triplet,
             lam_support=self.lambda_support,
             lam_smooth=self.lambda_smooth,
@@ -431,6 +437,7 @@ class ResNetCDPC(nn.Module):
             # Probabilistic outputs
             'validity_prob_ab': q_ab,
             'log_sigma_ab': log_sigma_ab,
+            'sigma_ab': sigma_ab,
             'reliability_score': s_ab,
             # Residuals
             'residual_map_ab': r_ab,
@@ -444,8 +451,15 @@ class ResNetCDPC(nn.Module):
             'loss_rel':     lr,
             'loss_temp':    ltmp,
             'loss_total':   lt_total,
+            'loss_align_weighted': la * lam_align,
+            'loss_triplet_weighted': lt * lam_triplet,
+            'align_weight': la.new_tensor(float(lam_align)),
             'triplet_weight': la.new_tensor(float(lam_triplet)),
             'triplet_margin': la.new_tensor(float(self.triplet_margin)),
+            'sigma_mean': sigma_ab.detach().mean(),
+            'log_sigma_mean': log_sigma_ab.detach().mean(),
+            'log_sigma_min': log_sigma_ab.detach().amin(),
+            'log_sigma_max': log_sigma_ab.detach().amax(),
             **lt_diag,
             # Visualisation (first sample only)
             'pred_I2_d':            pred_I2[:1, ...],

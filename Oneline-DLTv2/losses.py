@@ -195,12 +195,13 @@ def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
 # ---------------------------------------------------------------------------
 
 def compute_total_loss(la, lt, ls, lsm, lo=None, lr=None, ltmp=None,
-                       lam_triplet=0.1, lam_support=0.01,
+                       lam_align=1.0, lam_triplet=0.1, lam_support=0.01,
                        lam_smooth=0.001,
                        lam_offset=1e-4, lam_rel=0.1, lam_temp=0.1,
                        include_geometric=True):
     """
     la  = L_align    (carries the +log σ calibration term internally)
+                     (weight lam_align)
     lt  = L_triplet  (weight lam_triplet)
     ls  = L_support  (weight lam_support)
     lsm = L_smooth   (weight lam_smooth)
@@ -210,7 +211,7 @@ def compute_total_loss(la, lt, ls, lsm, lo=None, lr=None, ltmp=None,
     """
     total = la.new_tensor(0.0)
     if include_geometric:
-        total = total + la + lam_triplet * lt + lam_support * ls + lam_smooth * lsm
+        total = total + lam_align * la + lam_triplet * lt + lam_support * ls + lam_smooth * lsm
         if lo is not None:
             total = total + lam_offset * lo
     if lr is not None:

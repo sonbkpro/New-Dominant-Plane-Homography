@@ -267,6 +267,7 @@ def test(args):
         H_ab = out['H_ab']          # [1, 3, 3]
         q_ab = out['validity_prob_ab']          # [1, 1, Ph, Pw]
         log_sigma_ab = out['log_sigma_ab']      # [1, 1, Ph, Pw]
+        sigma_ab = out.get('sigma_ab', torch.exp(log_sigma_ab))
         s_ab = out['reliability_score']         # [1, 1]
 
         # ---- Reprojection error ----
@@ -325,7 +326,7 @@ def test(args):
             os.path.join(result_files, name + '_q_ab.png'),
         )
         save_heatmap(
-            torch.exp(log_sigma_ab[0, 0]),
+            sigma_ab[0, 0],
             os.path.join(result_files, name + '_sigma_ab.png'),
         )
 
