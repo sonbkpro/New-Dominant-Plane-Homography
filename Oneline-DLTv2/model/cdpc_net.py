@@ -1,21 +1,26 @@
 """Top-level Calibrated Dominant-Plane Consensus network.
 
-Pipeline (one direction, predicts H_ab only):
+Pipeline (one direction, predicts H_ab only). The H regression path uses a
+JOINT 2-channel backbone (v1-style channel-stacked input) so every conv layer
+sees both images. The per-pixel posterior/uncertainty heads keep using the
+per-image multi-scale backbone, where having clean per-image features matters
+for residual computation.
 
     (I_a_patch, I_b_patch)
-        -> multi-scale features F_a^{1/4}, F_a^{1/8}, F_b^{1/4}, F_b^{1/8}
-        -> local correlation c^{1/8}(F_a, F_b)
-        -> HomographyHead([F_a^{1/8}, F_b^{1/8}, c^{1/8}]) -> 4-pt offset
-        -> H_ab in patch-local pixel coordinates (via DLT_solve)
 
-        -> warp F_a^{1/4} by H_ab (rescaled to 1/4) -> F_a_warped^{1/4}
-        -> residual r = ||F_b^{1/4} - F_a_warped^{1/4}||_1 (channel-summed)
-        -> upsample c^{1/8} -> c^{1/4}
-        -> PosteriorHead([F_b^{1/4}, F_a_warped^{1/4}, c^{1/4}, r]) -> q
-        -> UncertaintyHead([F_b^{1/4}, F_a_warped^{1/4}, c^{1/4}, r]) -> log sigma
-
-        -> optional analytic-inverse cycle for the reliability vector
-        -> ReliabilityHead(phi) -> s in (0, 1)
+      ┌─ joint:    cat(I_a, I_b)              -> JointBackbone (2-ch)
+      │              -> F_joint^{1/8}
+      │              -> HomographyHead([F_joint^{1/8}, c^{1/8}]) -> 4-pt offset
+      │              -> H_ab (DLT_solve, in patch-local pixel coords)
+      │
+      └─ per-image: I_a, I_b separately       -> MultiScaleBackbone (1-ch)
+                     -> F_a^{1/4}, F_a^{1/8}, F_b^{1/4}, F_b^{1/8}
+                     -> Correlation(F_a^{1/8}, F_b^{1/8})   -> c^{1/8}
+                     -> warp F_a^{1/4} by H_ab              -> F_a_warped^{1/4}
+                     -> residual r = mean_c |F_b - F_a_warped|
+                     -> PosteriorHead([F_b^{1/4}, F_a_warped, c^{1/4}, r]) -> q
+                     -> UncertaintyHead([F_b^{1/4}, F_a_warped, c^{1/4}, r]) -> log sigma
+                     -> cycle features                      -> ReliabilityHead -> s
 
 Outputs are returned as a dictionary so train.py can apply individual losses.
 """
@@ -66,16 +71,32 @@ class CDPCNet(nn.Module):
         self.patch_h = patch_h
         self.patch_w = patch_w
 
+        # Per-image multi-scale backbone -- feeds the per-pixel heads (q, sigma)
+        # and the residual computation. Keeps clean per-image features so the
+        # consensus / uncertainty reasoning is well-defined.
         self.backbone = MultiScaleBackbone(
             pretrained=backbone_pretrained,
+            in_channels=1,
             out_channels_quarter=bb_quarter_channels,
             out_channels_eighth=bb_eighth_channels,
         )
+
+        # JOINT 2-channel backbone -- feeds the H regression head. v1-style
+        # (channel-stacked I_a, I_b) so every conv layer is cross-image-aware.
+        # This is the architectural change that lets H regression match v1.
+        self.joint_backbone = MultiScaleBackbone(
+            pretrained=backbone_pretrained,
+            in_channels=2,
+            out_channels_quarter=bb_quarter_channels,
+            out_channels_eighth=bb_eighth_channels,
+        )
+
         self.correlation = LocalCorrelation(
             radius=corr_radius, out_channels=corr_out_channels,
         )
 
-        homo_in = 2 * bb_eighth_channels + corr_out_channels
+        # H head now consumes joint features + correlation (not per-image features).
+        homo_in = bb_eighth_channels + corr_out_channels
         self.homography_head = HomographyHead(homo_in, rho=homography_rho)
 
         # Posterior / uncertainty heads consume [F_b^{1/4}, F_a_warped^{1/4},
@@ -119,17 +140,25 @@ class CDPCNet(nn.Module):
         B = I_a.shape[0]
         device = I_a.device
 
-        # --- feature extraction ---------------------------------------------
+        # --- per-image features (for q, sigma, residual) --------------------
         fa = self.backbone(I_a)
         fb = self.backbone(I_b)
         F_a4, F_a8 = fa["quarter"], fa["eighth"]
         F_b4, F_b8 = fb["quarter"], fb["eighth"]
 
+        # --- joint features (for H regression) ------------------------------
+        # Channel-stacked input means every conv layer in the joint backbone
+        # processes the pair simultaneously, building cross-image features at
+        # every spatial scale (v1's recipe).
+        joint_in = torch.cat([I_a, I_b], dim=1)                     # (B, 2, H, W)
+        f_joint = self.joint_backbone(joint_in)
+        F_joint8 = f_joint["eighth"]                                # (B, C, H/8, W/8)
+
         # --- correlation at 1/8 ---------------------------------------------
         c8 = self.correlation(F_a8, F_b8)                           # (B, Cc, H/8, W/8)
 
         # --- homography prediction ------------------------------------------
-        homo_in = torch.cat([F_a8, F_b8, c8], dim=1)
+        homo_in = torch.cat([F_joint8, c8], dim=1)
         offset = self.homography_head(homo_in)                      # (B, 8) in pixels
 
         h4p_batch = self.h4p_patch.expand(B, -1).to(device)

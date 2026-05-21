@@ -26,6 +26,7 @@ class MultiScaleBackbone(nn.Module):
     def __init__(
         self,
         pretrained: bool = True,
+        in_channels: int = 1,
         out_channels_quarter: int = 64,
         out_channels_eighth: int = 128,
     ):
@@ -36,16 +37,20 @@ class MultiScaleBackbone(nn.Module):
         except (AttributeError, TypeError):
             net = tv_models.resnet18(pretrained=pretrained)
 
-        # Adapt conv1 to 1-channel input by averaging the 3-channel kernel.
+        # Adapt conv1 to in_channels input. For pretrained init, average the
+        # ImageNet RGB-3-channel kernel down to 1 channel, then replicate so
+        # every input channel gets the same initial filter response. This works
+        # for any in_channels >= 1 (we use it for 1 and 2).
         orig_conv1 = net.conv1
         new_conv1 = nn.Conv2d(
-            1, orig_conv1.out_channels,
+            in_channels, orig_conv1.out_channels,
             kernel_size=orig_conv1.kernel_size, stride=orig_conv1.stride,
             padding=orig_conv1.padding, bias=False,
         )
         if pretrained:
             with torch.no_grad():
-                new_conv1.weight.copy_(orig_conv1.weight.mean(dim=1, keepdim=True))
+                mean_w = orig_conv1.weight.mean(dim=1, keepdim=True)   # (64,1,7,7)
+                new_conv1.weight.copy_(mean_w.expand(-1, in_channels, -1, -1))
         net.conv1 = new_conv1
 
         self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)

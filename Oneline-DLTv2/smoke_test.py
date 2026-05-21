@@ -115,7 +115,8 @@ def main():
     # Check that gradients propagated to all major parameter groups.
     grad_norms = {}
     for name, module in [
-        ("backbone", net.backbone),
+        ("backbone (per-image)", net.backbone),
+        ("joint_backbone (2-ch)", net.joint_backbone),
         ("correlation", net.correlation),
         ("homography_head", net.homography_head),
         ("posterior_head", net.posterior_head),
