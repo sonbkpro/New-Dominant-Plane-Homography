@@ -79,7 +79,11 @@ class TestDataset(Dataset):
         I_b_patch = img_b[:, y:y + self.patch_h, x:x + self.patch_w]
 
         # Manual point correspondences (in full-image coordinates).
-        npy_name = parts[0].split("/")[1] + "_" + parts[1].split("/")[1][:-1] + ".npy"
+        # Note: v1 wrote `parts[1].split("/")[1][:-1]` because v1 did NOT strip
+        # the trailing newline from the line. v2 strips it in __init__, so
+        # do NOT chop the last char or "00000100_10011.jpg" becomes ".jp".
+        npy_name = (parts[0].split("/")[1] + "_" +
+                    parts[1].split("/")[1] + ".npy")
         npy_path = os.path.join(self.npy_root, npy_name)
         point_dict = np.load(npy_path, allow_pickle=True).item()
         pts = np.array(point_dict["matche_pts"], dtype=np.float32)   # (K, 2, 2)
