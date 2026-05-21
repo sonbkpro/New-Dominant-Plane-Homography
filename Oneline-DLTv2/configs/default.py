@@ -54,8 +54,11 @@ class Config:
     # ---- Loss weights
     lambda_triplet: float = 1.0
     lambda_align: float = 1.0
-    lambda_em: float = 0.5
-    lambda_support: float = 0.01
+    lambda_em: float = 0.1             # was 0.5; EM raw values 3-5 contributed
+                                        # ~2.5 to L_total at warmup end, causing
+                                        # an optimizer shock that distorted H.
+    lambda_support: float = 0.1        # was 0.01; needs to actually bite to
+                                        # prevent q-collapse below alpha.
     lambda_smooth: float = 1.0e-3
     lambda_rel: float = 0.1
     lambda_cycle: float = 0.0          # off by default: identity is the unique
@@ -64,7 +67,18 @@ class Config:
                                         # identity during early training. Turn
                                         # on (e.g. 0.01) only for the ablation
                                         # row in the paper.
-    alpha_support: float = 0.10
+    lambda_sigma_reg: float = 0.01     # soft pull of log(sigma) toward 0
+                                        # (sigma toward 1); blocks the Kendall-
+                                        # Gal sigma-shrinking shortcut without
+                                        # hard-clamping log_sigma.
+    alpha_support: float = 0.25        # was 0.10; observed q_bar collapsing
+                                        # to 0.04 during align ramp, way below
+                                        # the floor.
+    triplet_use_q_weighting: bool = False  # plan-literal triplet had q weight,
+                                        # but that creates a degenerate loop:
+                                        # q collapse -> tiny triplet grad ->
+                                        # H stops learning -> worse q. Uniform
+                                        # weighting decouples H learning from q.
     smoothness_gamma: float = 10.0
     triplet_margin: float = 1.0
 

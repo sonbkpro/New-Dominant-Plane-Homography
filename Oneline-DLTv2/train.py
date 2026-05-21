@@ -211,6 +211,7 @@ def train(args, cfg: Config):
                 L_triplet = triplet_loss(
                     F_b_nat, F_a_warped_nat, F_a_nat,
                     q_nat, valid_nat, margin=cfg.triplet_margin,
+                    use_q_weighting=cfg.triplet_use_q_weighting,
                 )
                 L_align = alignment_loss(
                     residual_nat, log_sigma_nat, q_nat, valid_nat,
@@ -242,6 +243,13 @@ def train(args, cfg: Config):
                     F_a_nat, F_a_rec_nat, cycle_valid_nat, cond_valid_nat,
                 )
 
+                # Sigma regularizer: pull log(sigma) toward 0 (sigma ~= 1).
+                # Blocks the Kendall-Gal "shrink sigma to drive log-likelihood
+                # negative" shortcut. Computed in fp32 (log_sigma_nat already
+                # float here).
+                L_sigma_reg = (log_sigma_nat * valid_nat).pow(2).sum() / \
+                              valid_nat.sum().clamp(min=1.0)
+
                 # Linear ramps for L_align and L_em: zero during warmup, then
                 # ramp to the configured weight. Lets L_triplet drive H first.
                 def _ramp(it, warmup, ramp):
@@ -257,13 +265,14 @@ def train(args, cfg: Config):
                     glob_iter, cfg.em_warmup_iters, cfg.em_ramp_iters)
 
                 L_total = (
-                    cfg.lambda_triplet * L_triplet
+                    cfg.lambda_triplet   * L_triplet
                     + lam_align_eff      * L_align
                     + lam_em_eff         * L_em
                     + cfg.lambda_support * L_support
                     + cfg.lambda_smooth  * L_smooth
                     + cfg.lambda_rel     * L_rel
                     + cfg.lambda_cycle   * L_cycle
+                    + cfg.lambda_sigma_reg * L_sigma_reg
                 )
 
             scaler.scale(L_total).backward()
@@ -287,6 +296,7 @@ def train(args, cfg: Config):
             writer.add_scalar("loss/smooth",  float(L_smooth),  glob_iter)
             writer.add_scalar("loss/rel",     float(L_rel),     glob_iter)
             writer.add_scalar("loss/cycle",   float(L_cycle),   glob_iter)
+            writer.add_scalar("loss/sigma_reg", float(L_sigma_reg), glob_iter)
             writer.add_scalar("opt/lr",       scheduler.get_last_lr()[0], glob_iter)
             writer.add_scalar("opt/lambda_align_eff", lam_align_eff,    glob_iter)
             writer.add_scalar("opt/lambda_em_eff",    lam_em_eff,       glob_iter)
