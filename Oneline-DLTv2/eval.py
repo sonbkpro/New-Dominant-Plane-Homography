@@ -74,12 +74,18 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
         crop_xy = batch["crop_xy"].to(device)
         out = net(I_a, I_b)
         H_full = patch_to_full_homography(out["H_ab"], crop_xy)
-        pts = batch["points"].to(device)
+        # Match v1's protocol: first 6 correspondences only, and per-point
+        # min over the (A,B) / (B,A) swap, then mean. Mean-then-min is a
+        # different metric — and every downstream number here (AUC, inlier,
+        # AUROC, AUPRC, ECE, NLL, risk-coverage) is built from this per-pair
+        # err, so the v1↔v2 trustworthiness table is only comparable when
+        # the per-pair scalar is computed v1's way.
+        pts = batch["points"].to(device)[:, :6, :, :]   # (B, 6, 2, 2)
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
-        err_ab = point_reprojection_error(H_full, pts_a, pts_b).mean(dim=1)
-        err_ba = point_reprojection_error(H_full, pts_b, pts_a).mean(dim=1)
-        err = torch.minimum(err_ab, err_ba)
+        err_ab = point_reprojection_error(H_full, pts_a, pts_b)         # (B, 6)
+        err_ba = point_reprojection_error(H_full, pts_b, pts_a)         # (B, 6)
+        err = torch.minimum(err_ab, err_ba).mean(dim=1)                 # (B,)
         for j in range(I_a.shape[0]):
             errs.append(float(err[j]))
             scenes.append(batch["scene"][j])

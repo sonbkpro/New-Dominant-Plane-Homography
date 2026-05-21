@@ -95,13 +95,16 @@ def run_eval_l2(net, test_loader, device, max_batches=None) -> dict:
         out = net(I_a, I_b)
         H_full = patch_to_full_homography(out["H_ab"], crop_xy)
 
-        pts = batch["points"].to(device)               # (B, K, 2, 2): K pairs of (a, b)
+        # Match v1's protocol exactly: first 6 correspondences only
+        # (v1/test.py:169 `for j in range(6)`), and per-point min of the
+        # (A,B) / (B,A) reprojection — not mean-then-min — because the
+        # annotator's pair ordering can flip independently per point.
+        pts = batch["points"].to(device)[:, :6, :, :]   # (B, 6, 2, 2)
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
-        err_ab = point_reprojection_error(H_full, pts_a, pts_b)
-        # Symmetry (v1 takes min(err_LR, err_RL)).
-        err_ba = point_reprojection_error(H_full, pts_b, pts_a)
-        err = torch.minimum(err_ab.mean(dim=1), err_ba.mean(dim=1))   # (B,)
+        err_ab = point_reprojection_error(H_full, pts_a, pts_b)         # (B, 6)
+        err_ba = point_reprojection_error(H_full, pts_b, pts_a)         # (B, 6)
+        err = torch.minimum(err_ab, err_ba).mean(dim=1)                 # (B,)
         for j in range(I_a.shape[0]):
             scene = batch["scene"][j]
             per_scene.setdefault(scene, []).append(float(err[j]))

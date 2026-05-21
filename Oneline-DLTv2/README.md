@@ -5,6 +5,8 @@ dominant-plane posterior `q_i`, spatial uncertainty `log σ_i`, and pair-level
 reliability `s_ab`. Trained unsupervised on the CA-Homography pair list inherited
 from v1.
 
+For the full architecture drawing, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ## Layout
 
 ```

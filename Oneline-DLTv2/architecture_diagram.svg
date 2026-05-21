@@ -1,0 +1,283 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180" role="img" aria-labelledby="title desc">
+  <title id="title">Oneline-DLTv2 Architecture</title>
+  <desc id="desc">Block diagram of the Oneline-DLTv2 model showing input patches, per-image features, joint homography path, correlation, DLT, warping, pixel heads, reliability head, and losses.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#2d3748"/>
+    </marker>
+    <marker id="arrow-soft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      .bg { fill: #f7fafc; }
+      .title { font: 700 34px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #4b5563; }
+      .group-title { font: 700 17px Arial, sans-serif; fill: #1f2937; }
+      .box-title { font: 700 18px Arial, sans-serif; fill: #111827; }
+      .box-text { font: 400 14px Arial, sans-serif; fill: #374151; }
+      .small { font: 400 12px Arial, sans-serif; fill: #475569; }
+      .tiny { font: 400 11px Arial, sans-serif; fill: #64748b; }
+      .pill { font: 700 13px Arial, sans-serif; fill: #1f2937; }
+      .input { fill: #ffffff; stroke: #2563eb; stroke-width: 2; }
+      .per { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; }
+      .joint { fill: #fff7ed; stroke: #ea580c; stroke-width: 2; }
+      .corr { fill: #f0fdf4; stroke: #16a34a; stroke-width: 2; }
+      .homo { fill: #fefce8; stroke: #ca8a04; stroke-width: 2; }
+      .warp { fill: #fdf2f8; stroke: #db2777; stroke-width: 2; }
+      .head { fill: #eef2ff; stroke: #4f46e5; stroke-width: 2; }
+      .rel { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 2; }
+      .loss { fill: #ffffff; stroke: #64748b; stroke-width: 1.6; }
+      .group { fill: rgba(255,255,255,0.7); stroke: #cbd5e1; stroke-width: 1.5; stroke-dasharray: 8 6; }
+      .line { fill: none; stroke: #2d3748; stroke-width: 2.2; marker-end: url(#arrow); }
+      .soft-line { fill: none; stroke: #64748b; stroke-width: 1.8; marker-end: url(#arrow-soft); }
+      .dash-line { fill: none; stroke: #64748b; stroke-width: 1.8; stroke-dasharray: 7 6; marker-end: url(#arrow-soft); }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1600" height="1180"/>
+  <text x="64" y="62" class="title">Oneline-DLTv2 Architecture</text>
+  <text x="64" y="92" class="subtitle">Global homography from a joint image-pair route, plus calibrated dominant-plane consensus from per-image features.</text>
+
+  <!-- Inputs -->
+  <rect x="64" y="145" width="170" height="78" rx="10" class="input"/>
+  <text x="88" y="176" class="box-title">I_a patch</text>
+  <text x="88" y="201" class="box-text">(B, 1, 315, 560)</text>
+
+  <rect x="64" y="270" width="170" height="78" rx="10" class="input"/>
+  <text x="88" y="301" class="box-title">I_b patch</text>
+  <text x="88" y="326" class="box-text">(B, 1, 315, 560)</text>
+
+  <!-- Groups -->
+  <rect x="285" y="124" width="355" height="270" rx="14" class="group"/>
+  <text x="308" y="154" class="group-title">Per-image feature path</text>
+
+  <rect x="285" y="442" width="355" height="180" rx="14" class="group"/>
+  <text x="308" y="472" class="group-title">Joint homography path</text>
+
+  <rect x="695" y="160" width="300" height="175" rx="14" class="group"/>
+  <text x="718" y="190" class="group-title">Correspondence</text>
+
+  <rect x="1040" y="136" width="390" height="235" rx="14" class="group"/>
+  <text x="1063" y="166" class="group-title">Homography regression</text>
+
+  <rect x="720" y="438" width="710" height="250" rx="14" class="group"/>
+  <text x="743" y="468" class="group-title">Warp, residual, pixel heads</text>
+
+  <rect x="720" y="745" width="710" height="205" rx="14" class="group"/>
+  <text x="743" y="775" class="group-title">Pair reliability</text>
+
+  <rect x="64" y="1000" width="1366" height="120" rx="14" class="group"/>
+  <text x="87" y="1030" class="group-title">Training signals</text>
+
+  <!-- Per-image path -->
+  <rect x="322" y="182" width="250" height="76" rx="10" class="per"/>
+  <text x="346" y="212" class="box-title">Backbone A</text>
+  <text x="346" y="237" class="box-text">ResNet-18 to 1/4 and 1/8</text>
+
+  <rect x="322" y="292" width="250" height="76" rx="10" class="per"/>
+  <text x="346" y="322" class="box-title">Backbone B</text>
+  <text x="346" y="347" class="box-text">shared per-image module</text>
+
+  <rect x="705" y="38" width="160" height="58" rx="9" class="per"/>
+  <text x="732" y="62" class="pill">F_a4</text>
+  <text x="727" y="82" class="small">(B,64,79,140)</text>
+
+  <rect x="705" y="116" width="160" height="58" rx="9" class="per"/>
+  <text x="732" y="140" class="pill">F_a8</text>
+  <text x="727" y="160" class="small">(B,128,40,70)</text>
+
+  <rect x="705" y="354" width="160" height="58" rx="9" class="per"/>
+  <text x="732" y="378" class="pill">F_b4</text>
+  <text x="727" y="398" class="small">(B,64,79,140)</text>
+
+  <rect x="705" y="276" width="160" height="58" rx="9" class="per"/>
+  <text x="732" y="300" class="pill">F_b8</text>
+  <text x="727" y="320" class="small">(B,128,40,70)</text>
+
+  <!-- Joint path -->
+  <rect x="322" y="510" width="250" height="76" rx="10" class="joint"/>
+  <text x="346" y="540" class="box-title">Joint Backbone</text>
+  <text x="346" y="565" class="box-text">cat(I_a, I_b), 2 channels</text>
+
+  <rect x="705" y="514" width="180" height="64" rx="9" class="joint"/>
+  <text x="730" y="541" class="pill">F_joint8</text>
+  <text x="725" y="562" class="small">(B,128,40,70)</text>
+
+  <!-- Correlation -->
+  <rect x="735" y="210" width="220" height="76" rx="10" class="corr"/>
+  <text x="760" y="240" class="box-title">LocalCorrelation</text>
+  <text x="760" y="265" class="box-text">R=4 cosine cost volume</text>
+
+  <rect x="1038" y="213" width="150" height="64" rx="9" class="corr"/>
+  <text x="1070" y="239" class="pill">c8</text>
+  <text x="1060" y="260" class="small">(B,32,40,70)</text>
+
+  <!-- Homography -->
+  <rect x="1235" y="188" width="160" height="74" rx="10" class="homo"/>
+  <text x="1261" y="217" class="box-title">H Head</text>
+  <text x="1258" y="242" class="box-text">conv + GAP + MLP</text>
+
+  <rect x="1235" y="294" width="160" height="58" rx="9" class="homo"/>
+  <text x="1260" y="318" class="pill">offset_ab</text>
+  <text x="1276" y="338" class="small">(B,8)</text>
+
+  <rect x="1454" y="218" width="105" height="66" rx="10" class="homo"/>
+  <text x="1480" y="246" class="box-title">DLT</text>
+  <text x="1472" y="270" class="box-text">4 corners</text>
+
+  <rect x="1454" y="316" width="105" height="58" rx="9" class="homo"/>
+  <text x="1474" y="340" class="pill">H_ab</text>
+  <text x="1472" y="360" class="small">(B,3,3)</text>
+
+  <!-- Warp and pixel heads -->
+  <rect x="760" y="506" width="170" height="76" rx="10" class="warp"/>
+  <text x="790" y="536" class="box-title">Warp</text>
+  <text x="779" y="561" class="box-text">F_a4 by H_quarter</text>
+
+  <rect x="975" y="506" width="175" height="76" rx="10" class="warp"/>
+  <text x="998" y="536" class="box-title">F_a_warped</text>
+  <text x="1001" y="561" class="box-text">(B,64,79,140)</text>
+
+  <rect x="975" y="610" width="175" height="58" rx="9" class="warp"/>
+  <text x="1007" y="634" class="pill">residual r</text>
+  <text x="1001" y="654" class="small">mean_c |F_b4 - warp|</text>
+
+  <rect x="1195" y="507" width="190" height="76" rx="10" class="head"/>
+  <text x="1218" y="537" class="box-title">Pixel input</text>
+  <text x="1218" y="562" class="box-text">cat(F_b4, warp, c4, r)</text>
+
+  <rect x="1454" y="484" width="105" height="58" rx="9" class="head"/>
+  <text x="1490" y="508" class="pill">q</text>
+  <text x="1472" y="528" class="small">posterior</text>
+
+  <rect x="1454" y="586" width="105" height="58" rx="9" class="head"/>
+  <text x="1470" y="610" class="pill">log_sigma</text>
+  <text x="1476" y="630" class="small">uncertainty</text>
+
+  <rect x="760" y="626" width="170" height="50" rx="9" class="warp"/>
+  <text x="790" y="657" class="pill">valid_mask</text>
+
+  <!-- Reliability -->
+  <rect x="760" y="808" width="170" height="74" rx="10" class="rel"/>
+  <text x="786" y="837" class="box-title">Inverse</text>
+  <text x="777" y="862" class="box-text">safe H_quarter^-1</text>
+
+  <rect x="975" y="808" width="175" height="74" rx="10" class="rel"/>
+  <text x="1004" y="837" class="box-title">Cycle warp</text>
+  <text x="993" y="862" class="box-text">recover F_a feature</text>
+
+  <rect x="1195" y="808" width="190" height="74" rx="10" class="rel"/>
+  <text x="1224" y="837" class="box-title">8 stats phi</text>
+  <text x="1218" y="862" class="box-text">q, residual, sigma, cycle</text>
+
+  <rect x="1454" y="816" width="105" height="58" rx="9" class="rel"/>
+  <text x="1473" y="840" class="pill">score s</text>
+  <text x="1475" y="860" class="small">(B,)</text>
+
+  <!-- Outputs -->
+  <rect x="1440" y="700" width="130" height="56" rx="28" fill="#111827"/>
+  <text x="1468" y="725" style="font:700 15px Arial,sans-serif;fill:white;">Outputs</text>
+  <text x="1460" y="744" style="font:400 12px Arial,sans-serif;fill:#d1d5db;">H, q, sigma, s</text>
+
+  <!-- Losses -->
+  <rect x="100" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="121" y="1082" class="pill">L_triplet</text>
+
+  <rect x="285" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="310" y="1082" class="pill">L_align</text>
+
+  <rect x="470" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="507" y="1082" class="pill">L_em</text>
+
+  <rect x="655" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="682" y="1082" class="pill">L_support</text>
+
+  <rect x="840" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="866" y="1082" class="pill">L_smooth</text>
+
+  <rect x="1025" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="1060" y="1082" class="pill">L_rel</text>
+
+  <rect x="1210" y="1055" width="145" height="44" rx="8" class="loss"/>
+  <text x="1239" y="1082" class="pill">L_sigma</text>
+
+  <rect x="1410" y="1048" width="120" height="58" rx="10" fill="#111827" stroke="#111827"/>
+  <text x="1437" y="1073" style="font:700 15px Arial,sans-serif;fill:white;">L_total</text>
+  <text x="1430" y="1092" style="font:400 12px Arial,sans-serif;fill:#d1d5db;">weighted sum</text>
+
+  <!-- Arrows: inputs to paths -->
+  <path class="line" d="M234 184 C265 184 282 210 322 220"/>
+  <path class="line" d="M234 309 C265 309 282 330 322 330"/>
+  <path class="line" d="M234 184 C270 205 285 515 322 535"/>
+  <path class="line" d="M234 309 C270 340 285 545 322 558"/>
+
+  <!-- Features -->
+  <path class="line" d="M572 210 C620 190 655 72 705 67"/>
+  <path class="line" d="M572 230 C620 220 650 148 705 145"/>
+  <path class="line" d="M572 320 C620 325 650 382 705 383"/>
+  <path class="line" d="M572 330 C620 318 650 306 705 305"/>
+  <path class="line" d="M572 548 C620 548 655 546 705 546"/>
+
+  <!-- Correlation -->
+  <path class="line" d="M865 145 C905 145 715 209 735 228"/>
+  <path class="line" d="M865 305 C900 305 705 270 735 260"/>
+  <path class="line" d="M955 248 C990 248 1005 245 1038 245"/>
+
+  <!-- Homography -->
+  <path class="line" d="M885 546 C1010 548 1115 228 1235 224"/>
+  <path class="line" d="M1188 245 C1205 245 1218 230 1235 226"/>
+  <path class="line" d="M1315 262 C1315 276 1315 282 1315 294"/>
+  <path class="line" d="M1395 224 C1420 224 1431 250 1454 251"/>
+  <path class="line" d="M1506 284 C1506 299 1506 306 1506 316"/>
+
+  <!-- H to warp and valid -->
+  <path class="line" d="M1454 345 C1310 384 990 417 845 506"/>
+  <path class="soft-line" d="M1454 345 C1280 424 860 585 845 626"/>
+
+  <!-- Warp/residual/head -->
+  <path class="line" d="M785 96 C755 235 745 470 760 535"/>
+  <path class="line" d="M930 544 C950 544 955 544 975 544"/>
+  <path class="line" d="M865 383 C925 405 940 625 975 638"/>
+  <path class="line" d="M1062 582 C1062 596 1062 602 1062 610"/>
+  <path class="line" d="M1150 544 C1168 544 1178 544 1195 544"/>
+  <path class="line" d="M1150 638 C1175 630 1170 570 1195 560"/>
+  <path class="soft-line" d="M1188 245 C1238 285 1190 470 1212 508"/>
+  <path class="line" d="M1385 544 C1416 530 1428 516 1454 513"/>
+  <path class="line" d="M1385 544 C1416 560 1428 610 1454 615"/>
+  <path class="soft-line" d="M930 651 C1135 705 1320 708 1440 720"/>
+  <path class="soft-line" d="M1559 345 C1580 440 1580 650 1515 700"/>
+  <path class="soft-line" d="M1559 513 C1584 565 1570 670 1515 700"/>
+  <path class="soft-line" d="M1559 615 C1580 655 1560 690 1515 700"/>
+
+  <!-- Reliability arrows -->
+  <path class="line" d="M1454 345 C1300 460 890 705 845 808"/>
+  <path class="line" d="M930 845 C948 845 957 845 975 845"/>
+  <path class="line" d="M1150 845 C1168 845 1178 845 1195 845"/>
+  <path class="line" d="M1385 845 C1417 845 1428 845 1454 845"/>
+  <path class="dash-line" d="M1506 874 C1506 914 1506 970 1506 1048"/>
+
+  <!-- Loss arrows -->
+  <path class="dash-line" d="M1062 668 C860 780 280 950 172 1055"/>
+  <path class="dash-line" d="M1506 513 C1280 760 405 935 357 1055"/>
+  <path class="dash-line" d="M1506 615 C1265 790 570 950 542 1055"/>
+  <path class="dash-line" d="M1506 513 C1325 805 750 960 727 1055"/>
+  <path class="dash-line" d="M1506 513 C1380 825 925 965 912 1055"/>
+  <path class="dash-line" d="M1506 845 C1410 980 1120 1000 1097 1055"/>
+  <path class="dash-line" d="M1506 615 C1420 890 1260 1010 1282 1055"/>
+
+  <path class="soft-line" d="M245 1077 C260 1077 270 1077 285 1077"/>
+  <path class="soft-line" d="M430 1077 C445 1077 455 1077 470 1077"/>
+  <path class="soft-line" d="M615 1077 C630 1077 640 1077 655 1077"/>
+  <path class="soft-line" d="M800 1077 C815 1077 825 1077 840 1077"/>
+  <path class="soft-line" d="M985 1077 C1000 1077 1010 1077 1025 1077"/>
+  <path class="soft-line" d="M1170 1077 C1185 1077 1195 1077 1210 1077"/>
+  <path class="soft-line" d="M1355 1077 C1375 1077 1390 1077 1410 1077"/>
+
+  <!-- Legend -->
+  <rect x="64" y="1128" width="20" height="14" rx="3" class="joint"/>
+  <text x="94" y="1140" class="tiny">joint route predicts H_ab</text>
+  <rect x="285" y="1128" width="20" height="14" rx="3" class="per"/>
+  <text x="315" y="1140" class="tiny">per-image route builds residual/q/sigma</text>
+  <rect x="575" y="1128" width="20" height="14" rx="3" class="rel"/>
+  <text x="605" y="1140" class="tiny">pooled stats predict reliability s</text>
+</svg>

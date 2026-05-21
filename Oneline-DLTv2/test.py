@@ -48,22 +48,32 @@ def test(ckpt_path: str):
     loader = DataLoader(ds, batch_size=1, num_workers=0, shuffle=False)
 
     bucket = {"RE": [], "LT": [], "LL": [], "SF": [], "LF": []}
-    for batch in loader:
+    for i, batch in enumerate(loader):
         I_a = batch["I_a_patch"].to(device)
         I_b = batch["I_b_patch"].to(device)
         crop_xy = batch["crop_xy"].to(device)
         out = net(I_a, I_b)
         H_full = patch_to_full_homography(out["H_ab"], crop_xy)
-        pts = batch["points"].to(device)
+
+        # v1 hardcodes the first 6 manual correspondences per pair
+        # (test.py:169 `for j in range(6)`). Match it so per-pair errors
+        # are directly comparable across the two codebases.
+        pts = batch["points"].to(device)[:, :6, :, :]
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
-        err_ab = point_reprojection_error(H_full, pts_a, pts_b).mean(dim=1)
-        err_ba = point_reprojection_error(H_full, pts_b, pts_a).mean(dim=1)
-        err = float(torch.minimum(err_ab, err_ba).item())
+        # v1 takes min(err_LR, err_RL) PER POINT, then averages — the
+        # annotator's (A, B) ordering can flip independently per point.
+        # Mean-then-min (the previous v2 form) is a different metric and
+        # underestimates error on pairs with mixed annotation order.
+        err_ab = point_reprojection_error(H_full, pts_a, pts_b)         # (B, 6)
+        err_ba = point_reprojection_error(H_full, pts_b, pts_a)         # (B, 6)
+        err_per_point = torch.minimum(err_ab, err_ba)                   # (B, 6)
+        err = float(err_per_point.mean(dim=1).item())
+
         scene = batch["scene"][0]
         if scene in bucket:
             bucket[scene].append(err)
-        print(f"{scene}: {err:.4f}")
+        print(f"{i:08d} [{scene}]: {err:.4f}")
 
     res = {k: float(np.mean(v)) if v else float("nan") for k, v in bucket.items()}
     res["Avg"] = float(np.mean([res[k] for k in ("RE", "LT", "LL", "SF", "LF")
