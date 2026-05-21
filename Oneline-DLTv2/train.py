@@ -191,18 +191,22 @@ def train(args, cfg: Config):
             with torch.amp.autocast("cuda", enabled=cfg.use_amp):
                 out = net(I_a_all, I_b_all)
 
-                # Slice natural-pair outputs.
-                F_b_nat        = out["F_b4"][:B]
-                F_a_warped_nat = out["F_a_warped"][:B]
-                F_a_nat        = out["F_a4"][:B]
-                F_a_rec_nat    = out["F_a_recovered"][:B]
-                q_nat          = out["q"][:B]
-                log_sigma_nat  = out["log_sigma"][:B]
-                residual_nat   = out["residual"][:B]
-                valid_nat      = out["valid_mask"][:B]
-                cycle_valid_nat = out["cycle_valid"][:B]
-                cond_valid_nat  = out["cond_valid"][:B]
-                s_all          = out["s"]
+            # ---- compute losses in fp32 to avoid fp16 overflow in Charbonnier
+            #      sqrt(x^2), Kendall-Gal r/sigma, and EM log-sum-exp. AMP-style
+            #      training keeps the conv forward in fp16 for speed but evals
+            #      the loss in fp32; this is the standard recipe.
+            with torch.amp.autocast("cuda", enabled=False):
+                F_b_nat        = out["F_b4"][:B].float()
+                F_a_warped_nat = out["F_a_warped"][:B].float()
+                F_a_nat        = out["F_a4"][:B].float()
+                F_a_rec_nat    = out["F_a_recovered"][:B].float()
+                q_nat          = out["q"][:B].float()
+                log_sigma_nat  = out["log_sigma"][:B].float()
+                residual_nat   = out["residual"][:B].float()
+                valid_nat      = out["valid_mask"][:B].float()
+                cycle_valid_nat = out["cycle_valid"][:B].float()
+                cond_valid_nat  = out["cond_valid"][:B].float()
+                s_all          = out["s"].float()
 
                 L_triplet = triplet_loss(
                     F_b_nat, F_a_warped_nat, F_a_nat,
@@ -220,7 +224,8 @@ def train(args, cfg: Config):
                     L_em = torch.zeros((), device=device)
 
                 L_support = support_loss(q_nat, valid_nat, alpha=cfg.alpha_support)
-                L_smooth = edge_aware_smoothness(q_nat, I_b, gamma=cfg.smoothness_gamma)
+                L_smooth = edge_aware_smoothness(q_nat, I_b.float(),
+                                                 gamma=cfg.smoothness_gamma)
 
                 if do_rel:
                     r_mean_nat = residual_nat.mean(dim=(1, 2, 3))
@@ -228,7 +233,7 @@ def train(args, cfg: Config):
                         r_mean_nat,
                         hard_negative_percentile=cfg.rel_hard_neg_percentile,
                     )
-                    y_target = torch.cat([y_nat, y_neg], dim=0)
+                    y_target = torch.cat([y_nat, y_neg.float()], dim=0)
                     L_rel = reliability_loss(s_all, y_target)
                 else:
                     L_rel = torch.zeros((), device=device)

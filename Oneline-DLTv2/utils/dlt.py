@@ -15,36 +15,40 @@ def DLT_solve(src_p_flat: torch.Tensor, off_set_flat: torch.Tensor) -> torch.Ten
     """
     bs = src_p_flat.shape[0]
     device = src_p_flat.device
-    dtype = src_p_flat.dtype
+    out_dtype = src_p_flat.dtype
 
-    src_ps = src_p_flat.reshape(bs, 4, 2)
-    off_sets = off_set_flat.reshape(bs, 4, 2)
-    dst_p = src_ps + off_sets
-
-    ones = torch.ones(bs, 4, 1, device=device, dtype=dtype)
-    xy1 = torch.cat((src_ps, ones), dim=2)            # (B, 4, 3)
-    zeros = torch.zeros_like(xy1)
-    xyu = torch.cat((xy1, zeros), dim=2)              # (B, 4, 6)
-    xyd = torch.cat((zeros, xy1), dim=2)              # (B, 4, 6)
-    M1 = torch.cat((xyu, xyd), dim=2).reshape(bs, -1, 6)  # (B, 8, 6)
-
-    M2 = torch.matmul(
-        dst_p.reshape(bs * 4, 2, 1),
-        src_ps.reshape(bs * 4, 1, 2),
-    ).reshape(bs, -1, 2)                              # (B, 8, 2)
-
-    A = torch.cat((M1, -M2), dim=2)                   # (B, 8, 8)
-    b = dst_p.reshape(bs, 8, 1)                       # (B, 8, 1)
-
-    # linalg.solve / lstsq do not support fp16; force fp32 inside any autocast
-    # context, then cast back to the caller's dtype.
+    # Run the entire DLT in fp32 under AMP. The intermediate matmul
+    # dst_p @ src_ps^T contains products of pixel coordinates that easily
+    # overflow fp16 (e.g. 560 * 560 = 313600 > fp16 max 65504), which silently
+    # produces Inf -> NaN H matrices and contaminates the whole forward pass.
     with torch.amp.autocast(device_type=device.type, enabled=False):
-        try:
-            h8 = torch.linalg.solve(A.float(), b.float())
-        except RuntimeError:
-            h8 = torch.linalg.lstsq(A.float(), b.float()).solution
-    h8 = h8.to(dtype)
+        src_ps   = src_p_flat.float().reshape(bs, 4, 2)
+        off_sets = off_set_flat.float().reshape(bs, 4, 2)
+        dst_p = src_ps + off_sets
 
-    h9 = torch.cat([h8.squeeze(-1), torch.ones(bs, 1, device=device, dtype=dtype)], dim=1)
-    H = h9.reshape(bs, 3, 3)
-    return H
+        ones = torch.ones(bs, 4, 1, device=device, dtype=torch.float32)
+        xy1 = torch.cat((src_ps, ones), dim=2)            # (B, 4, 3)
+        zeros = torch.zeros_like(xy1)
+        xyu = torch.cat((xy1, zeros), dim=2)              # (B, 4, 6)
+        xyd = torch.cat((zeros, xy1), dim=2)              # (B, 4, 6)
+        M1 = torch.cat((xyu, xyd), dim=2).reshape(bs, -1, 6)  # (B, 8, 6)
+
+        M2 = torch.matmul(
+            dst_p.reshape(bs * 4, 2, 1),
+            src_ps.reshape(bs * 4, 1, 2),
+        ).reshape(bs, -1, 2)                              # (B, 8, 2)
+
+        A = torch.cat((M1, -M2), dim=2)                   # (B, 8, 8)
+        b = dst_p.reshape(bs, 8, 1)                       # (B, 8, 1)
+
+        try:
+            h8 = torch.linalg.solve(A, b)
+        except RuntimeError:
+            h8 = torch.linalg.lstsq(A, b).solution
+
+        h9 = torch.cat([h8.squeeze(-1),
+                        torch.ones(bs, 1, device=device, dtype=torch.float32)],
+                       dim=1)
+        H = h9.reshape(bs, 3, 3)
+
+    return H.to(out_dtype)
