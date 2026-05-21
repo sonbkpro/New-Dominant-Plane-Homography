@@ -53,7 +53,10 @@ def warp_by_homography(
     grid[:, 0, :] += out_origin_xy[0]
     grid[:, 1, :] += out_origin_xy[1]
 
-    H_inv = torch.linalg.inv(H_src_to_dst)                       # (B, 3, 3)
+    # linalg.inv requires fp32; force it inside any autocast scope.
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        H_inv = torch.linalg.inv(H_src_to_dst.float())            # (B, 3, 3)
+    H_inv = H_inv.to(dtype)
     src_coords = torch.bmm(H_inv, grid)                          # (B, 3, N)
     src_coords = src_coords / (src_coords[:, 2:3, :] + 1e-8)
     sx = src_coords[:, 0, :]
@@ -104,7 +107,9 @@ def make_validity_mask(
     grid[:, 0, :] += out_origin_xy[0]
     grid[:, 1, :] += out_origin_xy[1]
 
-    H_inv = torch.linalg.inv(H_src_to_dst)
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        H_inv = torch.linalg.inv(H_src_to_dst.float())
+    H_inv = H_inv.to(dtype)
     src_coords = torch.bmm(H_inv, grid)
     src_coords = src_coords / (src_coords[:, 2:3, :] + 1e-8)
     sx = src_coords[:, 0, :]

@@ -156,7 +156,7 @@ def train(args, cfg: Config):
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr,
                                  amsgrad=True, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_gamma)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
 
     log_dir = _abs(cfg.log_dir)
     save_dir = _abs(cfg.model_save_dir)
@@ -188,7 +188,7 @@ def train(args, cfg: Config):
                 y_neg = None
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=cfg.use_amp):
+            with torch.amp.autocast("cuda", enabled=cfg.use_amp):
                 out = net(I_a_all, I_b_all)
 
                 # Slice natural-pair outputs.

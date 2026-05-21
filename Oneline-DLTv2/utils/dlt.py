@@ -36,11 +36,14 @@ def DLT_solve(src_p_flat: torch.Tensor, off_set_flat: torch.Tensor) -> torch.Ten
     A = torch.cat((M1, -M2), dim=2)                   # (B, 8, 8)
     b = dst_p.reshape(bs, 8, 1)                       # (B, 8, 1)
 
-    # Solve via lstsq for numerical robustness; falls back to torch.linalg.solve.
-    try:
-        h8 = torch.linalg.solve(A, b)                 # (B, 8, 1)
-    except RuntimeError:
-        h8 = torch.linalg.lstsq(A, b).solution
+    # linalg.solve / lstsq do not support fp16; force fp32 inside any autocast
+    # context, then cast back to the caller's dtype.
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        try:
+            h8 = torch.linalg.solve(A.float(), b.float())
+        except RuntimeError:
+            h8 = torch.linalg.lstsq(A.float(), b.float()).solution
+    h8 = h8.to(dtype)
 
     h9 = torch.cat([h8.squeeze(-1), torch.ones(bs, 1, device=device, dtype=dtype)], dim=1)
     H = h9.reshape(bs, 3, 3)
