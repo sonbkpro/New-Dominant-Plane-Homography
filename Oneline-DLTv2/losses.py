@@ -2,11 +2,13 @@
 Loss functions for Calibrated Dominant-Plane Consensus Homography Estimation.
 
 Active losses (Milestones 2-4):
-  L_align   – robust uncertainty-weighted feature alignment (Oneline H_ab)
+  L_align   – robust heteroscedastic NLL with built-in σ calibration
+              (Charbonnier(r/σ) + log σ).  Replaces the prior split between
+              L_align (using log1p σ) and a separate L_calib head; that split
+              over-determined σ and pinned it at the clamp floor.
   L_triplet – consensus-weighted triplet margin loss (Oneline H_ab)
   L_support – prevent posterior collapse:  max(0, alpha - mean(q))^2
   L_smooth  – edge-aware TV on consensus map q
-  L_calib   – uncertainty calibration via stop-gradient residuals
 
 Active optional losses (Milestones 5-6):
   L_rel     – reliability BCE with synthetic invalid pairs
@@ -45,14 +47,20 @@ def positive_sigma(log_sigma):
 
 def _align_single(r, log_sigma, q, eps=_EPS):
     """
-    r, log_sigma, q : [B, 1, Ph, Pw]
-    Returns scalar.
+    Heteroscedastic alignment NLL with a Charbonnier likelihood surrogate:
+
+        per_pixel = q * ( Charbonnier(r / sigma) + log(sigma) )
+
+    The +log(sigma) term is the standard self-calibration penalty whose
+    minimum w.r.t. sigma occurs near |r|; it removes the need for a
+    separate L_calib head.  sigma is bounded by clamp_log_sigma so the
+    loss is bounded both above and below.
+
+    r, log_sigma, q : [B, 1, Ph, Pw]   →  scalar
     """
     sigma = positive_sigma(log_sigma)
     robust = charbonnier(r / sigma)
-    # Use a positive uncertainty penalty. Raw +log(sigma) can drive the
-    # objective negative and reward sigma collapse during early training.
-    per_pixel = q * (robust + torch.log1p(sigma))
+    per_pixel = q * (robust + torch.log(sigma))
     return per_pixel.sum() / (q.sum() + eps)
 
 
@@ -147,14 +155,9 @@ def loss_smooth(q_ab, img_patch_b, gamma=5.0):
 # ---------------------------------------------------------------------------
 # L_calib  (Section 6.6)
 # ---------------------------------------------------------------------------
-
-def loss_calib(log_sigma_ab, r_ab, eps=_EPS):
-    """Weak self-supervised calibration via stop-gradient residual targets."""
-    def _single(log_sigma, r):
-        log_sigma = torch.log(positive_sigma(log_sigma))
-        log_r_sg = clamp_log_sigma(torch.log(r.detach() + eps))
-        return torch.abs(log_sigma - log_r_sg).mean()
-    return _single(log_sigma_ab, r_ab)
+# Removed.  σ self-calibration is now performed inside L_align via the
+# +log(σ) term; running both losses pinned log σ at the clamp floor and
+# decoupled σ from the residual scale (see Section 6 review notes).
 
 
 # ---------------------------------------------------------------------------
@@ -191,25 +194,23 @@ def loss_temporal(H_t_t2, H_t1_t2, H_t_t1):
 # Total loss  (Section 6.9)
 # ---------------------------------------------------------------------------
 
-def compute_total_loss(la, lt, ls, lsm, lc, lo=None, lr=None, ltmp=None,
+def compute_total_loss(la, lt, ls, lsm, lo=None, lr=None, ltmp=None,
                        lam_triplet=0.1, lam_support=0.01,
-                       lam_smooth=0.001, lam_calib=0.05,
+                       lam_smooth=0.001,
                        lam_offset=1e-4, lam_rel=0.1, lam_temp=0.1,
                        include_geometric=True):
     """
-    la  = L_align
+    la  = L_align    (carries the +log σ calibration term internally)
     lt  = L_triplet  (weight lam_triplet)
     ls  = L_support  (weight lam_support)
     lsm = L_smooth   (weight lam_smooth)
-    lc  = L_calib    (weight lam_calib)
     lo  = L_offset   (weight lam_offset)
     lr  = L_rel      (weight lam_rel)
     ltmp= L_temp     (weight lam_temp)
     """
     total = la.new_tensor(0.0)
     if include_geometric:
-        total = total + la + lam_triplet * lt + lam_support * ls + \
-                lam_smooth * lsm + lam_calib * lc
+        total = total + la + lam_triplet * lt + lam_support * ls + lam_smooth * lsm
         if lo is not None:
             total = total + lam_offset * lo
     if lr is not None:

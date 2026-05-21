@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from utils import transform, DLT_solve
 from losses import (loss_align, loss_triplet, triplet_diagnostics,
-                    loss_support, loss_smooth, loss_calib,
+                    loss_support, loss_smooth,
                     loss_offset, loss_reliability, compute_total_loss,
                     clamp_log_sigma, positive_sigma)
 
@@ -123,10 +123,19 @@ def _build_conv_head(in_ch, mid_ch, out_ch, final_act):
 
 
 class MultiScaleFeature(nn.Module):
-    """Lightweight one-channel feature pyramid used in place of v1 ShareFeature."""
+    """Lightweight one-channel feature pyramid used in place of v1 ShareFeature.
 
-    def __init__(self):
+    Outputs are L2-normalised to unit per-pixel RMS per sample.  This is the
+    anti-collapse anchor: without it, weight decay on the trailing BN(γ) plus
+    the easy "shrink-r-via-shrink-F" gradient through L_align drove F → 0
+    and pinned the triplet at the margin (see v2 review §2b).  Fixing the
+    feature norm forces the optimiser to reduce r by improving the warp.
+    """
+
+    def __init__(self, normalize=True, eps=1e-6):
         super().__init__()
+        self.normalize = normalize
+        self.eps = eps
         self.local = nn.Sequential(
             nn.Conv2d(1, 4, 3, padding=1, bias=False),
             nn.BatchNorm2d(4), nn.ReLU(inplace=True),
@@ -151,9 +160,19 @@ class MultiScaleFeature(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    @staticmethod
+    def _unit_rms(feat, eps):
+        B, C, H, W = feat.shape
+        flat = feat.reshape(B, C, -1)
+        rms = flat.pow(2).mean(dim=2, keepdim=True).clamp_min(eps).sqrt()
+        return (flat / rms).reshape(B, C, H, W)
+
     def forward(self, x):
         local = self.local(x)
-        return self.fuse(torch.cat((local, self.ctx3(x), self.ctx5(x)), dim=1))
+        out = self.fuse(torch.cat((local, self.ctx3(x), self.ctx5(x)), dim=1))
+        if self.normalize:
+            out = self._unit_rms(out, self.eps)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -178,18 +197,19 @@ class ResNetCDPC(nn.Module):
     def __init__(self, block, layers, num_classes=8,
                  triplet_margin=0.2, lambda_triplet=0.1,
                  lambda_support=0.01, lambda_smooth=0.001,
-                 lambda_calib=0.05, lambda_offset=1e-4,
-                 lambda_rel=0.1, lambda_temp=0.1):
+                 lambda_offset=1e-4,
+                 lambda_rel=0.1, lambda_temp=0.1,
+                 fc_init_std=1e-2):
         self.inplanes = 64
         super().__init__()
         self.triplet_margin = triplet_margin
         self.lambda_triplet = lambda_triplet
         self.lambda_support = lambda_support
         self.lambda_smooth = lambda_smooth
-        self.lambda_calib = lambda_calib
         self.lambda_offset = lambda_offset
         self.lambda_rel = lambda_rel
         self.lambda_temp = lambda_temp
+        self.fc_init_std = fc_init_std
 
         # --- Backbone (2-channel input: concat of masked features) ---
         self.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2,
@@ -226,7 +246,13 @@ class ResNetCDPC(nn.Module):
         )
 
         self._init_weights()
-        nn.init.zeros_(self.fc.weight)
+        # Geometry head: small-Gaussian init keeps the initial warp close to
+        # identity *without* zero-pinning the gradient.  Zero init produced
+        # H_ab ≡ I at t=0, which forced pred_F2 ≡ F1 and made d_pos == d_neg,
+        # so the triplet sat at the margin with no signal to escape (v2
+        # review §2a).  weight_decay on this layer is also disabled in
+        # train.py to avoid pulling it back to zero.
+        nn.init.normal_(self.fc.weight, mean=0.0, std=self.fc_init_std)
         nn.init.zeros_(self.fc.bias)
 
     # ------------------------------------------------------------------
@@ -380,18 +406,16 @@ class ResNetCDPC(nn.Module):
         li  = la.new_tensor(0.0)
         ls  = loss_support(q_ab)
         lsm = loss_smooth(q_ab, img_patch_b)
-        lc  = loss_calib(log_sigma_ab, r_ab)
         lo  = loss_offset(offset_ab)
         lr = loss_reliability(s_ab, rel_label) if rel_label is not None else la.new_tensor(0.0)
         ltmp = la.new_tensor(0.0)
         lt_diag = triplet_diagnostics(r_ab, d_neg_ab, q_ab, m=self.triplet_margin)
         lam_triplet = self.lambda_triplet if triplet_weight is None else triplet_weight
         lt_total = compute_total_loss(
-            la, lt, ls, lsm, lc, lo=lo, lr=lr,
+            la, lt, ls, lsm, lo=lo, lr=lr,
             lam_triplet=lam_triplet,
             lam_support=self.lambda_support,
             lam_smooth=self.lambda_smooth,
-            lam_calib=self.lambda_calib,
             lam_offset=self.lambda_offset,
             lam_rel=self.lambda_rel,
             lam_temp=self.lambda_temp,
@@ -416,7 +440,6 @@ class ResNetCDPC(nn.Module):
             'loss_inv':     li,
             'loss_support': ls,
             'loss_smooth':  lsm,
-            'loss_calib':   lc,
             'loss_offset':  lo,
             'loss_rel':     lr,
             'loss_temp':    ltmp,

@@ -5,8 +5,11 @@ Training script for Calibrated Dominant-Plane Consensus (CDPC) homography.
 Key differences from Oneline-DLTv1/train.py:
   - Strict Oneline CDPC: learns H_ab only; loss_inv is logged as zero.
   - Total loss defaults to L_align + 0.1*L_triplet + 0.01*L_support
-                         + 0.001*L_smooth + 0.05*L_calib
-                         + 0.1*L_rel + a small offset stabilizer.
+                         + 0.001*L_smooth + 0.1*L_rel + a small offset
+                         stabilizer.  σ self-calibration is now folded
+                         into L_align (no separate L_calib).
+  - Weight decay is disabled on BN affine params, biases and the geometry
+    head (fc) so the optimiser can't shrink them toward zero.
   - TensorBoard logs each loss component separately.
   - Model saved under train_log_CDPC/.
 """
@@ -69,10 +72,10 @@ def train(args):
         lambda_triplet=args.lambda_triplet,
         lambda_support=args.lambda_support,
         lambda_smooth=args.lambda_smooth,
-        lambda_calib=args.lambda_calib,
         lambda_offset=args.lambda_offset,
         lambda_rel=args.lambda_rel,
         lambda_temp=args.lambda_temp,
+        fc_init_std=args.fc_init_std,
     )
 
     if args.finetune:
@@ -111,9 +114,25 @@ def train(args):
         num_workers=args.cpus, shuffle=True, drop_last=True,
     )
 
+    # Parameter groups: shrink only multi-dim conv/linear weights.  BN affine
+    # params, all biases, and the geometry head (fc) are weight-decay-free —
+    # weight decay on those parameters is the standard accelerant for
+    # feature-magnitude collapse and zero-pinning of the offset head.
+    decay_params, no_decay_params = [], []
+    for name, p in net.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or name.endswith('fc.weight') or name.endswith('fc.bias'):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
     optimizer = optim.Adam(
-        net.parameters(), lr=args.lr, amsgrad=True, weight_decay=1e-4,
+        [{'params': decay_params,    'weight_decay': 1e-4},
+         {'params': no_decay_params, 'weight_decay': 0.0}],
+        lr=args.lr, amsgrad=True,
     )
+    print('Optimizer: {} params with WD=1e-4, {} params with WD=0.'.format(
+        len(decay_params), len(no_decay_params)))
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.8)
 
     print('Start training — CDPC')
@@ -124,7 +143,7 @@ def train(args):
     # Running sums for periodic logging
     _sums = {k: 0.0 for k in
              ('total', 'align', 'triplet', 'inv', 'support', 'smooth',
-              'calib', 'offset', 'rel_valid', 'rel_invalid', 'temp',
+              'offset', 'rel_valid', 'rel_invalid', 'temp',
               'triplet_weight', 'triplet_d_pos', 'triplet_d_neg',
               'triplet_gap', 'triplet_margin_gap', 'triplet_active',
               'q_mean', 'q_std')}
@@ -186,7 +205,6 @@ def train(args):
             loss_inv_v   = out['loss_inv'].mean()
             loss_sup_v   = out['loss_support'].mean()
             loss_smo_v   = out['loss_smooth'].mean()
-            loss_cal_v   = out['loss_calib'].mean()
             loss_off_v   = out['loss_offset'].mean()
             loss_rel_valid_v = out['loss_rel'].mean()
             loss_rel_invalid_v = loss_total.new_tensor(0.0)
@@ -256,7 +274,6 @@ def train(args):
             _sums['inv']     += loss_inv_v.item()
             _sums['support'] += loss_sup_v.item()
             _sums['smooth']  += loss_smo_v.item()
-            _sums['calib']   += loss_cal_v.item()
             _sums['offset']  += loss_off_v.item()
             _sums['rel_valid']   += loss_rel_valid_v.item()
             _sums['rel_invalid'] += loss_rel_invalid_v.item()
@@ -275,14 +292,14 @@ def train(args):
                 print(
                     'Ep[{:03d}/{:03d}] It[{:05d}/{:05d}] '
                     'Total={:.4f} Align={:.4f} Tri={:.4f} '
-                    'Inv={:.4f} Sup={:.4f} Smo={:.4f} Cal={:.4f} Off={:.4f} '
+                    'Inv={:.4f} Sup={:.4f} Smo={:.4f} Off={:.4f} '
                     'Rel+={:.4f} Rel-={:.4f} Temp={:.4f} '
                     'TriW={:.3f} Dp={:.4f} Dn={:.4f} Gap={:.4f} '
                     'HAct={:.3f} Qm={:.3f} Qs={:.3f} '
                     'lr={:.2e}'.format(
                         epoch + 1, args.max_epoch, i + 1, len(train_loader),
                         avgs['total'], avgs['align'], avgs['triplet'],
-                        avgs['inv'], avgs['support'], avgs['smooth'], avgs['calib'],
+                        avgs['inv'], avgs['support'], avgs['smooth'],
                         avgs['offset'], avgs['rel_valid'], avgs['rel_invalid'], avgs['temp'],
                         avgs['triplet_weight'], avgs['triplet_d_pos'], avgs['triplet_d_neg'],
                         avgs['triplet_gap'], avgs['triplet_active'],
@@ -312,7 +329,6 @@ def train(args):
                 'inv':     loss_inv_v.item(),
                 'support': loss_sup_v.item(),
                 'smooth':  loss_smo_v.item(),
-                'calib':   loss_cal_v.item(),
                 'offset':  loss_off_v.item(),
                 'rel_valid': loss_rel_valid_v.item(),
                 'rel_invalid': loss_rel_invalid_v.item(),
@@ -375,9 +391,12 @@ if __name__ == '__main__':
                         help='Linearly ramp lambda_triplet over the first N iterations.')
     parser.add_argument('--lambda_support', type=float, default=0.01)
     parser.add_argument('--lambda_smooth', type=float, default=0.001)
-    parser.add_argument('--lambda_calib', type=float, default=0.05)
     parser.add_argument('--lambda_offset', type=float, default=1e-4)
     parser.add_argument('--lambda_rel', type=float, default=0.1)
+    parser.add_argument('--fc_init_std', type=float, default=1e-2,
+                        help='Std of Gaussian init on the geometry head fc. '
+                             'Set 0.0 to recover the old zero-init (do not '
+                             'do this — see v2 review §2a).')
 
     print('<==================== Loading data ===================>\n')
     args = parser.parse_args()
