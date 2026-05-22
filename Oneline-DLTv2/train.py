@@ -203,6 +203,24 @@ def _make_param_groups(net, cfg: Config, stage: str):
     return groups
 
 
+def _save_checkpoint(net, save_dir: str, filename: str, **extra) -> str:
+    """Save a checkpoint robustly. Recreates the directory if it's missing
+    (defensive against external `rm`s or transient mount issues) and catches
+    write errors -- disk-full or permission failures log a warning but do not
+    crash training, so the next scheduled save can succeed once you free space.
+    """
+    path = os.path.join(save_dir, filename)
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save({"state_dict": net.state_dict(), **extra}, path)
+        print(f"[ckpt] saved {path}", flush=True)
+        return path
+    except (OSError, RuntimeError) as e:
+        print(f"[ckpt] FAILED to save {path}: {type(e).__name__}: {e}",
+              flush=True)
+        return ""
+
+
 def _try_load_init(net, ckpt_path: str):
     """Soft-load a checkpoint (strict=False). Useful for staged resumption
     where the architecture is identical but some modules are frozen."""
@@ -619,12 +637,12 @@ def train(args, cfg: Config):
                 print(f"[eval @ it {glob_iter}] {line}  ({dt:.1f}s)", flush=True)
 
             if glob_iter > 0 and glob_iter % cfg.model_save_freq == 0:
-                ckpt = os.path.join(save_dir, f"cdpc_{stage}_iter_{glob_iter}.pth")
-                torch.save({"state_dict": net.state_dict(),
-                            "iter": glob_iter, "epoch": epoch,
-                            "stage": stage,
-                            "config": cfg.__dict__}, ckpt)
-                print(f"[ckpt] saved {ckpt}", flush=True)
+                _save_checkpoint(
+                    net, save_dir,
+                    f"cdpc_{stage}_iter_{glob_iter}.pth",
+                    iter=glob_iter, epoch=epoch, stage=stage,
+                    config=cfg.__dict__,
+                )
 
             glob_iter += 1
 
@@ -636,12 +654,17 @@ def train(args, cfg: Config):
 
         scheduler.step()
 
-    final_ckpt = os.path.join(save_dir, f"cdpc_{stage}_iter_{glob_iter}_final.pth")
-    torch.save({"state_dict": net.state_dict(),
-                "iter": glob_iter, "epoch": cfg.max_epoch,
-                "stage": stage,
-                "config": cfg.__dict__}, final_ckpt)
-    print(f"[done] final checkpoint: {final_ckpt}", flush=True)
+    final_path = _save_checkpoint(
+        net, save_dir,
+        f"cdpc_{stage}_iter_{glob_iter}_final.pth",
+        iter=glob_iter, epoch=cfg.max_epoch, stage=stage,
+        config=cfg.__dict__,
+    )
+    if final_path:
+        print(f"[done] final checkpoint: {final_path}", flush=True)
+    else:
+        print(f"[done] training finished but FINAL checkpoint failed to save; "
+              f"check disk/permissions on {save_dir}", flush=True)
     writer.close()
 
 
@@ -672,6 +695,9 @@ def _parse_args(cfg: Config):
                    help="Bound for H head: |corner_offset| <= rho. Must be >= synth_rho_max.")
     p.add_argument("--synth_rho_max", type=int, default=cfg.synth_rho_max,
                    help="Per-corner perturbation range for the synth dataset, in px.")
+    p.add_argument("--model_save_freq", type=int, default=cfg.model_save_freq,
+                   help="Iters between checkpoint saves. Lower it to keep more "
+                        "intermediate checkpoints if disk space allows.")
     args = p.parse_args()
 
     # Push CLI args back into cfg so downstream code reads a single source.
@@ -692,6 +718,7 @@ def _parse_args(cfg: Config):
     cfg.init_ckpt = args.init_ckpt
     cfg.homography_rho = args.homography_rho
     cfg.synth_rho_max = args.synth_rho_max
+    cfg.model_save_freq = args.model_save_freq
     if cfg.homography_rho < cfg.synth_rho_max:
         raise ValueError(
             f"homography_rho ({cfg.homography_rho}) must be >= synth_rho_max "
