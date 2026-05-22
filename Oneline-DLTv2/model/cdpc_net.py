@@ -216,10 +216,18 @@ class CDPCNet(nn.Module):
         #     and for the per-pixel heads. The correlation must be on the
         #     patch features (not the full image) because that is what is
         #     being matched.
+        # Derive crop sizes from the joint backbone's actual 1/8 output --
+        # ResNet's stem (stride 2) + maxpool (stride 2) + layer2 (stride 2)
+        # rounds odd inputs UP (e.g. patch_h=315 -> 158 -> 79 -> 40), so
+        # ph//8 = 39 would be off by 1 from the joint output (40). Using
+        # the actual output dims keeps every per-image / correlation /
+        # joint tensor at the same spatial resolution.
         crop_xy_8 = crop_xy / 8.0
         crop_xy_4 = crop_xy / 4.0
-        ph_8, pw_8 = ph // 8, pw // 8
-        ph_4, pw_4 = ph // 4, pw // 4
+        ph_8 = F_joint8_patch.shape[-2]
+        pw_8 = F_joint8_patch.shape[-1]
+        ph_4 = ph_8 * 2
+        pw_4 = pw_8 * 2
 
         F_a8_patch = _crop_feature(F_a_full8, crop_xy_8, ph_8, pw_8)
         F_b8_patch = _crop_feature(F_b_full8, crop_xy_8, ph_8, pw_8)
