@@ -33,7 +33,10 @@ from train import patch_to_full_homography
 
 
 SCENES = ("RE", "LT", "LL", "SF", "LF")
-METRICS = ("direct", "inverse", "symmetric", "identity", "v1")
+# planv3 B2: `v1` is min(forward(a->b), forward(b->a)) using H itself; v1's
+# actual test.py inverts H before measuring. The "v1-equivalent" column is
+# `v1_compat`. See train.run_eval_l2 for the same change.
+METRICS = ("direct", "inverse", "symmetric", "identity", "v1", "v1_compat")
 
 
 def _eye_like(H: torch.Tensor) -> torch.Tensor:
@@ -66,7 +69,9 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
         corr_out_channels=cfg.corr_out_channels,
         bb_quarter_channels=cfg.bb_quarter_channels,
         bb_eighth_channels=cfg.bb_eighth_channels,
-        homography_rho=cfg.homography_rho,
+        bb_sixteenth_channels=cfg.bb_sixteenth_channels,
+        rho_per_level=cfg.rho_per_level,
+        homography_levels=cfg.homography_levels,
         post_init_prob=cfg.post_init_prob,
         sigma_min=cfg.sigma_min,
         use_normalized_dlt=cfg.use_normalized_dlt,
@@ -100,16 +105,19 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
         pts = batch["points"].to(device)[:, :6, :, :]
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
-        err_ab  = point_reprojection_error(H_full,            pts_a, pts_b)
-        err_ba  = point_reprojection_error(H_full,            pts_b, pts_a)
-        err_inv = point_reprojection_error(H_full_inv,        pts_b, pts_a)
-        err_id  = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
+        err_ab      = point_reprojection_error(H_full,            pts_a, pts_b)
+        err_ba      = point_reprojection_error(H_full,            pts_b, pts_a)
+        err_inv     = point_reprojection_error(H_full_inv,        pts_b, pts_a)
+        err_inv_alt = point_reprojection_error(H_full_inv,        pts_a, pts_b)
+        err_id      = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
 
         per_metric["direct"].append(   float(err_ab.mean(dim=1).item()))
         per_metric["inverse"].append(  float(err_inv.mean(dim=1).item()))
         per_metric["symmetric"].append(float(((err_ab + err_inv) / 2.0).mean(dim=1).item()))
         per_metric["identity"].append( float(err_id.mean(dim=1).item()))
         per_metric["v1"].append(       float(torch.minimum(err_ab, err_ba).mean(dim=1).item()))
+        per_metric["v1_compat"].append(
+            float(torch.minimum(err_inv, err_inv_alt).mean(dim=1).item()))
 
         scenes.append(batch["scene"][0])
         reliabilities.append(float(out["s"][0]))
@@ -124,8 +132,9 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
             d[s] = float(errs[mask].mean()) if mask.any() else float("nan")
         return d
 
-    # The "v1" series is the authoritative one for failure-detection labels.
-    errs_v1 = np.array(per_metric["v1"], dtype=np.float64)
+    # The v1-compat (inverted-H, min over orderings) series is the
+    # authoritative one for failure-detection labels (planv3 B2).
+    errs_v1 = np.array(per_metric["v1_compat"], dtype=np.float64)
 
     summary = {"n_pairs": int(len(errs_v1)), "n_illcond_H": n_illcond}
     for m in METRICS:
@@ -143,7 +152,7 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
         summary[f"inlier@3_{m}"] = inlier_ratio_at_thresholds(e, [3.0])[0]
         summary[f"inlier@5_{m}"] = inlier_ratio_at_thresholds(e, [5.0])[0]
 
-    # Failure-detection trustworthiness metrics (labels from `v1`).
+    # Failure-detection trustworthiness metrics (labels from `v1_compat`).
     trust = {}
     for tau in tau_list:
         labels = (errs_v1 > tau).astype(np.int32)

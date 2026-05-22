@@ -107,10 +107,18 @@ class SynthPairDataset(Dataset):
         crop_xy = self._random_crop_xy()                              # (2,)
         x, y = int(crop_xy[0]), int(crop_xy[1])
 
-        # 4 patch corners in patch-local coords, ordered TL, TR, BR, BL.
+        # 4 patch corners in patch-local coords. Canonical order across the
+        # whole codebase is TL, BL, BR, TR (v1-compatible). Must match
+        # `h4p_patch` in cdpc_net.py and `src` in losses/fold.py so that
+        # offset[2i:2i+2] perturbs the SAME corner everywhere -- otherwise
+        # the supervised Huber pairs pred-BL with GT-TR (and vice versa)
+        # and the supervised stage learns a label-permuted H.
         ph, pw = self.patch_h, self.patch_w
         src_patch = np.array(
-            [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+            [[0,  0],
+             [0,  ph],
+             [pw, ph],
+             [pw, 0]],
             dtype=np.float32,
         )
         offset = self._random_offset()                                # (4, 2)
@@ -141,6 +149,9 @@ class SynthPairDataset(Dataset):
         # Targets: corner offset in patch-local coords (8,).
         offset_flat = offset.reshape(-1).astype(np.float32)
 
+        # planv3 §5: also expose H_full_gt for the Frobenius-supervision term.
+        H_full_t = (H_full / H_full[2, 2]).astype(np.float32)
+
         return {
             "I_a_full":  torch.from_numpy(img_a_full.copy()).float(),
             "I_b_full":  torch.from_numpy(img_b_full.copy()).float(),
@@ -148,4 +159,5 @@ class SynthPairDataset(Dataset):
             "I_b_patch": torch.from_numpy(I_b_patch.copy()).float(),
             "crop_xy":   torch.from_numpy(crop_xy).float(),
             "offset_gt": torch.from_numpy(offset_flat).float(),
+            "H_full_gt": torch.from_numpy(H_full_t).float(),
         }

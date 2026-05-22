@@ -1,44 +1,42 @@
-"""Multi-stage training driver for CDPC v2.
+"""Multi-stage training driver for CDPC v3.
 
-Stages (planv2):
+Stages (planv3 §6):
 
-  --stage synth   : synthetic supervised H bootstrap.
-                    Active: joint_backbone + homography_head.
-                    Loss: Huber(offset_pred, offset_gt) + L_fold.
-                    Frozen: per-image backbone, posterior, uncertainty, reliability.
+  --stage synth     : supervised geometric bootstrap
+                      Active: backbone + homography_pyramid.
+                      Loss:   Huber(offset_pred, offset_gt) at the final
+                              level (and per-level if homography_levels>1)
+                              + L_sup_H (Frobenius) + L_fold.
 
-  --stage h_only  : real-pair H-only.
-                    Active: per-image backbone, joint_backbone, correlation,
-                            homography_head.
-                    Loss: triplet + photometric (Charbonnier) + smooth + L_fold.
-                    Frozen: posterior, uncertainty, reliability.
+  --stage h_only    : real-pair unsupervised H refinement
+                      Active: backbone + homography_pyramid.
+                      Loss:   L_photo_img (image-space Charbonnier) +
+                              L_triplet + L_fold.
 
-  --stage q_sigma : add posterior + uncertainty.
-                    Active: everything above + posterior_head + uncertainty_head.
-                    Loss: + L_align (q-weighted) + L_em (residual-gated) + L_support.
-                    Frozen: reliability.
+  --stage q_only    : posterior head only
+                      Active: posterior_head only. backbone + H +
+                              uncertainty + reliability frozen.
+                      Loss:   L_em + L_support + L_smooth.
 
-  --stage joint   : joint fine-tune with q-dagger.
-                    Active: all geometry + q + sigma.
-                    Loss: L_align uses q_dagger = sg(max(q, q_min_floor)),
-                          decoupling H learning from q transients.
-                    Frozen: reliability. Geometry LR x0.1.
+  --stage sigma_only: uncertainty head only
+                      Active: uncertainty_head only.
+                      Loss:   L_align_het (Kendall-Gal on q-selected set
+                              with sg(sigma) in residual numerator) +
+                              L_sigma (data-adaptive log-r prior).
 
-  --stage rel     : detached reliability calibrator.
-                    Active: reliability_head only.
-                    Loss: L_rel(s, y).
-                    Frozen: everything else.
+  --stage joint     : joint fine-tune with q_dagger and (initially) sg(sigma)
+                      Active: everything except reliability.
+                      Loss:   L_photo_img + L_triplet + L_align_soft +
+                              L_align_het + L_em + L_support + L_smooth +
+                              L_sigma + L_cycle + L_fold.
 
-  --stage full    : original end-to-end behavior (back-compat / ablation).
+  --stage rel       : reliability calibrator only
+                      Active: reliability_head.
+                      Loss:   L_rel on detached phi.
 
-Each stage logs an extended TensorBoard panel (planv2 section 6):
-  loss/* trip/align/em/support/smooth/rel/cycle/sigma_reg/fold/photo/sup_corner
-  H/offset_inf_px, H/offset_mean_px, H/kappa_log, H/fold_count
-  q/mean, q/var, q/area_above_tau, q/A_v
-  sigma/mean, residual/median
-  eval_l2/direct, eval_l2/inverse, eval_l2/symmetric, eval_l2/identity, eval_l2/v1
-  grad_norm/{joint_backbone, backbone, homography_head, posterior_head,
-             uncertainty_head, reliability_head}
+  --stage full      : legacy end-to-end ablation (back-compat with v2 runs).
+
+Each stage logs the planv3 §8 panel.
 """
 
 import argparse
@@ -85,15 +83,18 @@ sys.path.insert(0, _THIS_DIR)
 from configs.default import Config
 from model.cdpc_net import CDPCNet
 from losses.triplet import triplet_loss
-from losses.align import alignment_loss
+from losses.align_v3 import align_soft_loss, align_het_loss, selection_set_stats
 from losses.em import em_posterior_loss
 from losses.support import support_loss
 from losses.smooth import edge_aware_smoothness
 from losses.reliability import reliability_loss, build_invalid_pair_labels
 from losses.cycle import cycle_loss
 from losses.fold import fold_loss
+from losses.photo_image import photometric_image_loss
+from losses.sigma_prior import sigma_prior_loss
 from data.pairs import TrainPairDataset
 from data.synth_pairs import SynthPairDataset
+from data.synth_pairs_v3 import SynthPairDatasetV3
 from data.invalid_pairs import build_invalid_batch
 from data.test_dataset import TestDataset
 from utils.eval_metrics import point_reprojection_error
@@ -105,8 +106,8 @@ from utils.inverse import safe_inverse_3x3
 # ---------------------------------------------------------------------------
 
 def patch_to_full_homography(H_patch: torch.Tensor, crop_xy: torch.Tensor) -> torch.Tensor:
-    """Conjugate the patch-coord homography with the patch's translation to
-    obtain the equivalent homography in full-image coordinates."""
+    """Conjugate H_patch with the crop translation to obtain its full-image
+    equivalent."""
     B = H_patch.shape[0]
     device, dtype = H_patch.device, H_patch.dtype
     T = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
@@ -130,33 +131,29 @@ def _set_requires_grad(module, flag: bool):
 
 
 def _freeze_for_stage(net, stage: str):
-    """Configure which modules are trainable for a given stage."""
+    """Configure which modules are trainable for a given stage (planv3 §6).
+
+    Note: the joint_backbone is gone in v3; the active sets reference only
+    the modules that actually exist on the v3 network.
+    """
     all_mods = {
-        "backbone":         net.backbone,
-        "joint_backbone":   net.joint_backbone,
-        "correlation":      net.correlation,
-        "homography_head":  net.homography_head,
-        "posterior_head":   net.posterior_head,
-        "uncertainty_head": net.uncertainty_head,
-        "reliability_head": net.reliability_head,
+        "backbone":           net.backbone,
+        "homography_pyramid": net.homography_pyramid,
+        "posterior_head":     net.posterior_head,
+        "uncertainty_head":   net.uncertainty_head,
+        "reliability_head":   net.reliability_head,
     }
 
     if stage == "synth":
-        active = {"joint_backbone", "homography_head"}
+        active = {"backbone", "homography_pyramid"}
     elif stage == "h_only":
-        active = {"backbone", "joint_backbone", "correlation", "homography_head"}
-    elif stage == "q_sigma":
-        # planv2 Phase 5: train posterior and uncertainty WITHOUT corrupting H.
-        # We freeze EVERY input on the H computation path -- joint_backbone +
-        # correlation + homography_head AND the per-image backbone, because
-        # the per-image backbone feeds correlation's inputs. Leaving the
-        # per-image backbone trainable lets H drift indirectly (frozen head,
-        # but a moving input), which produced a ~5% v1 regression on gap=2.
-        # The posterior and uncertainty heads alone (~140k params) have
-        # enough capacity to learn q and sigma from the converged residuals.
-        active = {"posterior_head", "uncertainty_head"}
+        active = {"backbone", "homography_pyramid"}
+    elif stage == "q_only":
+        active = {"posterior_head"}
+    elif stage == "sigma_only":
+        active = {"uncertainty_head"}
     elif stage == "joint":
-        active = {"backbone", "joint_backbone", "correlation", "homography_head",
+        active = {"backbone", "homography_pyramid",
                   "posterior_head", "uncertainty_head"}
     elif stage == "rel":
         active = {"reliability_head"}
@@ -171,11 +168,10 @@ def _freeze_for_stage(net, stage: str):
 
 
 def _make_param_groups(net, cfg: Config, stage: str):
-    """Differential learning rates per module group. Only trainable params end
-    up in the optimizer, so frozen modules contribute zero LR groups."""
-    # Buckets
-    h_mods = [net.joint_backbone, net.correlation, net.homography_head]
-    bb_mods = [net.backbone]
+    """Differential LRs per group. Only trainable params end up in the
+    optimizer so frozen modules contribute zero-size groups (excluded)."""
+    h_mods    = [net.homography_pyramid]
+    bb_mods   = [net.backbone]
     head_mods = [net.posterior_head, net.uncertainty_head, net.reliability_head]
 
     def _params(mods):
@@ -184,19 +180,19 @@ def _make_param_groups(net, cfg: Config, stage: str):
             ps += [p for p in m.parameters() if p.requires_grad]
         return ps
 
+    lr_h  = cfg.lr_h
+    lr_bb = cfg.lr_backbone
+    lr_d  = cfg.lr_heads
+
+    # Joint fine-tune lowers geometry LR by 10x (planv3 §7).
+    if stage == "joint":
+        lr_h  *= 0.1
+        lr_bb *= 0.1
+
     groups = []
     p_h = _params(h_mods)
     p_b = _params(bb_mods)
     p_d = _params(head_mods)
-    lr_h = cfg.lr_h
-    lr_bb = cfg.lr_backbone
-    lr_d = cfg.lr_heads
-
-    # joint fine-tune lowers geometry LR by 10x (planv2 phase 6).
-    if stage == "joint":
-        lr_h *= 0.1
-        lr_bb *= 0.1
-
     if p_h:
         groups.append({"params": p_h, "lr": lr_h})
     if p_b:
@@ -204,18 +200,11 @@ def _make_param_groups(net, cfg: Config, stage: str):
     if p_d:
         groups.append({"params": p_d, "lr": lr_d})
     if not groups:
-        # Should not happen, but fallback to a single dummy group with
-        # whatever is in the model to keep the optimizer constructible.
         groups.append({"params": list(net.parameters()), "lr": cfg.lr})
     return groups
 
 
 def _save_checkpoint(net, save_dir: str, filename: str, **extra) -> str:
-    """Save a checkpoint robustly. Recreates the directory if it's missing
-    (defensive against external `rm`s or transient mount issues) and catches
-    write errors -- disk-full or permission failures log a warning but do not
-    crash training, so the next scheduled save can succeed once you free space.
-    """
     path = os.path.join(save_dir, filename)
     try:
         os.makedirs(save_dir, exist_ok=True)
@@ -229,13 +218,12 @@ def _save_checkpoint(net, save_dir: str, filename: str, **extra) -> str:
 
 
 def _try_load_init(net, ckpt_path: str):
-    """Soft-load a checkpoint (strict=False) when one is explicitly requested.
+    """Soft-load (strict=False) a checkpoint when explicitly requested.
 
-    Resolves the path against (in order): as-given (cwd-relative or absolute),
-    then relative to the repo root. If a path was requested but neither
-    resolution exists, RAISES rather than falling back to random init --
-    silently training from scratch when staged init was intended would
-    waste hours of compute. Pass --init_ckpt '' (default) to skip cleanly.
+    Architectural changes between v2 and v3 mean a v2 checkpoint will report
+    many missing/unexpected keys; this is expected and we warn loudly rather
+    than fail, since users may legitimately want to inherit ImageNet-init
+    portions of the trunk.
     """
     if not ckpt_path:
         return
@@ -245,13 +233,8 @@ def _try_load_init(net, ckpt_path: str):
     resolved = next((c for c in candidates if os.path.isfile(c)), None)
     if resolved is None:
         raise FileNotFoundError(
-            f"--init_ckpt was requested but the file was not found.\n"
-            f"  Looked at: {candidates}\n"
-            f"  CWD:       {os.getcwd()}\n"
-            f"  Repo root: {_REPO_ROOT}\n"
-            f"  Tip: pass an absolute path, or a path relative to the repo "
-            f"root (e.g. 'train_log_v2/real_models/cdpc_synth_iter_*.pth'), "
-            f"NOT relative to the Oneline-DLTv2/ directory."
+            f"--init_ckpt requested but the file was not found.\n"
+            f"  Looked at: {candidates}"
         )
     ckpt = torch.load(resolved, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
@@ -269,12 +252,12 @@ def _try_load_init(net, ckpt_path: str):
 # ---------------------------------------------------------------------------
 
 SCENES = ("RE", "LT", "LL", "SF", "LF")
-EVAL_METRICS = ("direct", "inverse", "symmetric", "identity", "v1")
+EVAL_METRICS = ("direct", "inverse", "symmetric", "identity", "v1", "v1_compat")
 
 
 @torch.no_grad()
 def run_eval_l2(net, test_loader, device, max_batches=None) -> dict:
-    """Eval-L2 with all five conventions (planv2 section 2.5)."""
+    """Eval-L2 with all six conventions (planv3 B2)."""
     net.eval()
     per_scene = {m: {s: [] for s in SCENES} for m in EVAL_METRICS}
 
@@ -295,10 +278,11 @@ def run_eval_l2(net, test_loader, device, max_batches=None) -> dict:
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
 
-        err_ab  = point_reprojection_error(H_full,            pts_a, pts_b)
-        err_ba  = point_reprojection_error(H_full,            pts_b, pts_a)
-        err_inv = point_reprojection_error(H_full_inv,        pts_b, pts_a)
-        err_id  = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
+        err_ab      = point_reprojection_error(H_full,            pts_a, pts_b)
+        err_ba      = point_reprojection_error(H_full,            pts_b, pts_a)
+        err_inv     = point_reprojection_error(H_full_inv,        pts_b, pts_a)
+        err_inv_alt = point_reprojection_error(H_full_inv,        pts_a, pts_b)
+        err_id      = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
 
         per_pair = {
             "direct":    err_ab.mean(dim=1),
@@ -306,6 +290,7 @@ def run_eval_l2(net, test_loader, device, max_batches=None) -> dict:
             "symmetric": ((err_ab + err_inv) / 2.0).mean(dim=1),
             "identity":  err_id.mean(dim=1),
             "v1":        torch.minimum(err_ab, err_ba).mean(dim=1),
+            "v1_compat": torch.minimum(err_inv, err_inv_alt).mean(dim=1),
         }
         for j in range(I_a_patch.shape[0]):
             scene = batch["scene"][j]
@@ -334,7 +319,7 @@ def _ramp(it, warmup, ramp):
 
 
 # ---------------------------------------------------------------------------
-# Stage loops
+# Main training loop
 # ---------------------------------------------------------------------------
 
 def train(args, cfg: Config):
@@ -348,17 +333,17 @@ def train(args, cfg: Config):
     net = CDPCNet(
         patch_h=cfg.patch_h, patch_w=cfg.patch_w,
         backbone_pretrained=cfg.backbone_pretrained,
-        corr_radius=cfg.corr_radius,
-        corr_out_channels=cfg.corr_out_channels,
         bb_quarter_channels=cfg.bb_quarter_channels,
         bb_eighth_channels=cfg.bb_eighth_channels,
-        homography_rho=cfg.homography_rho,
+        bb_sixteenth_channels=cfg.bb_sixteenth_channels,
+        corr_radius=cfg.corr_radius,
+        corr_out_channels=cfg.corr_out_channels,
+        rho_per_level=cfg.rho_per_level,
+        homography_levels=cfg.homography_levels,
+        use_normalized_dlt=cfg.use_normalized_dlt,
         post_init_prob=cfg.post_init_prob,
         sigma_min=cfg.sigma_min,
-        use_normalized_dlt=cfg.use_normalized_dlt,
     ).to(device)
-    # Pass init_ckpt through unmodified; _try_load_init does its own dual
-    # resolution (cwd-relative, then repo-relative) and raises on miss.
     _try_load_init(net, cfg.init_ckpt)
     active = _freeze_for_stage(net, stage)
     print(f"[stage={stage}] active modules: {sorted(active)}", flush=True)
@@ -368,7 +353,8 @@ def train(args, cfg: Config):
 
     # --- data ---
     if stage == "synth":
-        train_ds = SynthPairDataset(
+        SynthCls = SynthPairDatasetV3 if cfg.use_v3_synth else SynthPairDataset
+        train_ds = SynthCls(
             _abs(cfg.train_list), _abs(cfg.train_root),
             patch_h=cfg.patch_h, patch_w=cfg.patch_w,
             img_h=cfg.img_h, img_w=cfg.img_w, rho=cfg.rho,
@@ -396,12 +382,19 @@ def train(args, cfg: Config):
 
     # --- optimizer ---
     param_groups = _make_param_groups(net, cfg, stage)
-    optimizer = torch.optim.Adam(param_groups, amsgrad=True, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_gamma)
+    optimizer = torch.optim.AdamW(
+        param_groups, weight_decay=cfg.weight_decay,
+    )
+    if cfg.use_cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.max_epoch, eta_min=1e-7,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_gamma)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
 
     # --- logging ---
-    log_dir = _abs(cfg.log_dir)
+    log_dir  = _abs(cfg.log_dir)
     save_dir = _abs(cfg.model_save_dir)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
@@ -420,7 +413,7 @@ def train(args, cfg: Config):
             crop_xy   = batch["crop_xy"].to(device, non_blocking=True)
             B = I_a_patch.shape[0]
 
-            # --- invalid pairs only relevant in stages that train reliability
+            # Invalid-pair construction only matters when reliability trains.
             do_rel = (stage in ("rel", "full")) and (glob_iter >= cfg.rel_warmup_iters)
             if do_rel:
                 I_a_neg, I_b_neg, y_neg = build_invalid_batch(
@@ -428,9 +421,6 @@ def train(args, cfg: Config):
                     shuffle_frac=cfg.rel_shuffle_frac,
                     reshuffle_frac=cfg.rel_reshuffle_frac,
                 )
-                # For negatives, just duplicate the full images (they're
-                # not what's compared anyway); the network learns from the
-                # mismatched patches only.
                 I_a_full_neg = I_a_full[:I_a_neg.shape[0]]
                 I_b_full_neg = I_b_full[:I_b_neg.shape[0]]
                 crop_xy_neg = crop_xy[:I_a_neg.shape[0]]
@@ -452,6 +442,7 @@ def train(args, cfg: Config):
                 out = net(I_a_full_all, I_b_full_all,
                           I_a_patch_all, I_b_patch_all, crop_xy_all)
 
+            # All losses computed in fp32 to keep DLT / linalg stable under AMP.
             with torch.amp.autocast("cuda", enabled=False):
                 F_b_nat        = out["F_b4"][:B].float()
                 F_a_warped_nat = out["F_a_warped"][:B].float()
@@ -464,79 +455,133 @@ def train(args, cfg: Config):
                 cycle_valid_nat = out["cycle_valid"][:B].float()
                 cond_valid_nat  = out["cond_valid"][:B].float()
                 offset_nat     = out["offset"][:B].float()
+                H_patch_nat    = out["H_patch"][:B].float()
+                per_level_off_nat = [t[:B].float() for t in out["per_level_offset"]]
                 s_all          = out["s"].float()
 
-                # --- compute losses appropriate for the stage ---
+                # Pull I_a_full / I_b_patch in fp32 (used for image-space photo).
+                I_a_full_nat = I_a_full_all[:B].float()
+                I_b_patch_nat = I_b_patch_all[:B].float()
+
+                # Full-image H, used by the image-space photometric loss.
+                H_full_nat = patch_to_full_homography(H_patch_nat, crop_xy[:B].float())
+
                 L = dict.fromkeys(
-                    ["triplet", "align", "em", "support", "smooth", "rel",
-                     "cycle", "sigma_reg", "fold", "photo", "sup_corner"],
+                    ["triplet", "align_soft", "align_het", "em", "support",
+                     "smooth", "rel", "cycle", "sigma_prior", "fold",
+                     "photo_img", "sup_corner", "sup_H"],
                     torch.zeros((), device=device),
                 )
 
-                # L_fold is cheap and always on (where the H head trains).
-                if stage in ("synth", "h_only", "q_sigma", "joint", "full"):
+                # ---- Fold penalty: cheap, always on when H trains ----
+                if stage in ("synth", "h_only", "q_only", "sigma_only",
+                             "joint", "full"):
                     L["fold"] = fold_loss(offset_nat, cfg.patch_h, cfg.patch_w)
 
+                # ============================================================
+                # Stage SYNTH: supervised corner + Frobenius supervision
+                # ============================================================
                 if stage == "synth":
-                    # Supervised corner loss.
+                    if "offset_gt" not in batch:
+                        raise KeyError(
+                            "stage=synth requires an offset_gt label; the "
+                            "training dataloader is not a SynthPair dataset.")
                     offset_gt = batch["offset_gt"].to(device).float()
-                    L["sup_corner"] = F.smooth_l1_loss(offset_nat, offset_gt, beta=1.0)
-                else:
-                    # Triplet: stage-aware q weighting.
-                    use_q = (stage in ("q_sigma", "full")) and cfg.triplet_use_q_weighting
+                    # Final-level offset supervision.
+                    sup_corner = F.smooth_l1_loss(offset_nat, offset_gt, beta=1.0)
+                    # Per-level supervision (each cumulative δp at level t
+                    # should also approach the GT offset). Skipped if only 1 level.
+                    if len(per_level_off_nat) > 1:
+                        cumul = torch.zeros_like(per_level_off_nat[0])
+                        for delta in per_level_off_nat:
+                            cumul = cumul + delta
+                            sup_corner = sup_corner + 0.5 * F.smooth_l1_loss(
+                                cumul, offset_gt, beta=1.0)
+                        sup_corner = sup_corner / float(len(per_level_off_nat))
+                    L["sup_corner"] = sup_corner
+
+                    # Frobenius supervision on the final H (normalized).
+                    if "H_full_gt" in batch:
+                        H_full_gt = batch["H_full_gt"].to(device).float()
+                        # Normalize both so H[2,2]=1 and compare in fro norm.
+                        H_pred = H_full_nat / (H_full_nat[:, 2:3, 2:3] + 1e-8)
+                        H_gt   = H_full_gt   / (H_full_gt[:, 2:3, 2:3]   + 1e-8)
+                        denom = (H_gt.flatten(1).norm(dim=1).clamp(min=1e-6))
+                        diff  = (H_pred - H_gt).flatten(1).norm(dim=1)
+                        L["sup_H"] = (diff / denom).mean()
+
+                # ============================================================
+                # Stages that use the triplet loss
+                # ============================================================
+                if stage in ("h_only", "joint", "full"):
+                    use_q = (stage in ("joint", "full")) and cfg.triplet_use_q_weighting
                     L["triplet"] = triplet_loss(
                         F_b_nat, F_a_warped_nat, F_a_nat,
                         q_nat, valid_nat, margin=cfg.triplet_margin,
                         use_q_weighting=use_q,
                     )
 
-                # Photometric (Charbonnier on patch image-space residual).
-                if stage in ("h_only", "q_sigma", "joint", "full"):
-                    # Build a low-res patch residual on the feature-space residual map
-                    # since we don't have an aligned image-space pair here. The
-                    # `residual_nat` already is Charbonnier-suitable on |F_b - F_a_warped|.
-                    photo = torch.sqrt(residual_nat ** 2 + 1e-6)
-                    # valid-mask normalized mean
-                    denom = valid_nat.sum(dim=(1, 2, 3)).clamp(min=1.0)
-                    L["photo"] = ((photo * valid_nat).sum(dim=(1, 2, 3)) / denom).mean()
-
-                # Alignment / EM / Support / Smooth (q + sigma stages).
-                if stage in ("q_sigma", "joint", "full"):
-                    if stage == "joint":
-                        # q_dagger = sg(max(q, q_min_floor)); decouples H from
-                        # transient q collapses (planv2 phase 6).
-                        q_eff = torch.clamp(q_nat, min=cfg.q_min_floor).detach()
-                    else:
-                        q_eff = q_nat
-                    L["align"] = alignment_loss(
-                        residual_nat, log_sigma_nat, q_eff, valid_nat,
+                # ============================================================
+                # Image-space photometric anchor (planv3 B5)
+                # ============================================================
+                if stage in ("h_only", "joint", "full"):
+                    L["photo_img"] = photometric_image_loss(
+                        I_a_full_nat, I_b_patch_nat,
+                        H_full_nat, crop_xy[:B].float(),
                     )
 
-                    # Residual-gated L_em: only fire when residuals are
-                    # credible (planv2 phase 5).
-                    r_median = residual_nat.detach().median()
-                    em_gated = (glob_iter >= cfg.em_warmup_iters and
-                                float(r_median) <= cfg.em_residual_gate)
-                    if em_gated:
+                # ============================================================
+                # Alignment split: soft (drives H/q) + heteroscedastic (sigma)
+                # ============================================================
+                if stage in ("h_only", "q_only", "joint", "full"):
+                    # In h_only, q is at its init bias (~post_init_prob), so
+                    # the soft term acts like a uniform-weighted Charbonnier.
+                    q_for_soft = q_nat
+                    if stage == "joint":
+                        # q_dagger = sg(max(q, q_min)) breaks the H<->q loop.
+                        q_for_soft = torch.clamp(q_nat, min=cfg.q_min_floor).detach()
+                    L["align_soft"] = align_soft_loss(
+                        residual_nat, q_for_soft, valid_nat,
+                    )
+                if stage in ("sigma_only", "joint", "full"):
+                    L["align_het"] = align_het_loss(
+                        residual_nat, log_sigma_nat, q_nat, valid_nat,
+                        tau_q=cfg.q_select_tau,
+                    )
+                if stage in ("sigma_only", "joint", "full"):
+                    L["sigma_prior"] = sigma_prior_loss(
+                        log_sigma_nat, residual_nat, valid_nat,
+                    )
+
+                # ============================================================
+                # Posterior training: EM + support + smoothness
+                # ============================================================
+                if stage in ("q_only", "joint", "full"):
+                    # Self-paced EM gate (planv3 §4.3): smooth fade with med(r).
+                    em_warmed = glob_iter >= cfg.em_warmup_iters
+                    if em_warmed:
+                        beta = cfg.em_self_paced_beta if cfg.use_em_self_paced_gate else 0.0
                         L["em"] = em_posterior_loss(
                             q_nat, residual_nat, log_sigma_nat, valid_nat,
                             pi=cfg.em_prior_pi, r_max=cfg.em_r_max,
+                            self_paced_beta=beta,
                         )
                     L["support"] = support_loss(q_nat, valid_nat, alpha=cfg.alpha_support)
-                    L["smooth"] = edge_aware_smoothness(
-                        q_nat, I_b_patch.float(), gamma=cfg.smoothness_gamma,
+                    L["smooth"]  = edge_aware_smoothness(
+                        q_nat, I_b_patch_nat, gamma=cfg.smoothness_gamma,
                     )
-                    # Pull-to-1 sigma regularizer (kept simple in stages <=4;
-                    # planv2's data-adaptive mu_sigma is a Phase-6 option not
-                    # adopted here to avoid bad-H / large-sigma coupling).
-                    L["sigma_reg"] = (log_sigma_nat * valid_nat).pow(2).sum() / \
-                                     valid_nat.sum().clamp(min=1.0)
 
-                if stage == "full":
+                # ============================================================
+                # Cycle consistency (joint only)
+                # ============================================================
+                if stage in ("joint", "full"):
                     L["cycle"] = cycle_loss(
                         F_a_nat, F_a_rec_nat, cycle_valid_nat, cond_valid_nat,
                     )
 
+                # ============================================================
+                # Reliability calibration
+                # ============================================================
                 if do_rel:
                     r_mean_nat = residual_nat.mean(dim=(1, 2, 3))
                     y_nat = build_invalid_pair_labels(
@@ -546,23 +591,26 @@ def train(args, cfg: Config):
                     y_target = torch.cat([y_nat, y_neg.float()], dim=0)
                     L["rel"] = reliability_loss(s_all, y_target)
 
-                lam_align_eff = cfg.lambda_align * _ramp(
+                # ---- Total ----
+                lam_align_soft_eff = cfg.lambda_align_soft * _ramp(
                     glob_iter, cfg.align_warmup_iters, cfg.align_ramp_iters)
                 lam_em_eff = cfg.lambda_em * _ramp(
                     glob_iter, cfg.em_warmup_iters, cfg.em_ramp_iters)
 
                 L_total = (
-                    cfg.lambda_triplet   * L["triplet"]
-                    + lam_align_eff      * L["align"]
-                    + lam_em_eff         * L["em"]
-                    + cfg.lambda_support * L["support"]
-                    + cfg.lambda_smooth  * L["smooth"]
-                    + cfg.lambda_rel     * L["rel"]
-                    + cfg.lambda_cycle   * L["cycle"]
-                    + cfg.lambda_sigma_reg * L["sigma_reg"]
-                    + cfg.lambda_fold    * L["fold"]
-                    + cfg.lambda_photo   * L["photo"]
+                    cfg.lambda_triplet     * L["triplet"]
+                    + lam_align_soft_eff   * L["align_soft"]
+                    + cfg.lambda_align_het * L["align_het"]
+                    + lam_em_eff           * L["em"]
+                    + cfg.lambda_support   * L["support"]
+                    + cfg.lambda_smooth    * L["smooth"]
+                    + cfg.lambda_rel       * L["rel"]
+                    + cfg.lambda_cycle     * L["cycle"]
+                    + cfg.lambda_sigma     * L["sigma_prior"]
+                    + cfg.lambda_fold      * L["fold"]
+                    + cfg.lambda_photo_img * L["photo_img"]
                     + cfg.lambda_sup_corner * L["sup_corner"]
+                    + cfg.lambda_sup_H     * L["sup_H"]
                 )
 
             scaler.scale(L_total).backward()
@@ -581,45 +629,50 @@ def train(args, cfg: Config):
                 offset_mean = float(offset_abs.mean())
                 kappa_H_nat = out["kappa_H"][:B].detach().float()
                 kappa_log = float(torch.log(kappa_H_nat.clamp(min=1.0)).mean())
-                # Fold-over count: any cross product flipped sign.
-                # Counted here as the number of pairs where L["fold"] > 0.
                 fold_count = float((L["fold"] > 0).float())
-                # A_v: fraction of valid pixels.
                 area_valid = float(valid_nat.mean())
-                # q stats
                 q_mean = float(q_nat.mean())
                 q_var  = float(((q_nat - q_nat.mean()) ** 2).mean())
                 q_area = float((q_nat > 0.5).float().mean())
-                # sigma stats
                 sigma_mean = float(log_sigma_nat.exp().mean())
                 r_median   = float(residual_nat.median())
+                sel_frac, q_in_S = selection_set_stats(
+                    q_nat, valid_nat, tau_q=cfg.q_select_tau)
+                sel_frac_m = float(sel_frac.mean())
+                q_in_S_m   = float(q_in_S.mean())
+                # Per-pyramid-level offset infinity norm.
+                per_lvl_inf = [float(t.abs().max()) for t in per_level_off_nat]
+                per_lvl_mean = [float(t.abs().mean()) for t in per_level_off_nat]
 
             for k, v in L.items():
                 writer.add_scalar(f"loss/{k}", float(v), glob_iter)
             writer.add_scalar("loss/total", float(L_total), glob_iter)
             writer.add_scalar("opt/lr", optimizer.param_groups[0]["lr"], glob_iter)
-            writer.add_scalar("opt/lambda_align_eff", lam_align_eff, glob_iter)
-            writer.add_scalar("opt/lambda_em_eff",    lam_em_eff,    glob_iter)
+            writer.add_scalar("opt/lambda_align_soft_eff", lam_align_soft_eff, glob_iter)
+            writer.add_scalar("opt/lambda_em_eff",         lam_em_eff,         glob_iter)
             writer.add_scalar("H/offset_inf_px",  offset_inf,  glob_iter)
             writer.add_scalar("H/offset_mean_px", offset_mean, glob_iter)
             writer.add_scalar("H/kappa_log",      kappa_log,   glob_iter)
             writer.add_scalar("H/fold_count",     fold_count,  glob_iter)
+            for t, (inf_, mean_) in enumerate(zip(per_lvl_inf, per_lvl_mean)):
+                writer.add_scalar(f"H/level{t}/offset_inf_px",  inf_,  glob_iter)
+                writer.add_scalar(f"H/level{t}/offset_mean_px", mean_, glob_iter)
             writer.add_scalar("q/mean",           q_mean,      glob_iter)
             writer.add_scalar("q/var",            q_var,       glob_iter)
             writer.add_scalar("q/area_above_tau", q_area,      glob_iter)
             writer.add_scalar("q/A_v",            area_valid,  glob_iter)
+            writer.add_scalar("q/selected_frac",  sel_frac_m,  glob_iter)
+            writer.add_scalar("q/in_S_mean",      q_in_S_m,    glob_iter)
             writer.add_scalar("sigma/mean",       sigma_mean,  glob_iter)
             writer.add_scalar("residual/median",  r_median,    glob_iter)
 
-            # Per-module grad norms.
             if glob_iter % 100 == 0:
                 for mod_name, mod in [
-                    ("backbone",         net.backbone),
-                    ("joint_backbone",   net.joint_backbone),
-                    ("homography_head",  net.homography_head),
-                    ("posterior_head",   net.posterior_head),
-                    ("uncertainty_head", net.uncertainty_head),
-                    ("reliability_head", net.reliability_head),
+                    ("backbone",           net.backbone),
+                    ("homography_pyramid", net.homography_pyramid),
+                    ("posterior_head",     net.posterior_head),
+                    ("uncertainty_head",   net.uncertainty_head),
+                    ("reliability_head",   net.reliability_head),
                 ]:
                     g2 = 0.0
                     n = 0
@@ -633,17 +686,20 @@ def train(args, cfg: Config):
             if batch_idx % cfg.score_print_freq == 0:
                 msg = (f"[ep {epoch+1:02d} it {glob_iter:06d} stage={stage}] "
                        f"L={float(L_total):.4f}  "
-                       f"sup={float(L['sup_corner']):.3f} "
+                       f"sup_c={float(L['sup_corner']):.3f} "
+                       f"sup_H={float(L['sup_H']):.3f} "
                        f"trip={float(L['triplet']):.3f} "
-                       f"al={float(L['align']):.3f} "
+                       f"asoft={float(L['align_soft']):.3f} "
+                       f"ahet={float(L['align_het']):.3f} "
                        f"em={float(L['em']):.3f} "
                        f"sup={float(L['support']):.3f} "
                        f"sm={float(L['smooth']):.4f} "
                        f"rel={float(L['rel']):.3f} "
                        f"cyc={float(L['cycle']):.3f} "
-                       f"ph={float(L['photo']):.3f} "
+                       f"ph_img={float(L['photo_img']):.3f} "
+                       f"sig={float(L['sigma_prior']):.3f} "
                        f"fold={float(L['fold']):.3f}  "
-                       f"q={q_mean:.3f} sig={sigma_mean:.3f} "
+                       f"q={q_mean:.3f} sig_e={sigma_mean:.3f} "
                        f"r_med={r_median:.3f} "
                        f"off_inf={offset_inf:.2f}px "
                        f"off_avg={offset_mean:.2f}px "
@@ -672,9 +728,6 @@ def train(args, cfg: Config):
 
             glob_iter += 1
 
-            # synth has a per-epoch iteration cap, since the dataset is
-            # generative and we want fast supervised bootstrap not a full
-            # pass through every line of Train_List.
             if stage == "synth" and batch_idx >= cfg.synth_iters_per_epoch:
                 break
 
@@ -688,9 +741,6 @@ def train(args, cfg: Config):
     )
     if final_path:
         print(f"[done] final checkpoint: {final_path}", flush=True)
-    else:
-        print(f"[done] training finished but FINAL checkpoint failed to save; "
-              f"check disk/permissions on {save_dir}", flush=True)
     writer.close()
 
 
@@ -712,32 +762,32 @@ def _parse_args(cfg: Config):
     p.add_argument("--train_root", type=str, default=cfg.train_root)
     p.add_argument("--log_dir",   type=str, default=cfg.log_dir)
     p.add_argument("--model_save_dir", type=str, default=cfg.model_save_dir)
-    p.add_argument("--stage",     type=str, default=cfg.stage,
-                   choices=["synth", "h_only", "q_sigma", "joint", "rel", "full"])
+    p.add_argument("--stage", type=str, default=cfg.stage,
+                   choices=["synth", "h_only", "q_only", "sigma_only",
+                            "joint", "rel", "full"])
     p.add_argument("--init_ckpt", type=str, default=cfg.init_ckpt)
     p.add_argument("--max_frame_gap", type=int, default=0,
-                   help="Stage 3 curriculum: max abs(frame_b - frame_a). 0 = no filter.")
-    p.add_argument("--homography_rho", type=float, default=cfg.homography_rho,
-                   help="Bound for H head: |corner_offset| <= rho. Must be >= synth_rho_max.")
+                   help="Stage h_only curriculum: max abs(frame_b - frame_a). 0 = no filter.")
+    p.add_argument("--homography_levels", type=int, default=cfg.homography_levels,
+                   help="Number of coarse-to-fine levels in the H pyramid (1, 2, or 3).")
     p.add_argument("--synth_rho_max", type=int, default=cfg.synth_rho_max,
-                   help="Per-corner perturbation range for the synth dataset, in px.")
-    p.add_argument("--model_save_freq", type=int, default=cfg.model_save_freq,
-                   help="Iters between checkpoint saves. Lower it to keep more "
-                        "intermediate checkpoints if disk space allows.")
-    p.add_argument("--lambda_triplet", type=float, default=cfg.lambda_triplet,
-                   help="Weight on L_triplet. Lower for small-motion h_only "
-                        "where triplet stays pinned at the margin.")
-    p.add_argument("--lambda_photo", type=float, default=cfg.lambda_photo,
-                   help="Weight on L_photo (Charbonnier on feature residual). "
-                        "Raise for h_only so the alignment signal isn't drowned "
-                        "by a stuck triplet.")
-    p.add_argument("--triplet_margin", type=float, default=cfg.triplet_margin,
-                   help="Triplet hinge margin. Default 1.0 is large vs feature "
-                        "residual scale (~0.05); lower to 0.05-0.1 if L_trip "
-                        "sticks near margin for many iters.")
+                   help="Max per-corner perturbation for the synth dataset, in px.")
+    p.add_argument("--use_v3_synth", action="store_true", default=cfg.use_v3_synth,
+                   help="Use the structured-affine SynthPairDatasetV3 (planv3 B6).")
+    p.add_argument("--no_v3_synth", dest="use_v3_synth", action="store_false")
+    p.add_argument("--model_save_freq", type=int, default=cfg.model_save_freq)
+    p.add_argument("--lambda_triplet",    type=float, default=cfg.lambda_triplet)
+    p.add_argument("--lambda_photo_img",  type=float, default=cfg.lambda_photo_img)
+    p.add_argument("--lambda_align_soft", type=float, default=cfg.lambda_align_soft)
+    p.add_argument("--lambda_align_het",  type=float, default=cfg.lambda_align_het)
+    p.add_argument("--lambda_sigma",      type=float, default=cfg.lambda_sigma)
+    p.add_argument("--triplet_margin",    type=float, default=cfg.triplet_margin)
+    p.add_argument("--sigma_min", type=float, default=cfg.sigma_min)
+    p.add_argument("--alpha_support",     type=float, default=cfg.alpha_support)
+    p.add_argument("--use_cosine_lr",  action="store_true", default=cfg.use_cosine_lr)
+    p.add_argument("--no_cosine_lr",   dest="use_cosine_lr", action="store_false")
     args = p.parse_args()
 
-    # Push CLI args back into cfg so downstream code reads a single source.
     cfg.batch_size = args.batch_size
     cfg.max_epoch = args.max_epoch
     cfg.lr = args.lr
@@ -753,18 +803,19 @@ def _parse_args(cfg: Config):
     cfg.model_save_dir = args.model_save_dir
     cfg.stage = args.stage
     cfg.init_ckpt = args.init_ckpt
-    cfg.homography_rho = args.homography_rho
+    cfg.homography_levels = args.homography_levels
     cfg.synth_rho_max = args.synth_rho_max
+    cfg.use_v3_synth = args.use_v3_synth
     cfg.model_save_freq = args.model_save_freq
     cfg.lambda_triplet = args.lambda_triplet
-    cfg.lambda_photo = args.lambda_photo
+    cfg.lambda_photo_img = args.lambda_photo_img
+    cfg.lambda_align_soft = args.lambda_align_soft
+    cfg.lambda_align_het = args.lambda_align_het
+    cfg.lambda_sigma = args.lambda_sigma
     cfg.triplet_margin = args.triplet_margin
-    if cfg.homography_rho < cfg.synth_rho_max:
-        raise ValueError(
-            f"homography_rho ({cfg.homography_rho}) must be >= synth_rho_max "
-            f"({cfg.synth_rho_max}); otherwise the synth target is unreachable "
-            f"and L_sup_corner plateaus while offset_inf_px saturates at rho."
-        )
+    cfg.sigma_min = args.sigma_min
+    cfg.alpha_support = args.alpha_support
+    cfg.use_cosine_lr = args.use_cosine_lr
     return args
 
 

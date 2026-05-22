@@ -1,15 +1,18 @@
-"""Legacy v1-style point-reprojection test, extended with diagnostics.
-
-Reports five per-pair metrics, averaged per scene (RE/LT/LL/SF/LF) and overall:
+"""Point-reprojection test, planv3 §6: six metrics per pair, averaged
+per scene (RE/LT/LL/SF/LF) and overall:
 
   direct     : || H * p_a - p_b ||                         per-point, then mean
   inverse    : || H^-1 * p_b - p_a ||                      per-point, then mean
   symmetric  : 0.5 * (direct + inverse)                    per-point, then mean
   identity   : || p_a - p_b ||         (H = I baseline)    per-point, then mean
-  v1         : min(|| H p_a - p_b ||, || H p_b - p_a ||)   per-point, then mean
-
-The `v1` row is the historic Avg directly comparable to v1's reported scores.
-The other four are diagnostics (see planv2 §2.5).
+  v1         : min(|| H p_a - p_b ||, || H p_b - p_a ||)   legacy (UNINVERTED)
+  v1_compat  : min(|| H^-1 p_b - p_a ||, || H^-1 p_a - p_b ||)
+                 planv3 B2: the actual v1-equivalent column (v1's test.py
+                 INVERTS the model's H_mat before measuring error and then
+                 takes a per-point min over the two correspondence orderings,
+                 because the dataset's `matche_pts` is not consistently
+                 oriented). The legacy `v1` row above does NOT invert and is
+                 generally NOT comparable to v1's headline number.
 """
 
 import argparse
@@ -34,7 +37,7 @@ from eval import _load_state
 
 
 SCENES = ("RE", "LT", "LL", "SF", "LF")
-METRICS = ("direct", "inverse", "symmetric", "identity", "v1")
+METRICS = ("direct", "inverse", "symmetric", "identity", "v1", "v1_compat")
 
 
 def _eye_like(H: torch.Tensor) -> torch.Tensor:
@@ -55,7 +58,9 @@ def test(ckpt_path: str):
         corr_out_channels=cfg.corr_out_channels,
         bb_quarter_channels=cfg.bb_quarter_channels,
         bb_eighth_channels=cfg.bb_eighth_channels,
-        homography_rho=cfg.homography_rho,
+        bb_sixteenth_channels=cfg.bb_sixteenth_channels,
+        rho_per_level=cfg.rho_per_level,
+        homography_levels=cfg.homography_levels,
         post_init_prob=cfg.post_init_prob,
         sigma_min=cfg.sigma_min,
         use_normalized_dlt=cfg.use_normalized_dlt,
@@ -92,10 +97,11 @@ def test(ckpt_path: str):
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
 
-        err_ab  = point_reprojection_error(H_full,            pts_a, pts_b)
-        err_ba  = point_reprojection_error(H_full,            pts_b, pts_a)
-        err_inv = point_reprojection_error(H_full_inv,        pts_b, pts_a)
-        err_id  = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
+        err_ab      = point_reprojection_error(H_full,            pts_a, pts_b)
+        err_ba      = point_reprojection_error(H_full,            pts_b, pts_a)
+        err_inv     = point_reprojection_error(H_full_inv,        pts_b, pts_a)
+        err_inv_alt = point_reprojection_error(H_full_inv,        pts_a, pts_b)
+        err_id      = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
 
         per_pair = {
             "direct":    float(err_ab.mean(dim=1).item()),
@@ -103,6 +109,7 @@ def test(ckpt_path: str):
             "symmetric": float(((err_ab + err_inv) / 2.0).mean(dim=1).item()),
             "identity":  float(err_id.mean(dim=1).item()),
             "v1":        float(torch.minimum(err_ab, err_ba).mean(dim=1).item()),
+            "v1_compat": float(torch.minimum(err_inv, err_inv_alt).mean(dim=1).item()),
         }
 
         scene = batch["scene"][0]

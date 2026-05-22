@@ -1,6 +1,8 @@
 """Diagnose where NaN first appears under AMP with realistic feature scales.
 
-Mimics the training data range: normalized grayscale ~ N(0, 1)-ish."""
+planv3 update: forward signature now requires both full images and patches.
+Mimics the training data range: normalized grayscale ~ N(0, 1)-ish.
+"""
 
 import os, sys, torch
 _THIS = os.path.dirname(os.path.abspath(__file__))
@@ -20,23 +22,32 @@ def _check(name, t):
 def main():
     torch.manual_seed(0)
     cfg = Config()
-    cfg.patch_h, cfg.patch_w = 315, 560
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     net = CDPCNet(
         patch_h=cfg.patch_h, patch_w=cfg.patch_w,
         backbone_pretrained=True,
         corr_radius=cfg.corr_radius, corr_out_channels=cfg.corr_out_channels,
         bb_quarter_channels=cfg.bb_quarter_channels,
         bb_eighth_channels=cfg.bb_eighth_channels,
+        bb_sixteenth_channels=cfg.bb_sixteenth_channels,
+        rho_per_level=cfg.rho_per_level,
+        homography_levels=cfg.homography_levels,
+        post_init_prob=cfg.post_init_prob,
+        sigma_min=cfg.sigma_min,
+        use_normalized_dlt=cfg.use_normalized_dlt,
     ).to(device)
     net.eval()
     B = 2
-    I_a = torch.randn(B, 1, cfg.patch_h, cfg.patch_w, device=device) * 1.0
-    I_b = I_a + 0.1 * torch.randn_like(I_a)
+    I_a_full = torch.randn(B, 1, cfg.img_h, cfg.img_w, device=device)
+    I_b_full = I_a_full + 0.1 * torch.randn_like(I_a_full)
+    x0, y0 = 40, 23
+    I_a_patch = I_a_full[:, :, y0:y0+cfg.patch_h, x0:x0+cfg.patch_w].contiguous()
+    I_b_patch = I_b_full[:, :, y0:y0+cfg.patch_h, x0:x0+cfg.patch_w].contiguous()
+    crop_xy = torch.tensor([[x0, y0]] * B, dtype=torch.float32, device=device)
 
     print("=== AMP autocast on ===")
-    with torch.amp.autocast("cuda", enabled=True):
-        out = net(I_a, I_b)
+    with torch.amp.autocast("cuda", enabled=device == "cuda"):
+        out = net(I_a_full, I_b_full, I_a_patch, I_b_patch, crop_xy)
     for k, v in out.items():
         if isinstance(v, torch.Tensor) and v.dim() > 0:
             _check(k, v)

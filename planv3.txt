@@ -1,0 +1,924 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+
+\title{Plan v3: Redesigning CDPC-Homography for Sub-Pixel Convergence and a TIP-Quality Story}
+\author{Diagnostic + redesign over \texttt{Oneline-DLTv2/} as of 22 May 2026}
+\date{2026-05-22}
+
+\begin{document}
+\maketitle
+
+\section{Executive diagnosis}
+
+The current Oneline-DLTv2 fails to reach v1-competitive accuracy for \emph{five}
+compounding reasons. Listed in order of effect on the headline number:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{(P0) Corner-ordering inconsistency between the H head, the
+    synthetic supervision dataset, and the fold-over loss.} The supervised
+    Stage--2 (\texttt{synth}) bootstrap is therefore training the regressor
+    against \emph{permuted} corner labels. The DLT then assembles a corrupted
+    $H$ regardless of how well the head fits its (wrong) labels. The downstream
+    \texttt{h\_only}, \texttt{q\_sigma}, \texttt{joint}, and \texttt{rel}
+    stages all inherit this corrupted basin.
+
+    \item \textbf{(P0) The headline ``L2 v1'' column in
+    \texttt{train.py}/\texttt{eval.py} does not match v1's evaluation
+    convention.} v1 inverts \texttt{H\_mat} before computing reprojection
+    error. v2's \texttt{eval\_l2/v1} column does \emph{not} invert; the column
+    that mirrors v1's protocol is \texttt{eval\_l2/inverse}. The number you
+    have been reading is the result of an \emph{uninverted} comparison and is
+    systematically higher than the comparable v1 baseline.
+
+    \item \textbf{(P1) The q--$\sigma$ block is a coupled fixed-point with
+    multiple shortcuts.} The alignment loss normalizes by $\sum q_i v_i$ (q
+    can suppress hard regions); $\sigma$ enters as $1/\sigma$ with floor
+    $\sigma_{\min}=0.05$ (gradient blow-up); the EM target depends on the
+    \emph{predicted} $\sigma$ inside the inlier likelihood (no anchor); and
+    the reliability score $s$ is now fed by detached statistics
+    (good) but $\phi$ contains $\kappa(H)$ in fp32 even when $H$ is corrupted.
+
+    \item \textbf{(P1) The H regression head is structurally weak.} It stops
+    at ResNet \texttt{layer2} (stride 1/8) with a single global average pool,
+    and the local correlation has radius $R{=}4$ at stride 1/8 (capture basin
+    $\pm 32$\,px in input space, which is at the edge of
+    \texttt{synth\_rho\_max}). v1 uses ResNet--34 through \texttt{layer4} on
+    the cropped pair. There is no coarse-to-fine refinement.
+
+    \item \textbf{(P2) The ``photometric'' loss is not photometric.} It applies
+    Charbonnier to the same feature-space residual that drives
+    $\mathcal{L}_{\mathrm{align}}$; it adds no independent anchor. The
+    planv2 image-space Charbonnier anchor was never built.
+\end{enumerate}
+
+\noindent
+\textbf{Target.} The user reports a v1 single-network baseline reaching
+$\text{L2}_{\mathrm{Avg}}<0.25$\,px on the headline metric. Reaching that
+number with v2's probabilistic stack requires (i)~fixing the synth bootstrap
+so the H branch has a non-degenerate initialization, (ii)~reporting the
+\emph{correct} v1-equivalent metric, and (iii)~redesigning the probabilistic
+block so it does not destabilize H once unfrozen. None of these are tunable
+hyperparameters --- they are correctness issues.
+
+\section{Bug-level findings (must fix before any retraining)}
+
+\subsection{B1 (P0): corner ordering is inconsistent across the stack}
+
+\paragraph{H head / DLT convention} \texttt{cdpc\_net.py:158--164} defines
+the source quad as
+\[
+\mathtt{h4p\_patch} =
+\bigl[\,(0,0),\ (0,h),\ (w,h),\ (w,0)\,\bigr]
+= [\text{TL},\text{BL},\text{BR},\text{TR}].
+\]
+\texttt{HomographyHead} emits an 8-vector that \texttt{DLT\_solve} interprets
+in this same TL,BL,BR,TR order.
+
+\paragraph{Synthetic supervision} \texttt{data/synth\_pairs.py:111--117} builds
+\[
+\mathtt{src\_patch} = [(0,0),\ (w,0),\ (w,h),\ (0,h)]
+= [\text{TL},\text{TR},\text{BR},\text{BL}].
+\]
+The sampled label \texttt{offset\_gt = offset.reshape(-1)} is in
+TL,TR,BR,BL order. The supervised Huber in \texttt{train.py:482--483} matches
+\emph{by index}, so the head is trained with: pred-BL $\leftrightarrow$ GT-TR,
+and pred-TR $\leftrightarrow$ GT-BL. Two of four corners are permuted.
+
+\paragraph{Fold-over loss} \texttt{losses/fold.py:34--41} uses the same
+TL,TR,BR,BL ordering, so the penalty is computed on a quad with two corners
+swapped relative to what DLT actually produced.
+
+\paragraph{Impact.} Even an over-parameterized head cannot do better than
+its corrupted labels; the supervised stage produces an H that is a
+\emph{different} projective transform than the one that generated $I_b$.
+Subsequent unsupervised stages start from this corrupted basin.
+
+\paragraph{Fix.} Choose one canonical order and use it everywhere. The least
+invasive choice is to keep the existing v1-compatible TL,BL,BR,TR. In
+\texttt{synth\_pairs.py}, change
+\begin{lstlisting}[basicstyle=\ttfamily\small,frame=single]
+src_patch = np.array([[0,0], [0,ph], [pw,ph], [pw,0]], dtype=np.float32)
+\end{lstlisting}
+and pass the same \texttt{src} to \texttt{\_solve\_homography\_4pt}. The
+\texttt{offset\_flat} will then be TL,BL,BR,TR-ordered, matching the head's
+DLT convention. In \texttt{losses/fold.py}, apply the same change. Add a
+unit test \texttt{tests/test\_corner\_ordering.py} that does:
+\begin{enumerate}[leftmargin=1.5em]
+\item generate random $\Delta p$ in canonical order,
+\item run \texttt{\_solve\_homography\_4pt} (synth) and \texttt{DLT\_solve}
+      (head/DLT) with the same convention,
+\item assert that they produce identical $H$.
+\end{enumerate}
+
+\subsection{B2 (P0): the headline evaluation metric is not v1's}
+
+\texttt{train.py:298--309} computes
+\begin{align*}
+e_{ab} &= \|\,H_{\mathrm{full}}\,p_a^i - p_b^i\,\| \\
+e_{ba} &= \|\,H_{\mathrm{full}}\,p_b^i - p_a^i\,\| \\
+\mathtt{eval\_l2/v1} &= \min(e_{ab}, e_{ba})\ \text{(then mean over 6 points)}.
+\end{align*}
+The model's $H_{\mathrm{full}}$ is applied to \emph{both} orderings of the
+correspondence. v1's \texttt{test.py:160--163} does
+\[
+H_{\mathrm{eval}} = \mathrm{inv}(H_{\mathrm{mat}}),
+\quad
+e_{\mathrm{LR}} = \|H_{\mathrm{eval}} \cdot \tilde p_a - \tilde p_b\|,
+\quad
+\text{report } \min(e_{\mathrm{LR}}, e_{\mathrm{RL}}).
+\]
+
+v1 inverts; v2's \texttt{eval\_l2/v1} does not. The v2 column that actually
+implements v1's protocol is \texttt{eval\_l2/inverse}, since
+\[
+\mathrm{inv}(H_{\mathrm{ab}}) \cdot p_b \approx p_a
+\quad\Leftrightarrow\quad
+\mathrm{inv}(H_{\mathrm{mat}}) \cdot p_a \approx p_b
+\]
+under the dual semantics of $H_{ab}$ vs $H_{ba}$.
+
+\paragraph{Impact.} If v2's H is geometrically reasonable, the
+\texttt{eval\_l2/v1} column over-reports error by exactly $\|H - H^{-1}\|$
+geometrically, which can be many pixels for any non-identity warp. You may
+already have a near-working model and not know it.
+
+\paragraph{Fix.} Two equivalent options:
+\begin{enumerate}[leftmargin=1.5em]
+\item Rename: relabel \texttt{eval\_l2/v1} as \texttt{eval\_l2/min\_direct}
+    (what it actually is), and add a new \texttt{eval\_l2/v1\_compat} that
+    inverts $H$ first:
+    \[
+    e_{\mathrm{LR}} = \|H_{\mathrm{full}}^{-1} \cdot p_a^i - p_b^i\|,\quad
+    e_{\mathrm{RL}} = \|H_{\mathrm{full}}^{-1} \cdot p_b^i - p_a^i\|,
+    \]
+    headline $= \min(e_{\mathrm{LR}}, e_{\mathrm{RL}})$.
+\item Or change v2's training convention so $H_{ab}$ in the network is
+    $b\to a$ (matching v1's $H_{\mathrm{mat}}$). Less invasive.
+\end{enumerate}
+Add a unit test that, given a known $H^*$ and 6 synthesized
+correspondences, all five v2 columns return identical numbers up to the
+known transfer error.
+
+\subsection{B3 (P1): $\sigma_{\min}=0.05$ is the Kendall--Gal trap}
+
+\texttt{configs/default.py:36} sets $\sigma_{\min}=0.05$. The alignment
+loss uses
+$\rho(r_i / \sigma_i) + \log \sigma_i$
+with $\sigma_i = \sigma_{\min} + \mathrm{softplus}(u_i)$. As $u\to-\infty$,
+$\sigma\to\sigma_{\min}=0.05$ and the residual gradient is scaled by
+$1/\sigma_i = 20$. \texttt{L\_sigma\_reg} only pulls $\log\sigma$ toward
+$0$, with weight $\lambda_\sigma=0.1$. Once \texttt{L\_align} ramps to
+$\lambda_a=1.0$, the model gains by shrinking $\sigma$ globally.
+
+\paragraph{Fix.} Three combined changes:
+\begin{enumerate}[leftmargin=1.5em]
+\item Raise $\sigma_{\min}$ to $0.3$ for the \texttt{q\_sigma} stage and
+    $0.5$ before \texttt{joint}. The doc-string in \texttt{train.py} already
+    suggests this; the config default does not enforce it.
+\item Replace pull-to-1 by a data-adaptive log-residual prior:
+    \[
+    \mathcal{L}_\sigma
+    = \frac{1}{N}\sum_i v_i \bigl(\log\sigma_i - \mu_\sigma\bigr)^2,
+    \qquad
+    \mu_\sigma = \mathrm{sg}\!\bigl(\mathrm{median}_i \log r_i\bigr).
+    \]
+    This regularizes $\sigma$ to track residual scale instead of unity.
+\item In the early stages, detach $\sigma$ inside $\mathcal{L}_{\mathrm{align}}$
+    so the gradient cannot collapse $\sigma$ to recover loss. Release the
+    detach in stage \texttt{joint} after $H$ is stable.
+\end{enumerate}
+
+\subsection{B4 (P1): the q-weighted alignment loss has a normalization shortcut}
+
+The current \texttt{losses/align.py}:
+\[
+\mathcal{L}_{\mathrm{align}}
+= \frac{\sum_i q_i v_i [\rho(r_i/\sigma_i) + \log\sigma_i]}
+       {\sum_i q_i v_i}.
+\]
+The denominator depends on $q$. If $q$ is uniform low, the loss is reduced
+trivially. The mitigation in stage \texttt{joint} is \texttt{q\_dagger =
+sg(max(q, q\_min))}; in stage \texttt{q\_sigma}, the raw $q$ is still used.
+
+\paragraph{Fix.} Drop the q-in-denominator. Use an \emph{unnormalized}
+$q$-weighted mean with a fixed denominator $\sum_i v_i$, paired with a
+strong $\mathcal{L}_{\mathrm{support}}$ to force coverage:
+\[
+\mathcal{L}_{\mathrm{align}}^{\mathrm{new}}
+= \frac{\sum_i q_i v_i [\rho(r_i/\sigma_i) + \log\sigma_i]}
+       {\sum_i v_i},
+\]
+\[
+\mathcal{L}_{\mathrm{support}}
+= \mathrm{ReLU}\bigl(\alpha_q - \bar q\bigr)^2,
+\qquad \alpha_q = 0.5,
+\]
+where $\bar q$ is the mean of $q$ over valid pixels. The model now cannot
+escape the alignment cost by lowering $q$ uniformly; only \emph{spatially
+selective} suppression is rewarded, which is the desired dominant-plane
+behavior.
+
+\subsection{B5 (P2): L\_photo is a duplicate of L\_align}
+
+\texttt{train.py:497--501} computes \texttt{photo} as a Charbonnier on
+\texttt{residual\_nat}, which is the same tensor consumed by
+$\mathcal{L}_{\mathrm{align}}$ (modulo $q$ and $\sigma$). Therefore
+$\lambda_{\mathrm{photo}}$ adds no anchor.
+
+\paragraph{Fix.} Build a true image-space anchor:
+\[
+\mathcal{L}_{\mathrm{photo}}^{I}
+= \frac{1}{\sum_i v_i^I}
+  \sum_i v_i^I\,\rho_\epsilon\!\bigl(I_b^p(i) - W(I_a^{\mathrm{full}}, H_{ab})(i)\bigr),
+\]
+sampled at full patch resolution (315x560), not the feature 1/4 grid. This
+costs one extra \texttt{grid\_sample} per iteration but provides an anchor
+that is independent of feature drift.
+
+\subsection{B6 (P2): synth supervision is too narrow}
+
+The synth dataset uses uniform $\Delta p \sim \mathcal{U}(-32, 32)^8$. Real
+CA-Homography pairs have additional in-plane rotations and small projective
+warp components that uniform corner perturbations rarely produce in a
+balanced way.
+
+\paragraph{Fix.} Use a composition of three random affines plus a small
+projective perturbation:
+\[
+H^* = H_{\mathrm{persp}}\cdot H_{\mathrm{rot}}(\theta)\cdot H_{\mathrm{trans}}(t)\cdot H_{\mathrm{scale}}(s),
+\]
+with $\theta\sim\mathcal{U}(-5^\circ, 5^\circ)$, $t\sim\mathcal{U}(-20,20)$,
+$s\sim\mathcal{U}(0.95, 1.05)$, $H_{\mathrm{persp}}$ having
+$|h_{31}|,|h_{32}| < 5\times 10^{-4}$. Project to corner offsets for
+training. Mix 70\% structured + 30\% the existing uniform-corner sampling.
+
+\subsection{B7 (P3): minor numerical / convention issues}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{utils/dlt\_normalized.py:87} uses \texttt{torch.linalg.inv}
+    on $T_{\mathrm{dst}}$. $T_{\mathrm{dst}}$ is a similarity transform; use
+    the closed form $T^{-1} = \mathrm{diag}(1/s,1/s,1)\cdot\mathrm{trans}(\cdot)$
+    for fp32 stability and one fewer LU.
+\item \texttt{model/cdpc\_net.py:303--304} sets
+    \texttt{cycle\_mean = 10.0} for ill-conditioned samples. 10 is unitless
+    and dwarfs other $\phi$ entries; use the per-batch median residual
+    instead.
+\item \texttt{lr\_gamma=0.8} (exponential per epoch) collapses LR to
+    $1.24\times 10^{-3}$ by epoch 30. With 30-epoch curriculum on real
+    pairs, the network is effectively static after epoch 15. Switch to
+    \texttt{CosineAnnealingLR} with $T_{\max}$ = \texttt{max\_epoch}.
+\item \texttt{data/pairs.py:90--91} draws a uniform random crop per pair.
+    The patch is always 315x560 inside a 360x640 image: only
+    $(640-2\cdot 16-560)\times(360-2\cdot 16-315) = 48\times 13$ crop
+    positions exist. The crop variability is effectively a small jitter,
+    not a meaningful augmentation.
+\end{itemize}
+
+\section{Architectural redesign (Plan v3)}
+
+\subsection{Design goal}
+
+The current v2 has \emph{five} learned modules (per-image backbone, joint
+backbone, correlation, four heads). For TIP credibility we want every
+module to either (a) pay its way in the ablation, or (b) be removed. The
+redesign:
+
+\begin{itemize}[leftmargin=1.5em]
+\item one shared feature trunk (per-image, not joint);
+\item correlation block fed by trunk features (kept);
+\item coarse-to-fine H regression with bounded residual updates;
+\item pixel heads $q$, $\sigma$ at one scale;
+\item reliability head as a detached calibrator.
+\end{itemize}
+
+The joint 2-channel backbone is dropped; its only role was to give the
+H head access to pairwise cues, which the correlation block also provides
+and which the deeper per-image backbone (going to \texttt{layer4}) can
+encode without 2-channel input.
+
+\subsection{Feature trunk}
+
+\textbf{Spec.} A single ResNet-style trunk shared (Siamese) across $I_a$
+and $I_b$, returning a feature pyramid at strides $1/4, 1/8, 1/16$.
+Channels $(64, 128, 256)$ at the three scales. ImageNet-pretrained ResNet-18
+weights for stem/layer1/layer2/layer3; conv1 averaged to 1-channel input.
+
+\textbf{Why drop joint\_backbone.} The joint route gave the H head a
+shortcut to absolute photometric statistics ($\mu_a - \mu_b$ at pixel level)
+that correlate with motion only spuriously. A Siamese trunk produces
+features that are designed to be matched, which is what the H head should
+consume.
+
+\textbf{Implementation.} Modify \texttt{model/backbone.py} to expose
+\texttt{layer3} and add a third stride scale. New file
+\texttt{model/feature\_pyramid.py} that wraps \texttt{MultiScaleBackbone}.
+
+\subsection{Coarse-to-fine homography regressor}
+
+\textbf{Spec.} Three update levels at $t = 0, 1, 2$ with strides
+$1/16, 1/8, 1/4$. Each level takes
+\[
+X_t = \bigl[\,F_a^{(t)},\ W(F_b^{(t)}, H_t^{-1}),\ C^{(t)},\ x/W,\ y/H\,\bigr]
+\]
+where $C^{(t)}$ is the local cosine correlation at level $t$, and
+$W(F_b, H_t^{-1})$ is $F_b$ pre-warped by the current $H_t$ estimate (so the
+network only has to regress \emph{residual} corner offsets). The level-$t$
+update is
+\[
+\Delta p^{(t)} = \rho_t \tanh\!\bigl(f_t(X_t)\bigr),
+\qquad
+\rho_t \in (32, 16, 8)\ \text{pixels for}\ t=0,1,2,
+\]
+and the running estimate is
+\[
+H_{t+1} = \mathrm{DLT}(p, p + \Delta p^{(t)})\cdot H_t,
+\quad H_0 = I.
+\]
+The compound homography $H_3$ is the final prediction.
+
+\textbf{Why this design.} The current single-stage head has a fixed capture
+basin equal to $\rho\cdot\max|\tanh| = 32$\,px. Coarse-to-fine increases
+effective range to $\rho_0+\rho_1+\rho_2 = 56$\,px while keeping any single
+update bounded. Pre-warping $F_b$ at each step makes the regressor's job
+local (similar to PWC-Net / RAFT for optical flow).
+
+\textbf{Each level}'s regressor: 4 conv blocks (256 ch) + $1\times 1$ conv
+projection + attentive pooling (not GAP) to a 256-d embedding, MLP to 8.
+Attentive pooling: a learned spatial softmax over the level's feature map
+that yields a single 256-d vector. Removes the GAP-induced
+translation-invariance.
+
+\textbf{Implementation.} New file \texttt{model/homography\_pyramid.py}.
+The current \texttt{HomographyHead} becomes the level-2 regressor.
+
+\subsection{Pixel heads $q$ and $\sigma$ (one scale, decoupled)}
+
+The redesigned probabilistic block (Section \ref{sec:prob}) requires
+$q$ and $\sigma$ at one fixed scale --- the highest available, $1/4$ ---
+and \emph{decouples} their training so they cannot feed each other's
+shortcuts.
+
+\textbf{$q$-head spec.} Input: $\bigl[F_b^{1/4},\ W(F_a^{1/4}, H_3),\ r_a^{1/4}\bigr]$
+where $r_a^{1/4}$ is the residual map and the warp uses the \emph{final}
+$H_3$. 3 conv blocks (64 ch) + $1\times 1$ to a single logit. Sigmoid output.
+
+\textbf{$\sigma$-head spec.} Same input, separate weights. Output:
+$\sigma_i = \sigma_{\min} + \mathrm{softplus}(u_i)$.
+$\sigma_{\min}$ is stage-dependent: $0.5$ in early training,
+relaxed to $0.05$ only after $H_3$ and $q$ have stabilized.
+
+\textbf{Why one scale.} The current code samples $q$ and $\sigma$ at $1/4$
+but the inputs include correlation at $1/8$ upsampled to $1/4$. Removing
+the upsample (since the trunk is now a pyramid up to $1/4$) eliminates a
+source of low-frequency bias in the heads.
+
+\subsection{Reliability head}
+
+Keep \texttt{model/heads.py:ReliabilityHead} unchanged. The 10-dim $\phi$
+already detaches before entering the head (\texttt{cdpc\_net.py:318}).
+Two minor changes:
+
+\begin{itemize}[leftmargin=1.5em]
+\item Replace the magic-number \texttt{cycle\_mean = 10.0} for ill-conditioned
+    $H$ with the per-batch \texttt{median(r)} value, so $\phi$ stays on a
+    bounded scale.
+\item Add a temperature parameter $T$ initialized to 1.0, with
+    $s = \sigma\bigl(\mathrm{MLP}(\phi)/T\bigr)$, calibrated post-hoc on
+    val via the standard temperature-scaling closed-form.
+\end{itemize}
+
+\section{Probabilistic block redesign}
+\label{sec:prob}
+
+This is the largest single change in v3 and addresses B3 / B4 above. The
+current block has $q$ and $\sigma$ jointly shaping the alignment loss
+\emph{and} jointly trained against each other through EM. We break the
+coupling.
+
+\subsection{New variables and roles}
+
+\begin{itemize}[leftmargin=1.5em]
+\item $q_i \in [0,1]$: \textbf{dominant-plane indicator}. ``Is pixel $i$ on
+    the plane that $H$ describes?'' Trained by EM against a generative
+    residual model. Does \emph{not} weight $\sigma$.
+\item $\sigma_i > 0$: \textbf{aleatoric scale of the residual.} ``How noisy
+    is the alignment at pixel $i$ \emph{given} that it is on the plane?''
+    Trained by Kendall--Gal heteroscedastic regression on \emph{q-selected}
+    pixels.
+\item $s_{ab} \in [0,1]$: \textbf{pair reliability.} Trained as a detached
+    calibrator on $\phi$.
+\end{itemize}
+
+\subsection{New alignment loss}
+
+Define a \emph{hard} dominant-plane selection set
+\[
+\mathcal{S} = \{ i : q_i > \tau_q\ \wedge\ v_i = 1\},
+\qquad \tau_q = 0.5,
+\]
+and a \emph{soft} weight $w_i = q_i v_i$. The alignment loss splits:
+
+\begin{align}
+\mathcal{L}_{\mathrm{align}}^{\mathrm{soft}}
+&= \frac{1}{\sum_i v_i}\sum_i q_i v_i \cdot \rho_\epsilon(r_i),
+&&\text{drives $H$, $q$, trunk}\\
+\mathcal{L}_{\mathrm{align}}^{\mathrm{het}}
+&= \frac{1}{|\mathcal{S}|}\sum_{i\in\mathcal{S}}
+   \Bigl[\rho_\epsilon\!\bigl(r_i/\mathrm{sg}(\sigma_i)\bigr) + \log\sigma_i\Bigr],
+&&\text{drives $\sigma$ only.}
+\end{align}
+
+The soft term has no $\sigma$ and a fixed denominator: $q$ cannot escape
+cost by suppressing pixels. The heteroscedastic term uses $\mathrm{sg}(\sigma)$
+in the residual numerator, so the gradient $\partial/\partial\sigma$ comes
+only from $\log\sigma_i$ pulling $\sigma$ up and from the explicit $\sigma$
+in the denominator pulling it down --- the closed-form fixed point is
+$\sigma_i^* = r_i$ on selected pixels. No $1/\sigma$ amplification on H.
+
+\subsection{New EM target and $\mathcal{L}_{\mathrm{em}}$}
+
+\begin{align}
+p(r_i\mid z_i=1) &= \frac{1}{\sigma_i^{\mathrm{em}}}
+                    \exp\!\bigl(-r_i / \sigma_i^{\mathrm{em}}\bigr),
+&\sigma_i^{\mathrm{em}} = \mathrm{sg}(\sigma_i),\\
+p(r_i\mid z_i=0) &= 1/r_{\max},
+&r_{\max} = 4.0,\\
+\tilde q_i &= \frac{\pi\,p(r_i\mid 1)}{\pi\,p(r_i\mid 1) + (1-\pi)\,p(r_i\mid 0)},
+&\pi=0.5,\\
+\mathcal{L}_{\mathrm{em}} &=
+\frac{1}{\sum_i v_i}\sum_i v_i\,\mathrm{BCE}\!\bigl(q_i, \mathrm{sg}(\tilde q_i)\bigr).
+\end{align}
+
+Differences from the current code:
+\begin{enumerate}[leftmargin=1.5em]
+\item $\sigma^{\mathrm{em}}$ is \emph{stop-graded}: the EM target depends on
+    $\sigma$ but no gradient flows back. Otherwise $\sigma$ would be
+    co-trained by both EM and Kendall--Gal, with the EM term preferring
+    \emph{large} $\sigma$ (broad inlier likelihood) and Kendall--Gal
+    preferring \emph{small} $\sigma$.
+\item The residual gate (\texttt{cfg.em\_residual\_gate}) is replaced by a
+    per-batch self-paced gate: $\mathcal{L}_{\mathrm{em}}$ is multiplied by
+    $\mathrm{sg}\bigl(\exp(-\beta\,\mathrm{med}(r)/r_{\max})\bigr)$ with
+    $\beta=2$. EM contribution decays smoothly as residuals get large,
+    rather than turning on or off.
+\end{enumerate}
+
+\subsection{$\sigma$ regularizer}
+
+\[
+\mathcal{L}_\sigma
+= \frac{1}{\sum_i v_i}
+  \sum_i v_i\bigl(\log\sigma_i - \mu_\sigma\bigr)^2,
+\qquad
+\mu_\sigma = \mathrm{sg}\!\bigl(\mathrm{med}_i \log\,(r_i+\epsilon)\bigr).
+\]
+
+This pulls $\sigma$ toward the residual scale rather than 1. Combined with
+the heteroscedastic term, the equilibrium is $\sigma_i \approx r_i$ on the
+plane and $\sigma_i \approx \mathrm{med}(r)$ off the plane, which is the
+physically right scale.
+
+\subsection{Cycle and reliability}
+
+$\mathcal{L}_{\mathrm{cycle}}$ stays as in v2. Set $\lambda_{\mathrm{cycle}} = 0.05$
+in the joint stage (currently 0.0, which means cycle is silent).
+
+$\mathcal{L}_{\mathrm{rel}}$ stays as v2 with the detached $\phi$. Replace
+the magic 10.0 in $\phi$ with batch-median residual (B7).
+
+\section{Loss inventory and weights}
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}
+                 >{\raggedright\arraybackslash}p{0.40\linewidth}
+                 >{\raggedright\arraybackslash}p{0.30\linewidth}}
+\toprule
+Symbol & Purpose & Active stage(s) and $\lambda$ \\
+\midrule
+$\mathcal{L}_{\mathrm{sup}}^{\mathrm{corner}}$
+    & Huber($\Delta p$, $\Delta p^*$) supervised
+    & synth: $\lambda=1.0$ \\
+$\mathcal{L}_{\mathrm{sup}}^{\mathrm{H}}$
+    & Frobenius $\|H_3-H^*\|_F^2 / \|H^*\|_F^2$ after normalization
+    & synth: $\lambda=0.1$ (multi-scale check) \\
+$\mathcal{L}_{\mathrm{photo}}^{I}$
+    & Image-space Charbonnier on $I_b^p - W(I_a^{\mathrm{full}}, H_3)$
+    & h\_only, joint: $0.5\to 0.25$ \\
+$\mathcal{L}_{\mathrm{align}}^{\mathrm{soft}}$
+    & q-weighted feature Charbonnier, fixed denominator
+    & h\_only, q\_sigma, joint: $0.5\to 1.0$ \\
+$\mathcal{L}_{\mathrm{align}}^{\mathrm{het}}$
+    & Kendall--Gal on $\mathcal{S}$, drives $\sigma$ only
+    & q\_sigma, joint: $0.3$ \\
+$\mathcal{L}_{\mathrm{tri}}$
+    & Hinge $(m + d^+ - d^-)_+$, uniform-weighted
+    & h\_only, joint: $0.5$ \\
+$\mathcal{L}_{\mathrm{em}}$
+    & BCE($q$, sg($\tilde q$)) with self-paced gate
+    & q\_sigma, joint: $0.1\to 0.2$ \\
+$\mathcal{L}_{\mathrm{support}}$
+    & $\mathrm{ReLU}(\alpha_q - \bar q)^2$, $\alpha_q = 0.5$
+    & q\_sigma, joint: $0.1$ \\
+$\mathcal{L}_{\mathrm{smooth}}$
+    & Edge-aware TV on $q$
+    & q\_sigma, joint: $10^{-3}$ \\
+$\mathcal{L}_\sigma$
+    & $(\log\sigma - \mu_\sigma)^2$, data-adaptive
+    & q\_sigma, joint: $0.1$ \\
+$\mathcal{L}_{\mathrm{cycle}}$
+    & Feature cycle consistency
+    & joint: $0.05$ \\
+$\mathcal{L}_{\mathrm{fold}}$
+    & Quadrilateral convexity penalty
+    & always (synth\,$\to$\,joint): $0.1$ \\
+$\mathcal{L}_{\mathrm{rel}}$
+    & BCE on detached $\phi$
+    & rel: $1.0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Weights with ``$a \to b$'' notation are cosine-ramped from $a$ to $b$ over
+the first half of the stage.
+
+\section{Stage curriculum with explicit acceptance gates}
+
+Each stage \emph{must} pass its gate before proceeding. If a gate fails,
+diagnose with the panel in Section \ref{sec:diag} rather than continuing.
+
+\subsection{Stage 0: preflight unit tests (no training)}
+
+Run \texttt{tests/} in CI:
+\begin{enumerate}[leftmargin=1.5em]
+\item \texttt{test\_corner\_ordering}: identical $H$ from synth's
+    \texttt{\_solve\_homography\_4pt} and the head's \texttt{DLT\_solve}
+    given the same canonical $\Delta p$.
+\item \texttt{test\_dlt\_identity}: $\Delta p = 0 \Rightarrow H = I$ to $10^{-4}$.
+\item \texttt{test\_warp\_translation}: warp a checkerboard by a pure
+    translation; reprojection error $<0.1$\,px.
+\item \texttt{test\_eval\_protocol}: synthesize $(p_a, p_b)$ with known $H^*$,
+    feed $H^*$ to all 5 eval columns; \texttt{eval\_l2/v1\_compat} (new
+    inverted-H column) and the synthesized error must agree to $10^{-3}$.
+\item \texttt{test\_identity\_overfit}: $I_b = I_a$, batch size 8, run 500
+    steps of stage \texttt{h\_only}; require $\|\Delta p\|_\infty < 0.5$\,px,
+    $\bar q > 0.7$, headline L2 $< 0.5$\,px.
+\end{enumerate}
+
+\textbf{Exit gate.} All 5 tests pass deterministically with seed 0.
+
+\subsection{Stage 1 (synth): supervised geometric bootstrap}
+
+\textbf{Active modules}: feature trunk (frozen ImageNet init for the first
+1k iters, then unfrozen), homography pyramid (all three levels), heads
+frozen.
+
+\textbf{Losses}: $\mathcal{L}_{\mathrm{sup}}^{\mathrm{corner}}$ at $\rho_t$
+of each level (not just final), $\mathcal{L}_{\mathrm{sup}}^{\mathrm{H}}$,
+$\mathcal{L}_{\mathrm{fold}}$.
+
+\textbf{Curriculum}: $\rho_s = 16 \to 32 \to 48$ over 3000 iter chunks.
+
+\textbf{Exit gate}: on a 1024-pair synth val set,
+\[
+\mathrm{median}\,\|\Delta p\,\text{(pred)} - \Delta p^*\|_\infty < 1.0\ \text{px},
+\quad
+\bar e_{\mathrm{corner}} < 1.5\ \text{px}.
+\]
+Save checkpoint \texttt{cdpc\_synth\_done.pth}.
+
+\subsection{Stage 2 (h\_only): unsupervised geometric refinement}
+
+\textbf{Active modules}: trunk + homography pyramid. $q\equiv 1$,
+$\sigma\equiv\sigma_{\mathrm{fixed}}$, no EM, no reliability.
+
+\textbf{Losses}: $\mathcal{L}_{\mathrm{photo}}^{I}$ (image-space) +
+$\mathcal{L}_{\mathrm{tri}}$ (feature) + $\mathcal{L}_{\mathrm{fold}}$.
+
+\textbf{Curriculum}: frame gap $\le 2 \to 4 \to 8$ over 6k iter chunks.
+
+\textbf{Exit gate}: on the 5-scene Test set,
+\texttt{eval\_l2/v1\_compat} (the corrected v1-equivalent metric) overall
+$< 0.6$\,px. This is the planv2 v1-reproduction milestone.
+
+\subsection{Stage 3 (q\_only): train the dominant-plane posterior alone}
+
+\textbf{Active modules}: $q$-head only. Trunk + homography pyramid +
+$\sigma$-head frozen.
+
+\textbf{Losses}: $\mathcal{L}_{\mathrm{em}}$ +
+$\mathcal{L}_{\mathrm{support}}$ + $\mathcal{L}_{\mathrm{smooth}}$.
+
+\textbf{Notes}: $\sigma$ is held at a constant
+$\sigma_{\mathrm{fixed}} = \mathrm{med}(r)$ of the first 200 batches.
+
+\textbf{Exit gate}: $0.3 < \bar q < 0.85$ stable for 2000 iters; the
+\texttt{eval\_l2/v1\_compat} from Stage 2 does \emph{not} degrade
+(since $H$ is frozen, this is just a sanity check that the eval pipeline
+is consistent).
+
+\subsection{Stage 4 (sigma\_only): train uncertainty alone}
+
+\textbf{Active modules}: $\sigma$-head only. All else frozen.
+
+\textbf{Losses}: $\mathcal{L}_{\mathrm{align}}^{\mathrm{het}}$ (on the
+$q$-selected set $\mathcal{S}$ from Stage 3) + $\mathcal{L}_\sigma$.
+
+\textbf{Exit gate}: $\sigma$ histogram has 5\%--95\% range
+$[0.3\,\mathrm{med}(r), 3\,\mathrm{med}(r)]$. NLL of the
+Laplacian residual model decreases by $\ge 30\%$ vs. constant-$\sigma$
+baseline.
+
+\subsection{Stage 5 (joint): joint fine-tune with detached weights}
+
+\textbf{Active}: everything. $q$ enters losses as
+$q^\dagger = \mathrm{sg}(\max(q, 0.25))$. $\sigma$ enters
+$\mathcal{L}_{\mathrm{align}}^{\mathrm{soft}}$ as $\mathrm{sg}(\sigma)$ for
+the first 5k iters, then released.
+
+\textbf{Losses}: all of Stage 2 + Stage 3 + Stage 4 +
+$\mathcal{L}_{\mathrm{cycle}}$.
+
+\textbf{Optimizer}: H-related LR $\times 0.1$, posterior/uncertainty LR
+unchanged.
+
+\textbf{Exit gate}: \texttt{eval\_l2/v1\_compat} overall $< 0.35$\,px and
+no per-scene number exceeds 1.5x the v1 reference for that scene. If gate
+fails, roll back to Stage 2 checkpoint.
+
+\subsection{Stage 6 (rel): reliability calibration only}
+
+\textbf{Active}: reliability head only. Everything else frozen.
+
+\textbf{Losses}: $\mathcal{L}_{\mathrm{rel}}$ on detached $\phi$, with
+labels from (a) intra-batch shuffles, (b) patch reshuffles, and \emph{add}
+(c) synthetic large-perturbation pairs ($\rho_s > 80$) which are guaranteed
+out-of-distribution.
+
+\textbf{Exit gate}: ECE $< 0.05$, AUROC $\ge 0.85$ on the test pairs at
+$\tau = 3$\,px. Apply temperature scaling on a 64-pair val split if ECE
+$> 0.05$.
+
+\section{Differential learning rates and schedules}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Group & Modules & LR (synth/h\_only/q/$\sigma$/joint/rel) \\
+\midrule
+trunk & feature trunk
+      & $5\!\times\!10^{-5}$ / $2\!\times\!10^{-5}$ / 0 / 0 / $2\!\times\!10^{-6}$ / 0 \\
+H pyramid & three level regressors
+      & $2\!\times\!10^{-4}$ / $2\!\times\!10^{-4}$ / 0 / 0 / $2\!\times\!10^{-5}$ / 0 \\
+q-head & q-head
+      & 0 / 0 / $1\!\times\!10^{-4}$ / 0 / $1\!\times\!10^{-4}$ / 0 \\
+$\sigma$-head & $\sigma$-head
+      & 0 / 0 / 0 / $1\!\times\!10^{-4}$ / $1\!\times\!10^{-4}$ / 0 \\
+rel-head & reliability head
+      & 0 / 0 / 0 / 0 / 0 / $1\!\times\!10^{-4}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Schedule.} \texttt{CosineAnnealingLR} with $T_{\max}$ = stage epochs.
+\textbf{Optimizer.} AdamW, weight decay $10^{-4}$ on conv/Linear weights only
+(exclude BN/bias). Gradient clipping global-norm 1.0. Use AMP \emph{after}
+Stage 0 unit tests pass; keep AMP off during Stage 1 (synth) for the first
+3k iters to make NaN debugging deterministic.
+
+\section{Diagnostics panel}
+\label{sec:diag}
+
+Every run logs to TensorBoard:
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{loss/\{sup\_corner, sup\_H, photo\_I, align\_soft, align\_het,
+    tri, em, support, smooth, sigma, cycle, fold, rel\}}
+\item \texttt{eval\_l2/\{direct, inverse, symmetric, identity,
+    min\_direct, v1\_compat\}/\{RE, LT, LL, SF, LF, overall\}}
+\item \texttt{H/\{offset\_inf\_px, offset\_mean\_px, kappa\_log, fold\_count\}}
+    per pyramid level
+\item \texttt{q/\{mean, var, area\_above\_tau, A\_v\}}
+\item \texttt{sigma/\{mean, median, p5, p95\}}
+\item \texttt{residual/\{mean, median, p95\}} per pyramid level
+\item \texttt{grad\_norm/\{trunk, H\_pyr\_lvl\{0,1,2\}, q, sigma, rel\}}
+\item \texttt{calibration/\{auroc, auprc, ece\}} every 4k iters in Stage 6
+\end{itemize}
+
+\textbf{Healthy training fingerprint.}
+\[
+\|\Delta p^{(2)}\|_\infty \in [1, \rho_2],
+\quad
+\kappa(H_3) < 10^3,
+\quad
+0.4 < \bar q < 0.85,
+\quad
+\mathrm{med}(\sigma) \in [0.5, 2]\cdot \mathrm{med}(r).
+\]
+\textbf{Failure fingerprints to alert on.}
+\begin{itemize}[leftmargin=1.5em]
+\item $\bar q$ falls below 0.1 within 200 iters of EM turning on: posterior
+    collapse. Increase $\mathcal{L}_{\mathrm{support}}$.
+\item $\mathrm{med}(\sigma) \to \sigma_{\min}$: Kendall--Gal trap. Increase
+    $\sigma_{\min}$ or weight on $\mathcal{L}_\sigma$.
+\item $\kappa(H_3) > 10^4$ for any sample: bad DLT solve. Raise
+    $\mathcal{L}_{\mathrm{fold}}$ weight; check ill-conditioning rate in
+    \texttt{cond\_valid}.
+\item $\|\Delta p^{(t)}\|_\infty$ pinned at $\rho_t$: head saturated, basin
+    is too small. Raise $\rho_t$ or add a coarser pyramid level.
+\end{itemize}
+
+\section{TIP paper structure with this redesign}
+
+\subsection{Headline claim}
+
+\emph{We present Calibrated Dominant-Plane Consensus, a single network that
+jointly estimates a homography, its spatial support, its aleatoric
+uncertainty, and a pair-level reliability score, with a trustworthiness
+evaluation protocol. CDPC achieves sub-0.3-pixel L2 reprojection on CA-Homography
+while exposing failure detection ROC of $\ge 0.85$ and an ECE below 0.05.}
+
+The wording is deliberately conservative on the headline number; the
+literal target is $<0.25$\,px but the gate in Stage 5 is $<0.35$\,px, so the
+final ablation should target $<0.3$\,px and report whatever Stage 5
+delivers. Tightening to $<0.25$ would be a follow-up.
+
+\subsection{Necessary ablations}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item Single-stage v2 baseline (current code post-corner-fix) vs.\ full
+    plan-v3 staged. Establishes that the curriculum helps.
+\item v3 -- coarse-to-fine + ($q$ only, $\sigma$ only, $q$+$\sigma$, $q$+$\sigma$+rel).
+    Establishes that each probabilistic component contributes.
+\item v3 -- soft-only L\_align vs.\ soft+het split. Establishes the
+    necessity of the decoupling fix.
+\item v3 image-space photometric vs.\ feature-only. Establishes
+    $\mathcal{L}_{\mathrm{photo}}^I$ is not redundant.
+\item Reliability: detached vs.\ end-to-end gradient. Establishes
+    the detach is necessary (already in plan-v2; re-verify under v3).
+\end{enumerate}
+
+\subsection{Trustworthiness section}
+
+This is the unique selling point. Report on the same checkpoint:
+
+\begin{itemize}[leftmargin=1.5em]
+\item Failure-detection AUROC, AUPRC for $\tau\in\{1,3,5\}$\,px.
+\item Reliability calibration: ECE before and after temperature scaling,
+    NLL.
+\item Risk-coverage curve from $s_{ab}$: expected reprojection error vs.\
+    coverage. Hit the table with the curve at coverages
+    $\{0.5, 0.7, 0.9, 1.0\}$.
+\item Per-scene rejection statistics: which scenes lose the most pairs at
+    high coverage thresholds?
+\item Qualitative panels: overlay $q$, residual, and reliability for a
+    sampled pair from each scene; show a failure case where $s_{ab}$ is
+    low and a near-failure where $s_{ab}$ is borderline.
+\end{itemize}
+
+\subsection{Comparison set}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item Classical: SIFT + RANSAC, ORB + MAGSAC.
+\item Deep supervised: DeTone-style HomographyNet on the same train set.
+\item Deep unsupervised: v1 (Oneline-FastDLT).
+\item v2 (current code) at best checkpoint with corner-order fix only.
+\item v3 (plan in this document).
+\end{enumerate}
+
+\section{Concrete file-level work plan}
+
+\subsection{Files to add}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{model/feature\_pyramid.py}: ResNet trunk exposing 1/4, 1/8, 1/16.
+\item \texttt{model/homography\_pyramid.py}: three-level coarse-to-fine
+    regressor with attentive pooling and bounded residual DLT updates.
+\item \texttt{losses/align\_v3.py}: \texttt{align\_soft\_loss},
+    \texttt{align\_het\_loss}, sharing residual computation.
+\item \texttt{losses/photo\_image.py}: image-space photometric Charbonnier
+    on full-image warp $\to$ patch crop.
+\item \texttt{losses/sigma\_prior.py}: data-adaptive log-residual prior.
+\item \texttt{tests/test\_corner\_ordering.py}, \texttt{test\_dlt\_identity.py},
+    \texttt{test\_warp\_translation.py}, \texttt{test\_eval\_protocol.py},
+    \texttt{test\_identity\_overfit.py}.
+\item \texttt{data/synth\_pairs\_v3.py}: composition-of-affines synthesizer
+    with optional projective perturbation (B6).
+\end{itemize}
+
+\subsection{Files to modify}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{data/synth\_pairs.py}: fix corner ordering to TL,BL,BR,TR
+    (B1). Until \texttt{synth\_pairs\_v3.py} lands, this is the
+    blocker fix.
+\item \texttt{losses/fold.py}: change \texttt{src} to TL,BL,BR,TR (B1).
+\item \texttt{train.py}: add \texttt{eval\_l2/v1\_compat} column that
+    inverts $H$ (B2); use \texttt{align\_soft\_loss} +
+    \texttt{align\_het\_loss}; gate $\mathcal{L}_{\mathrm{em}}$ via the new
+    self-paced gate; switch to \texttt{CosineAnnealingLR};
+    add per-pyramid-level diagnostics.
+\item \texttt{eval.py}: same \texttt{v1\_compat} addition; report all
+    columns.
+\item \texttt{configs/default.py}: bump default \texttt{sigma\_min} to 0.5;
+    add \texttt{alpha\_support = 0.5}; add per-level $\rho_t$ and
+    \texttt{n\_pyr\_levels = 3}.
+\item \texttt{model/cdpc\_net.py}: drop \texttt{joint\_backbone}; wire
+    \texttt{feature\_pyramid} + \texttt{homography\_pyramid}; remove the
+    \texttt{cycle\_mean=10.0} magic value (B7).
+\item \texttt{model/heads.py}: heads to consume pyramid-final
+    features (single 1/4 scale), no upsample of $c8$.
+\end{itemize}
+
+\subsection{Files to delete}
+
+\begin{itemize}[leftmargin=1.5em]
+\item \texttt{model/backbone.py} usage of separate joint trunk after
+    \texttt{feature\_pyramid.py} subsumes it (keep file for v1 ablation
+    reproduction).
+\item Magic-number paths in \texttt{cdpc\_net.py:303--304} for cycle\_mean.
+\end{itemize}
+
+\section{Estimated effort and milestones}
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.22\linewidth}
+                 >{\raggedright\arraybackslash}p{0.40\linewidth}
+                 c}
+\toprule
+Milestone & Scope & Time \\
+\midrule
+M1: Bugfix-only & B1 + B2 + B3 + B5 in current architecture; retrain
+                  staged & 1--2 days dev + 4 days compute \\
+M2: Probabilistic redesign &
+                  Section \ref{sec:prob} losses, no architectural change;
+                  retrain stages 3--5 from M1's stage-2 checkpoint &
+                  2 days dev + 3 days compute \\
+M3: Architectural redesign &
+                  Coarse-to-fine H pyramid, drop joint trunk; retrain
+                  stages 1--5 from scratch &
+                  4 days dev + 1 week compute \\
+M4: Trustworthiness eval &
+                  Reliability stage + calibration + ablations &
+                  2 days dev + 2 days compute \\
+M5: TIP submission package &
+                  Tables, figures, qualitative panels, supplementary &
+                  1 week writing \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Decision point after M1.} If post-bugfix L2\_v1\_compat is already
+$< 0.4$\,px, the architectural redesign (M3) becomes a paper ablation
+rather than a correctness fix. Decide M3 scope after M1 completes.
+
+\section{Information still needed from the user}
+
+\begin{enumerate}[leftmargin=1.5em]
+\item The exact per-scene \texttt{eval\_l2/v1} and
+    \texttt{eval\_l2/inverse} numbers at the best checkpoint, so I can
+    estimate how much of the gap is the metric vs. the model.
+\item TensorBoard traces of \texttt{H/offset\_inf\_px} and \texttt{q/mean}
+    at the end of each stage, to confirm whether Stage 1 (synth) was
+    visibly failing the way the corner-order bug predicts.
+\item The exact iteration counts you ran for each stage (synth, h\_only,
+    \ldots) and which checkpoints you initialized the next stage from.
+\item Confirmation that the test-pair label set is \texttt{Coordinate-v2}
+    (the new labels), not the original \texttt{Coordinate}. The
+    \texttt{TestDataset} candidate logic checks both, but the actual
+    files on disk decide which one is used.
+\item Whether you intend to compare against the v1 published number on
+    CA-Homography or to retrain v1 on your dataset split.
+\end{enumerate}
+
+\section{Summary}
+
+\textbf{Why your current run shows high L2.} Three reasons stacked:
+(a)~the supervised stage trains the H regressor against label-permuted
+corner offsets and produces a non-physical $H$; (b)~the headline column
+\texttt{eval\_l2/v1} does not implement v1's actual evaluation protocol
+and over-reports error; (c)~the $q$--$\sigma$ block has a coupled
+shortcut that lets the posterior suppress hard pixels and the uncertainty
+collapse, neither of which is checked in the current training loop.
+
+\textbf{What v3 changes.} Fixes (a)--(c) directly (Sections 2.1--2.4),
+replaces the H regressor with a coarse-to-fine pyramid (Section 3.3),
+re-derives the probabilistic block with decoupled $q$ and $\sigma$
+gradients (Section \ref{sec:prob}), and adds explicit per-stage gates
+so a failing stage is detected before it contaminates downstream
+training.
+
+\textbf{Acceptance.} The plan targets \texttt{eval\_l2/v1\_compat}
+$< 0.35$\,px at the end of Stage 5 with a clean failure-detection ROC
+$\ge 0.85$ at $\tau = 3$\,px. Either is sufficient on its own for a
+TIP-quality story; both together is the paper.
+
+\end{document}

@@ -8,6 +8,11 @@ the same sign and stay bounded away from zero.
 We normalize the signed cross product by the source-quad area so the threshold
 `eps_frac` is a fraction of the original quad area (0.1 = penalize when any
 corner's signed area drops below 10% of the source area).
+
+Corner order is the canonical TL, BL, BR, TR convention used by
+cdpc_net.py:h4p_patch and DLT_solve. A previous version of this file used
+TL, TR, BR, BL, which silently mis-attributed per-corner penalties because
+the offset vector emitted by the head is in TL, BL, BR, TR order.
 """
 
 import torch
@@ -21,7 +26,7 @@ def fold_loss(
 ) -> torch.Tensor:
     """
     Args:
-        offset: (B, 8) corner offsets in pixel coords, ordered TL, TR, BR, BL
+        offset: (B, 8) corner offsets in pixel coords, ordered TL, BL, BR, TR
                 as [x0,y0, x1,y1, x2,y2, x3,y3] -- same as DLT_solve.
         patch_h, patch_w: source patch dimensions in pixels.
         eps_frac: minimum signed area at each corner, as a fraction of the
@@ -32,10 +37,10 @@ def fold_loss(
     device, dtype = offset.device, offset.dtype
 
     src = torch.tensor(
-        [[0.0, 0.0],
-         [patch_w, 0.0],
+        [[0.0,     0.0],
+         [0.0,     patch_h],
          [patch_w, patch_h],
-         [0.0, patch_h]],
+         [patch_w, 0.0]],
         device=device, dtype=dtype,
     ).view(1, 4, 2).expand(B, -1, -1)
     dst = src + offset.view(B, 4, 2)
