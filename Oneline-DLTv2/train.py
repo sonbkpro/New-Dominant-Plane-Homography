@@ -668,6 +668,10 @@ def _parse_args(cfg: Config):
     p.add_argument("--init_ckpt", type=str, default=cfg.init_ckpt)
     p.add_argument("--max_frame_gap", type=int, default=0,
                    help="Stage 3 curriculum: max abs(frame_b - frame_a). 0 = no filter.")
+    p.add_argument("--homography_rho", type=float, default=cfg.homography_rho,
+                   help="Bound for H head: |corner_offset| <= rho. Must be >= synth_rho_max.")
+    p.add_argument("--synth_rho_max", type=int, default=cfg.synth_rho_max,
+                   help="Per-corner perturbation range for the synth dataset, in px.")
     args = p.parse_args()
 
     # Push CLI args back into cfg so downstream code reads a single source.
@@ -686,6 +690,14 @@ def _parse_args(cfg: Config):
     cfg.model_save_dir = args.model_save_dir
     cfg.stage = args.stage
     cfg.init_ckpt = args.init_ckpt
+    cfg.homography_rho = args.homography_rho
+    cfg.synth_rho_max = args.synth_rho_max
+    if cfg.homography_rho < cfg.synth_rho_max:
+        raise ValueError(
+            f"homography_rho ({cfg.homography_rho}) must be >= synth_rho_max "
+            f"({cfg.synth_rho_max}); otherwise the synth target is unreachable "
+            f"and L_sup_corner plateaus while offset_inf_px saturates at rho."
+        )
     return args
 
 

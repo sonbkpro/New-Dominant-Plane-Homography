@@ -21,10 +21,12 @@ class Config:
     corr_radius: int = 4
     corr_out_channels: int = 32
 
-    # Bounded H output via rho_max * tanh. With rho_max=16 px the network can
-    # never produce a corner offset whose magnitude exceeds this, which kills
-    # the runaway-H failure mode and lets us train with a higher LR.
-    homography_rho: float = 16.0
+    # Bounded H output via rho_max * tanh. The network can never produce a
+    # corner offset whose magnitude exceeds this, which kills the runaway-H
+    # failure mode and lets us train with a higher LR. MUST be >= synth_rho_max
+    # below, else the synth-stage supervised target is unreachable and L_sup
+    # plateaus while `H/offset_inf_px` saturates at this value.
+    homography_rho: float = 32.0
 
     # Posterior bias init so q ~= post_init_prob at iter 0.
     post_init_prob: float = 0.7
