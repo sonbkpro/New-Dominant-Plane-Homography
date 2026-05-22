@@ -717,6 +717,17 @@ def _parse_args(cfg: Config):
     p.add_argument("--model_save_freq", type=int, default=cfg.model_save_freq,
                    help="Iters between checkpoint saves. Lower it to keep more "
                         "intermediate checkpoints if disk space allows.")
+    p.add_argument("--lambda_triplet", type=float, default=cfg.lambda_triplet,
+                   help="Weight on L_triplet. Lower for small-motion h_only "
+                        "where triplet stays pinned at the margin.")
+    p.add_argument("--lambda_photo", type=float, default=cfg.lambda_photo,
+                   help="Weight on L_photo (Charbonnier on feature residual). "
+                        "Raise for h_only so the alignment signal isn't drowned "
+                        "by a stuck triplet.")
+    p.add_argument("--triplet_margin", type=float, default=cfg.triplet_margin,
+                   help="Triplet hinge margin. Default 1.0 is large vs feature "
+                        "residual scale (~0.05); lower to 0.05-0.1 if L_trip "
+                        "sticks near margin for many iters.")
     args = p.parse_args()
 
     # Push CLI args back into cfg so downstream code reads a single source.
@@ -738,6 +749,9 @@ def _parse_args(cfg: Config):
     cfg.homography_rho = args.homography_rho
     cfg.synth_rho_max = args.synth_rho_max
     cfg.model_save_freq = args.model_save_freq
+    cfg.lambda_triplet = args.lambda_triplet
+    cfg.lambda_photo = args.lambda_photo
+    cfg.triplet_margin = args.triplet_margin
     if cfg.homography_rho < cfg.synth_rho_max:
         raise ValueError(
             f"homography_rho ({cfg.homography_rho}) must be >= synth_rho_max "
