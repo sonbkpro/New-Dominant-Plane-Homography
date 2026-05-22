@@ -146,8 +146,12 @@ def _freeze_for_stage(net, stage: str):
     elif stage == "h_only":
         active = {"backbone", "joint_backbone", "correlation", "homography_head"}
     elif stage == "q_sigma":
-        active = {"backbone", "joint_backbone", "correlation", "homography_head",
-                  "posterior_head", "uncertainty_head"}
+        # planv2 Phase 5: train posterior and uncertainty WITHOUT corrupting H.
+        # The H trunk (joint_backbone + correlation + homography_head) is
+        # frozen so q/sigma learn against the converged alignment target
+        # from h_only. Without this, the optimizer drifts H toward identity
+        # on small-motion pairs while q/sigma chase the moving residual.
+        active = {"backbone", "posterior_head", "uncertainty_head"}
     elif stage == "joint":
         active = {"backbone", "joint_backbone", "correlation", "homography_head",
                   "posterior_head", "uncertainty_head"}
