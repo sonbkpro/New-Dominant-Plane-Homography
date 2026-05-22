@@ -147,11 +147,14 @@ def _freeze_for_stage(net, stage: str):
         active = {"backbone", "joint_backbone", "correlation", "homography_head"}
     elif stage == "q_sigma":
         # planv2 Phase 5: train posterior and uncertainty WITHOUT corrupting H.
-        # The H trunk (joint_backbone + correlation + homography_head) is
-        # frozen so q/sigma learn against the converged alignment target
-        # from h_only. Without this, the optimizer drifts H toward identity
-        # on small-motion pairs while q/sigma chase the moving residual.
-        active = {"backbone", "posterior_head", "uncertainty_head"}
+        # We freeze EVERY input on the H computation path -- joint_backbone +
+        # correlation + homography_head AND the per-image backbone, because
+        # the per-image backbone feeds correlation's inputs. Leaving the
+        # per-image backbone trainable lets H drift indirectly (frozen head,
+        # but a moving input), which produced a ~5% v1 regression on gap=2.
+        # The posterior and uncertainty heads alone (~140k params) have
+        # enough capacity to learn q and sigma from the converged residuals.
+        active = {"posterior_head", "uncertainty_head"}
     elif stage == "joint":
         active = {"backbone", "joint_backbone", "correlation", "homography_head",
                   "posterior_head", "uncertainty_head"}
