@@ -222,14 +222,31 @@ def _save_checkpoint(net, save_dir: str, filename: str, **extra) -> str:
 
 
 def _try_load_init(net, ckpt_path: str):
-    """Soft-load a checkpoint (strict=False). Useful for staged resumption
-    where the architecture is identical but some modules are frozen."""
+    """Soft-load a checkpoint (strict=False) when one is explicitly requested.
+
+    Resolves the path against (in order): as-given (cwd-relative or absolute),
+    then relative to the repo root. If a path was requested but neither
+    resolution exists, RAISES rather than falling back to random init --
+    silently training from scratch when staged init was intended would
+    waste hours of compute. Pass --init_ckpt '' (default) to skip cleanly.
+    """
     if not ckpt_path:
         return
-    if not os.path.isfile(ckpt_path):
-        print(f"[init_ckpt] not found, skipping: {ckpt_path}", flush=True)
-        return
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    candidates = [ckpt_path]
+    if not os.path.isabs(ckpt_path):
+        candidates.append(os.path.normpath(os.path.join(_REPO_ROOT, ckpt_path)))
+    resolved = next((c for c in candidates if os.path.isfile(c)), None)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"--init_ckpt was requested but the file was not found.\n"
+            f"  Looked at: {candidates}\n"
+            f"  CWD:       {os.getcwd()}\n"
+            f"  Repo root: {_REPO_ROOT}\n"
+            f"  Tip: pass an absolute path, or a path relative to the repo "
+            f"root (e.g. 'train_log_v2/real_models/cdpc_synth_iter_*.pth'), "
+            f"NOT relative to the Oneline-DLTv2/ directory."
+        )
+    ckpt = torch.load(resolved, map_location="cpu", weights_only=False)
     sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
     cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in sd.items()}
     missing, unexpected = net.load_state_dict(cleaned, strict=False)
@@ -237,7 +254,7 @@ def _try_load_init(net, ckpt_path: str):
         print(f"[init_ckpt] missing  ({len(missing)}): {missing[:6]}...", flush=True)
     if unexpected:
         print(f"[init_ckpt] unexpected ({len(unexpected)}): {unexpected[:6]}...", flush=True)
-    print(f"[init_ckpt] loaded {ckpt_path}", flush=True)
+    print(f"[init_ckpt] loaded {resolved}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +350,9 @@ def train(args, cfg: Config):
         sigma_min=cfg.sigma_min,
         use_normalized_dlt=cfg.use_normalized_dlt,
     ).to(device)
-    _try_load_init(net, _abs(cfg.init_ckpt) if cfg.init_ckpt else "")
+    # Pass init_ckpt through unmodified; _try_load_init does its own dual
+    # resolution (cwd-relative, then repo-relative) and raises on miss.
+    _try_load_init(net, cfg.init_ckpt)
     active = _freeze_for_stage(net, stage)
     print(f"[stage={stage}] active modules: {sorted(active)}", flush=True)
     n_train = sum(p.numel() for p in net.parameters() if p.requires_grad) / 1e6
