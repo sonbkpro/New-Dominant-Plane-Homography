@@ -20,28 +20,28 @@ class Config:
     bb_eighth_channels: int = 128
     corr_radius: int = 4
     corr_out_channels: int = 32
-    homography_rho: float = 16.0       # was 32; smaller rho + larger FC init
-                                        # together give initial offsets in the
-                                        # 5-10 px range, enough for the triplet
-                                        # to drive H out of the identity basin.
+
+    # Bounded H output via rho_max * tanh. With rho_max=16 px the network can
+    # never produce a corner offset whose magnitude exceeds this, which kills
+    # the runaway-H failure mode and lets us train with a higher LR.
+    homography_rho: float = 16.0
+
+    # Posterior bias init so q ~= post_init_prob at iter 0.
     post_init_prob: float = 0.7
-    log_sigma_min: float = -0.3    # sigma >= 0.74; tight enough to block the
-                                    # Kendall-Gal shrink-sigma shortcut without
-                                    # killing all uncertainty adaptation. Was
-                                    # -5.0 (sigma_min ~0.007) which permitted
-                                    # arbitrary alignment-loss free lunch.
-    log_sigma_max: float = 5.0
+
+    # Uncertainty parameterized as sigma = sigma_min + softplus(u). u=0 gives
+    # sigma = sigma_min + log(2) ~= 0.74 at init.
+    sigma_min: float = 0.05
 
     # ---- EM posterior
     em_prior_pi: float = 0.5
     em_r_max: float = 4.0
-    em_warmup_iters: int = 5000     # disable L_em during this many iters
+    em_warmup_iters: int = 5000
+    # Once we leave warmup, L_em fires only if the current batch's residual
+    # median is below this threshold. Stops EM from following bad-H residuals.
+    em_residual_gate: float = 1.5
 
     # ---- Alignment ramp
-    # L_align is disabled (lambda=0) for `align_warmup_iters`, then linearly
-    # ramped to `lambda_align` over `align_ramp_iters`. Reason: at init H is
-    # near identity so triplet has weak gradient; if L_align fires immediately
-    # the network exploits sigma-shrinking instead of learning H.
     align_warmup_iters: int = 3000
     align_ramp_iters: int = 2000
     em_ramp_iters: int = 2000
@@ -50,58 +50,66 @@ class Config:
     rel_shuffle_frac: float = 0.5
     rel_reshuffle_frac: float = 0.25
     rel_hard_neg_percentile: float = 0.85
-    rel_warmup_iters: int = 7000    # disable L_rel during this many iters
+    rel_warmup_iters: int = 7000
 
     # ---- Cycle loss
     cycle_cond_max: float = 1.0e4
 
+    # ---- q-dagger (Stage 5 joint fine-tune)
+    q_min_floor: float = 0.25     # q_dagger = sg(max(q, q_min_floor))
+
     # ---- Loss weights
     lambda_triplet: float = 1.0
     lambda_align: float = 1.0
-    lambda_em: float = 0.1             # was 0.5; EM raw values 3-5 contributed
-                                        # ~2.5 to L_total at warmup end, causing
-                                        # an optimizer shock that distorted H.
-    lambda_support: float = 0.1        # was 0.01; needs to actually bite to
-                                        # prevent q-collapse below alpha.
+    lambda_em: float = 0.1
+    lambda_support: float = 0.1
     lambda_smooth: float = 1.0e-3
     lambda_rel: float = 0.1
-    lambda_cycle: float = 0.0          # off by default: identity is the unique
-                                        # global minimizer of the analytic cycle,
-                                        # so this loss actively pulls H toward
-                                        # identity during early training. Turn
-                                        # on (e.g. 0.01) only for the ablation
-                                        # row in the paper.
-    lambda_sigma_reg: float = 0.1      # was 0.01; observed sigma drifting from
-                                        # 1.0 to 0.55 during align ramp, with
-                                        # triplet climbing toward the margin
-                                        # in lockstep. 10x stronger nudge keeps
-                                        # sigma near 1.0; combined with the
-                                        # tightened log_sigma_min clamp this
-                                        # closes the sigma-shortcut.
-    alpha_support: float = 0.25        # was 0.10; observed q_bar collapsing
-                                        # to 0.04 during align ramp, way below
-                                        # the floor.
-    triplet_use_q_weighting: bool = False  # plan-literal triplet had q weight,
-                                        # but that creates a degenerate loop:
-                                        # q collapse -> tiny triplet grad ->
-                                        # H stops learning -> worse q. Uniform
-                                        # weighting decouples H learning from q.
+    lambda_cycle: float = 0.0
+    lambda_sigma_reg: float = 0.1
+    lambda_fold: float = 0.1          # NEW: fold-over penalty on quad
+    lambda_photo: float = 0.25        # NEW: photometric (Stage 3) anchor
+    lambda_sup_corner: float = 1.0    # NEW: supervised corner L1 (Stage 2)
+
+    alpha_support: float = 0.25
+    triplet_use_q_weighting: bool = False
     smoothness_gamma: float = 10.0
     triplet_margin: float = 1.0
 
-    # ---- Optimizer
-    lr: float = 1.0e-4
+    # ---- Optimizer (differential LR per parameter group)
+    lr: float = 1.0e-4               # default LR for all groups when --stage full
+    lr_h: float = 2.0e-4             # H trunk + head LR for staged runs
+    lr_backbone: float = 2.0e-5      # per-image backbone (slower)
+    lr_heads: float = 1.0e-4         # q, sigma, reliability heads
     weight_decay: float = 1.0e-4
-    lr_gamma: float = 0.8           # exponential decay per epoch
+    lr_gamma: float = 0.8
     batch_size: int = 16
     max_epoch: int = 30
     grad_clip: float = 1.0
+
+    # ---- Multi-stage training
+    # Stages (planv2):
+    #   "synth"  : synthetic supervised H bootstrap. joint_backbone+H head only.
+    #   "h_only" : real-pair H-only. + per-image backbone. q/sigma/rel frozen.
+    #   "q_sigma": adds posterior + uncertainty. rel frozen.
+    #   "joint"  : joint fine-tune with q_dagger weighting. rel frozen.
+    #   "rel"    : detached reliability calibrator only.
+    #   "full"   : original end-to-end behavior (back-compat / ablation).
+    stage: str = "full"
+    init_ckpt: str = ""              # checkpoint to resume from (any stage)
+
+    # ---- Synthetic-H (Stage 2)
+    synth_rho_max: int = 32           # max per-corner perturbation (px)
+    synth_iters_per_epoch: int = 4000 # iter cap when --stage synth
+
+    # ---- DLT
+    use_normalized_dlt: bool = True   # Hartley-normalized DLT
 
     # ---- Logging
     score_print_freq: int = 200
     viz_freq: int = 500
     model_save_freq: int = 4000
-    eval_every: int = 2000          # run eval-L2 every N iterations
+    eval_every: int = 2000
 
     # ---- AMP
     use_amp: bool = True
@@ -109,6 +117,11 @@ class Config:
     # ---- Paths (relative to repo root unless absolute)
     train_list: str = "Data/Train_List.txt"
     train_root: str = "Data/Train"
-    test_root: str = "."             # test_dataset.py joins this with 'Data/...'
+    test_root: str = "."
     log_dir: str = "train_log_v2/logs"
     model_save_dir: str = "train_log_v2/real_models"
+
+    # ---- Legacy fields kept for back-compat with older checkpoints/configs.
+    # New code reads sigma_min instead; these are no-ops in the new pipeline.
+    log_sigma_min: float = -3.0
+    log_sigma_max: float = 5.0

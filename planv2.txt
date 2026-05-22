@@ -1,0 +1,515 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\title{Plan v2: Stabilizing Oneline-DLTv2 for Dominant-Plane Homography and TIP-Quality Evaluation}
+\author{Code/design review of \texttt{New-Dominant-Plane-Homography/Oneline-DLTv2}}
+\date{May 22, 2026}
+
+\begin{document}
+\maketitle
+
+\section{Executive diagnosis}
+
+The current Oneline-DLTv2 design has several good research ideas---dominant-plane posterior
+$q_i$, spatial uncertainty $\sigma_i$, and pair-level reliability $s_{ab}$---but the training
+system is not yet a stable homography estimator. The most important problem is not one single
+hyperparameter. It is the combination of
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item a geometric mismatch between v1 and v2 warping,
+    \item an underpowered and overly translation-invariant homography head,
+    \item loss terms that give the posterior, uncertainty, and reliability branches shortcuts,
+    \item reliability gradients that can corrupt the homography backbone,
+    \item insufficient synthetic/geometric bootstrap before unsupervised real-pair training, and
+    \item an evaluation convention that must be verified for $H$ versus $H^{-1}$.
+\end{enumerate}
+
+I will use $SA$ to mean the reported average alignment/reprojection error. If your $SA$ metric
+means something else, replace the metric name below; the design conclusions still apply.
+
+\section{Observed code-level failure points}
+
+\subsection{P0: v2 removed v1's full-image sampling context}
+
+In v1, the model predicts a homography from patch corner coordinates, warps the \emph{full}
+source image, and then samples the destination patch. In equations, v1 effectively optimizes
+\begin{equation}
+    \widehat{I}_b(\Omega_p)
+    = \left[ W\!\left(I_a^{\mathrm{full}}, H\right) \right]_{\Omega_p},
+\end{equation}
+where $\Omega_p$ is the output crop region.
+
+In v2, \texttt{TrainPairDataset} returns only
+\begin{equation}
+    I_a^p = I_a[y:y+h, x:x+w], \qquad I_b^p = I_b[y:y+h, x:x+w],
+\end{equation}
+and \texttt{CDPCNet.forward()} warps only $F_a^p$:
+\begin{equation}
+    \widehat{F}_b^p = W\!\left(F_a^p, H_{ab}^{p}\right).
+\end{equation}
+This is not equivalent. If the correct homography maps a destination pixel to a source pixel
+just outside the source crop, v2 cannot sample that pixel. The validity mask then removes those
+pixels from the loss, so the model is rewarded for small/identity-like motions. This can directly
+produce high $SA$ even when the rest of the code is numerically correct.
+
+\textbf{Fix:} restore full-image/context warping. At minimum, train with a source context crop
+\begin{equation}
+    I_a^{p+m} = I_a[y-m:y+h+m, x-m:x+w+m]
+\end{equation}
+and warp from $I_a^{p+m}$ into the destination patch $I_b^p$. Better: reproduce v1 exactly at
+first: extract full-image features, warp full-image features, then gather the patch.
+
+\subsection{P0: the homography regressor is too weak and too translation invariant}
+
+The current H path uses a 2-channel ResNet-18 truncated at \texttt{layer2} and then a global
+average pooled MLP. This has three issues:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item v1 uses a deeper ResNet-style global regressor. v2 stops at stride $1/8$.
+    \item Global average pooling removes most spatial layout. A four-corner offset
+    $\Delta p \in \mathbb{R}^8$ is a spatially ordered output; it needs absolute/relative
+    position information.
+    \item The local correlation radius $R=4$ at stride $1/8$ covers only about $\pm 32$ pixels
+    before any coarse alignment. CA-Homography pairs can have frame gaps of 1--8, so the true
+    displacement can exceed this basin.
+\end{enumerate}
+
+\textbf{Fix:} make the homography path a first-class estimator again. Use either a v1-compatible
+ResNet-34 H branch or a coarse-to-fine H branch:
+\begin{equation}
+    H^{(0)} = I, \qquad
+    H^{(t+1)} = \Delta H^{(t)} H^{(t)}, \qquad t=0,1,2,
+\end{equation}
+where each $\Delta H^{(t)}$ is obtained from a bounded corner update
+\begin{equation}
+    \Delta p^{(t)} = \rho_t \tanh\!\left(\hat{\Delta p}^{(t)}\right).
+\end{equation}
+Add coordinate channels $(x/W, y/H)$ to the H features before pooling or use flatten/attention
+pooling instead of pure GAP.
+
+\subsection{P0: q, sigma, and reliability create training shortcuts}
+
+The intended probabilistic interpretation is strong, but the implemented optimization allows
+shortcuts:
+
+\begin{equation}
+    \mathcal{L}_{\mathrm{align}}
+    = \frac{\sum_i q_i v_i\left[\rho\!\left(r_i/\sigma_i\right)+\log\sigma_i\right]}
+           {\sum_i q_i v_i}.
+\end{equation}
+
+Because the denominator normalizes by $\sum_i q_i v_i$, the model can reduce pressure on hard
+regions by choosing low $q_i$ there. The EM target also follows current residuals, so a bad early
+$H$ can teach $q_i$ to reject the very pixels needed to improve $H$.
+
+\textbf{Fix:} during H learning, use detached and floored posterior weights:
+\begin{equation}
+    q_i^{\dagger} = \operatorname{sg}\!\left(\max(q_i, q_{\min})\right),
+    \qquad q_{\min}\in[0.2,0.4],
+\end{equation}
+where $\operatorname{sg}(\cdot)$ is stop-gradient. Train $q_i$ and $\sigma_i$ in a separate phase
+or with their own losses after $H$ has a useful basin.
+
+\subsection{P0: reliability loss should not backpropagate into the homography estimator}
+
+The current reliability score $s_{ab}$ is computed from pooled statistics $\phi_{ab}$ that depend
+on $q$, residuals, $\sigma$, cycle error, and offset magnitude. The BCE reliability loss is then
+backpropagated through $s_{ab}\rightarrow \phi_{ab}\rightarrow H,q,\sigma,\text{backbones}$.
+This means invalid-pair classification can reshape the homography features and offsets instead
+of only calibrating $s_{ab}$.
+
+\textbf{Fix:} train reliability as a calibrator on detached statistics:
+\begin{equation}
+    s_{ab} = g_{\eta}\!\left(\operatorname{sg}(\phi_{ab})\right),
+    \qquad
+    \mathcal{L}_{\mathrm{rel}} = \operatorname{BCE}(s_{ab}, y_{ab}).
+\end{equation}
+This preserves $H$ training while still learning a reliable failure detector.
+
+\subsection{P1: evaluation convention must be verified}
+
+v2 reports errors using $H_{ab}$ directly and then takes a per-point minimum using the same
+$H_{ab}$ in both point orders:
+\begin{equation}
+    e_i = \min\left(\lVert H p_a^i - p_b^i\rVert_2,
+                    \lVert H p_b^i - p_a^i\rVert_2\right).
+\end{equation}
+A physically symmetric check should compare
+\begin{equation}
+    e_i^{\mathrm{sym}}
+    = \min\left(
+      \lVert H_{ab} p_a^i - p_b^i\rVert_2,
+      \lVert H_{ab}^{-1} p_b^i - p_a^i\rVert_2
+      \right),
+\end{equation}
+or should exactly match the v1 convention after confirming that v1's exported matrix was inverted
+before evaluation. A wrong convention can make $SA$ look high even when the predicted geometry is
+reasonable.
+
+\textbf{Fix:} log three validation curves: direct $H$, inverse $H^{-1}$, and symmetric transfer.
+Do this before changing the model.
+
+\subsection{P1: DLT should be normalized and bounded}
+
+The current DLT runs in fp32, which fixes AMP overflow, but the predicted offsets are unbounded.
+Large updates can make $H$ ill-conditioned and poison \texttt{grid\_sample}. Use Hartley-normalized
+DLT and bounded corner offsets:
+\begin{equation}
+    \Delta p = \rho_{\max}\tanh(\hat{\Delta p}),
+    \qquad \rho_{\max}\in\{16,32,64\}\text{ by curriculum.}
+\end{equation}
+Reject or penalize fold-over quadrilaterals:
+\begin{equation}
+    \mathcal{L}_{\mathrm{fold}} = \sum_{k=1}^{4}\max(0, \epsilon - A_k),
+\end{equation}
+where $A_k$ is the signed local triangle/cross-product area around the predicted quadrilateral.
+
+\section{Revised Plan v2}
+
+\subsection{Phase 0: preflight tests before training}
+
+Implement these tests and do not start full training until they pass:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item \textbf{DLT identity test:}
+    \begin{equation}
+        \Delta p=0 \Rightarrow H=I, \qquad
+        \max_i\lVert H p_i - p_i\rVert_2 < 10^{-4}.
+    \end{equation}
+    \item \textbf{Known translation test:} set $\Delta p_i=(t_x,t_y)$ for all corners and verify
+    that warping moves a synthetic checkerboard by $(t_x,t_y)$ under the same convention used in
+    training and evaluation.
+    \item \textbf{Identity-pair overfit:} set $I_b=I_a$ for 8--16 samples. After 200--500 updates,
+    require
+    \begin{equation}
+        \lVert \Delta p\rVert_{\infty}<0.5\text{ px}, \qquad
+        \bar{q}>0.7, \qquad SA<0.5\text{ px}.
+    \end{equation}
+    \item \textbf{Synthetic homography overfit:} generate $I_b=W(I_a,H^*)$ with known $H^*$ and
+    require corner error $<2$ px on a held-out mini-batch.
+    \item \textbf{Evaluation convention test:} for a known $H^*$, verify direct, inverse, and
+    symmetric metrics and document which one matches v1.
+\end{enumerate}
+
+\subsection{Phase 1: restore geometry-safe data loading}
+
+Replace the current patch-only training input with context-aware sampling. For a crop origin
+$(x,y)$, patch size $(w,h)$, and margin $m$, return
+\begin{equation}
+    I_a^{c}=I_a[y-m:y+h+m,\;x-m:x+w+m], \qquad
+    I_b^{p}=I_b[y:y+h,\;x:x+w].
+\end{equation}
+Let
+\begin{equation}
+    T_a^{c} =
+    \begin{bmatrix}1&0&x-m\\0&1&y-m\\0&0&1\end{bmatrix},\qquad
+    T_b^{p} =
+    \begin{bmatrix}1&0&x\\0&1&y\\0&0&1\end{bmatrix}.
+\end{equation}
+If $H_{ab}^{\mathrm{full}}$ maps full-image source coordinates to full-image destination
+coordinates, the context-to-patch homography is
+\begin{equation}
+    H_{c\rightarrow p} = (T_b^p)^{-1} H_{ab}^{\mathrm{full}} T_a^c.
+\end{equation}
+The inverse mapping used by \texttt{grid\_sample} is
+\begin{equation}
+    H_{p\rightarrow c} = H_{c\rightarrow p}^{-1}.
+\end{equation}
+
+Recommended margin schedule:
+\begin{equation}
+    m = 32 \rightarrow 64 \rightarrow 96\text{ px},
+\end{equation}
+where training starts with $m=32$ and increases after the synthetic and short-gap curricula pass.
+
+\subsection{Phase 2: rebuild the homography path}
+
+Use one of the following two options.
+
+\paragraph{Option A: conservative v1-compatible H branch.}
+Use a ResNet-34-like 2-channel H branch through \texttt{layer4}, with coordinate channels before
+the regression head. This is the fastest way to recover v1-level convergence. The H branch input is
+\begin{equation}
+    X_H = [I_a, I_b, x/W, y/H].
+\end{equation}
+The output is bounded:
+\begin{equation}
+    \Delta p = \rho_{\max}\tanh(f_\theta(X_H)).
+\end{equation}
+
+\paragraph{Option B: coarse-to-fine CDPC-H branch.}
+Build feature pyramids $F^{1/16},F^{1/8},F^{1/4}$ and predict residual corner updates:
+\begin{align}
+    H^{(0)} &= I,\\
+    \Delta p^{(t)} &= \rho_t\tanh\left(f_t\left(F_a^{(t)},F_b^{(t)},C^{(t)},H^{(t)}\right)\right),\\
+    \Delta H^{(t)} &= \operatorname{DLT}(p, p+\Delta p^{(t)}),\\
+    H^{(t+1)} &= \Delta H^{(t)} H^{(t)}.
+\end{align}
+Use $\rho_t=(64,32,16)$ from coarse to fine. This gives a larger capture basin than a single
+local correlation block.
+
+\subsection{Phase 3: supervised/synthetic bootstrap}
+
+Before unsupervised real training, synthesize known homographies from individual training images.
+Sample corner perturbations
+\begin{equation}
+    \Delta p^* \sim \mathcal{U}(-\rho_s,\rho_s)^8,
+    \qquad \rho_s\in\{8,16,32,64\}.
+\end{equation}
+Train the H branch with
+\begin{equation}
+    \mathcal{L}_{\mathrm{sup}}
+    = \operatorname{Huber}(\Delta p,\Delta p^*)
+    + \lambda_g\frac{1}{4}\sum_{k=1}^{4}
+      \left\lVert H p_k - H^* p_k \right\rVert_1
+    + \lambda_{\mathrm{fold}}\mathcal{L}_{\mathrm{fold}}.
+\end{equation}
+Acceptance criterion: validation corner error $<2$ px at $\rho_s=32$ and no NaNs in 20k iterations.
+
+\subsection{Phase 4: real-pair H-only unsupervised training}
+
+Train only the H branch and feature extractor using a v1-style robust feature/census loss. Keep
+$q=1$, freeze the posterior and uncertainty heads, and disable reliability.
+
+Use
+\begin{equation}
+    d_i^+ = \left\lVert \Psi_b(i)-W(\Psi_a,H)(i)\right\rVert_1,
+    \qquad
+    d_i^- = \left\lVert \Psi_b(i)-\Psi_a(i)\right\rVert_1,
+\end{equation}
+and
+\begin{equation}
+    \mathcal{L}_{\mathrm{tri}}^{0}
+    = \frac{1}{\sum_i v_i}\sum_i v_i\max(0, m+d_i^+-d_i^-).
+\end{equation}
+Use a robust image/census term as an auxiliary anchor:
+\begin{equation}
+    \mathcal{L}_{\mathrm{photo} }
+    = \frac{1}{\sum_i v_i}\sum_i v_i\,\rho_\epsilon
+      \left( I_b(i)-W(I_a,H)(i)\right),
+\end{equation}
+where $\rho_\epsilon(x)=\sqrt{x^2+\epsilon^2}$.
+
+Curriculum by frame gap:
+\begin{equation}
+    \text{gap}\le2 \;\rightarrow\; \text{gap}\le4 \;\rightarrow\; \text{gap}\le8.
+\end{equation}
+Acceptance criterion: eval $SA$ must decrease monotonically on the validation set before enabling
+$q$, $\sigma$, or $s$.
+
+\subsection{Phase 5: train posterior and uncertainty without corrupting H}
+
+Freeze or detach $H$ and train $q_i$ and $\sigma_i$ from residuals. Use the two-component model
+
+\begin{align}
+    p(r_i\mid z_i=1) &= \frac{1}{\sigma_i}\exp\left(-\frac{r_i}{\sigma_i}\right),\\
+    p(r_i\mid z_i=0) &= \frac{1}{r_{\max}},\\
+    \tilde{q}_i
+    &= \frac{\pi\,p(r_i\mid z_i=1)}{\pi\,p(r_i\mid z_i=1)+(1-\pi)p(r_i\mid z_i=0)}.
+\end{align}
+
+Use stop-gradient targets:
+\begin{equation}
+    \mathcal{L}_{\mathrm{em}}
+    = \frac{1}{\sum_i v_i}\sum_i v_i\,
+      \operatorname{BCE}\left(q_i,\operatorname{sg}(\tilde q_i)\right).
+\end{equation}
+
+Parameterize uncertainty without hard clamp:
+\begin{equation}
+    \sigma_i = \sigma_{\min}+\operatorname{softplus}(u_i),
+    \qquad \sigma_{\min}=0.05.
+\end{equation}
+Regularize with
+\begin{equation}
+    \mathcal{L}_{\sigma} = \frac{1}{N}\sum_i \left(\log\sigma_i-\mu_\sigma\right)^2,
+    \qquad \mu_\sigma=\operatorname{median}\{\log r_i\}.
+\end{equation}
+
+\subsection{Phase 6: joint fine-tuning with detached consensus weights}
+
+After H-only training is stable, fine-tune all alignment modules with detached posterior weights:
+\begin{equation}
+    q_i^\dagger = \operatorname{sg}\left(\max(q_i,q_{\min})\right),
+    \qquad q_{\min}=0.25.
+\end{equation}
+Use
+\begin{equation}
+    \mathcal{L}_{\mathrm{align}}^{\dagger}
+    = \frac{\sum_i q_i^\dagger v_i\left[\rho(r_i/\sigma_i)+\log\sigma_i\right]}
+           {\sum_i q_i^\dagger v_i}.
+\end{equation}
+The total fine-tuning objective is
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{\mathrm{joint}}
+    ={}& \lambda_t\mathcal{L}_{\mathrm{tri}}^{0}
+      + \lambda_p\mathcal{L}_{\mathrm{photo}}
+      + \lambda_a\mathcal{L}_{\mathrm{align}}^{\dagger}
+      + \lambda_e\mathcal{L}_{\mathrm{em}} \\
+      &+ \lambda_s\mathcal{L}_{\mathrm{support}}
+      + \lambda_v\mathcal{L}_{\mathrm{smooth}}
+      + \lambda_{\sigma}\mathcal{L}_{\sigma}
+      + \lambda_{\mathrm{fold}}\mathcal{L}_{\mathrm{fold}}.
+\end{split}
+\end{equation}
+Initial weights:
+\begin{equation}
+    \lambda_t=1,
+    \quad \lambda_p=0.25,
+    \quad \lambda_a=0.2\rightarrow1.0,
+    \quad \lambda_e=0.05,
+    \quad \lambda_s=0.05,
+    \quad \lambda_v=10^{-3},
+    \quad \lambda_\sigma=0.01.
+\end{equation}
+
+\subsection{Phase 7: reliability as a detached calibrator}
+
+Train reliability after H and $q$ are stable. Compute
+\begin{equation}
+    \phi_{ab} = [\bar q,\operatorname{var}(q),A_q,\bar r,\overline{qr},\bar\sigma,
+                 e_{\mathrm{cycle}},\lVert\Delta p\rVert_1,\kappa(H),A_v],
+\end{equation}
+where $A_q=|\{i:q_i>\tau\}|/N$, $A_v=\sum_i v_i/N$, and $\kappa(H)$ is the condition number.
+Then train
+\begin{equation}
+    s_{ab}=g_\eta(\operatorname{sg}(\phi_{ab})),
+    \qquad
+    \mathcal{L}_{\mathrm{rel}}=\operatorname{BCE}(s_{ab},y_{ab}).
+\end{equation}
+
+Best labels, in descending quality:
+\begin{enumerate}[leftmargin=1.5em]
+    \item validation/test coordinate labels: $y_{ab}=\mathbb{1}[e_{ab}\le\tau]$ for calibration only,
+    \item synthetic known-good/known-bad pairs,
+    \item current invalid-pair shuffle labels, but with no gradient into H.
+\end{enumerate}
+
+\section{Concrete code changes}
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item Add \texttt{data/context\_pairs.py}. It should return
+    \texttt{I\_a\_ctx}, \texttt{I\_b\_patch}, \texttt{T\_a\_ctx}, \texttt{T\_b\_patch},
+    \texttt{crop\_xy}, and frame gap.
+    \item Replace \texttt{warp\_patch\_by\_homography()} in training with a context-to-patch warp:
+    \begin{equation}
+        F_{a\rightarrow b}^{p}=W(F_a^{c}, H_{c\rightarrow p}, \Omega_b^p).
+    \end{equation}
+    \item Replace \texttt{HomographyHead} with bounded output:
+    \begin{equation}
+        \Delta p=\rho_{\max}\tanh(\hat{\Delta p}).
+    \end{equation}
+    \item Add coordinate channels to the H input and remove pure GAP-only spatial aggregation.
+    \item Add \texttt{utils/dlt\_normalized.py} using Hartley normalization.
+    \item In \texttt{cdpc\_net.py}, use
+    \begin{equation}
+        \sigma=\sigma_{\min}+\operatorname{softplus}(u_\sigma)
+    \end{equation}
+    instead of hard \texttt{clamp()}.
+    \item In \texttt{train.py}, make reliability detached:
+    \begin{equation}
+        s=\mathrm{ReliabilityHead}(\operatorname{sg}(\phi)).
+    \end{equation}
+    \item In \texttt{train.py}, use $q^\dagger$ for H-affecting losses and let
+    \texttt{L\_em} train $q$ separately.
+    \item In \texttt{eval.py} and \texttt{test.py}, report all three conventions:
+    direct $H$, inverse $H^{-1}$, and symmetric transfer.
+    \item Add tests: \texttt{test\_dlt\_warp\_translation.py},
+    \texttt{test\_identity\_overfit.py}, and \texttt{test\_synthetic\_overfit.py}.
+\end{enumerate}
+
+\section{Training recipe}
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.20\linewidth} >{\raggedright\arraybackslash}p{0.40\linewidth} >{\raggedright\arraybackslash}p{0.28\linewidth}}
+\toprule
+Stage & Enabled modules/losses & Exit criterion \\
+\midrule
+0. Unit tests & DLT, warp, eval convention & all deterministic tests pass \\
+1. Synthetic H & H branch, $\mathcal{L}_{\mathrm{sup}}$ & corner error $<2$ px \\
+2. Real H-only & H branch, $\mathcal{L}_{\mathrm{tri}}^{0}+\mathcal{L}_{\mathrm{photo}}$ & validation $SA$ decreasing \\
+3. Posterior & q, $\sigma$, $\mathcal{L}_{\mathrm{em}}$ with detached H & stable $\bar q$, no collapse \\
+4. Joint & H + q + $\sigma$ with $q^\dagger$ & lower $SA$ than H-only \\
+5. Reliability & detached $\phi$, BCE calibration & AUROC/AUPRC/ECE improve \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Optimizer recommendation:
+\begin{equation}
+    \eta_H=2\times10^{-4},\qquad
+    \eta_{\mathrm{backbone}}=2\times10^{-5},\qquad
+    \eta_{q,\sigma,s}=10^{-4}.
+\end{equation}
+Use AdamW, exclude BatchNorm and bias from weight decay, clip gradients at $\lVert g\rVert_2\le1$,
+and disable AMP until the synthetic and identity tests are stable.
+
+\section{Diagnostics to log every run}
+
+Log these scalars in TensorBoard and include them in the paper ablation appendix:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item $SA_{H}$, $SA_{H^{-1}}$, and $SA_{\mathrm{sym}}$.
+    \item $\lVert\Delta p\rVert_\infty$, $\lVert\Delta p\rVert_1$, and corner update histograms.
+    \item valid area ratio $A_v=\sum_i v_i/N$.
+    \item $\bar q$, $\operatorname{var}(q)$, $A_q=|\{q_i>0.5\}|/N$.
+    \item $\bar\sigma$, min/max $\sigma$, and $\mathcal{L}_{\sigma}$.
+    \item $\kappa(H)$ and fold-over count.
+    \item gradient norms for H branch, shared backbone, q head, $\sigma$ head, and reliability head.
+    \item reliability AUROC, AUPRC, ECE, NLL, and risk-coverage curves.
+\end{enumerate}
+
+Expected healthy early-training behavior:
+\begin{equation}
+    \lVert\Delta p\rVert_\infty \text{ grows above } 1\text{ px but remains below }\rho_{\max},
+    \quad
+    A_v>0.75,
+    \quad
+    0.3<\bar q<0.9,
+    \quad
+    \kappa(H)<10^4.
+\end{equation}
+
+\section{TIP paper structure after stabilization}
+
+The paper should not claim novelty merely from adding more losses. The claim should be:
+
+\begin{quote}
+A calibrated dominant-plane consensus framework that estimates a homography, its spatial support,
+its aleatoric uncertainty, and a pair-level reliability score, with a trustworthiness evaluation
+protocol for deep homography estimation.
+\end{quote}
+
+Suggested experiments:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item v1 baseline versus current v2 versus Plan-v2 H-only versus full Plan-v2.
+    \item Ablation: context warp, bounded normalized DLT, coarse-to-fine H, detached q, detached reliability.
+    \item Failure detection: AUROC/AUPRC for $e>3$ px and $e>5$ px.
+    \item Calibration: ECE/NLL before and after temperature/isotonic calibration of $s_{ab}$.
+    \item Risk-coverage: show that rejecting low-$s_{ab}$ pairs lowers expected reprojection error.
+    \item Qualitative: overlay $q_i$, residual $r_i$, and failure examples where $s_{ab}$ is low.
+\end{enumerate}
+
+\section{Information still needed}
+
+To finish the diagnosis quantitatively, I need the following from your latest run:
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item exact definition of $SA$ and the full per-category table,
+    \item checkpoint iteration and whether training was from scratch or resumed,
+    \item TensorBoard curves for $SA$, $\bar q$, $\bar\sigma$, $\lVert\Delta p\rVert$, valid area, and all losses,
+    \item whether \texttt{Coordinate-v2.zip} was extracted into the path used by \texttt{TestDataset}, and
+    \item three evaluation numbers from the same checkpoint: direct $H$, inverse $H^{-1}$, and symmetric transfer.
+\end{enumerate}
+
+\end{document}

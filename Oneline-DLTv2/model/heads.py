@@ -1,14 +1,16 @@
 """Prediction heads for the CDPC network.
 
-- HomographyHead:  pooled features -> 8-DoF corner offset
+- HomographyHead:  pooled features -> 8-DoF corner offset, BOUNDED by rho*tanh.
 - PosteriorHead:   per-pixel features -> q in [0, 1]
-- UncertaintyHead: per-pixel features -> log sigma (clamped)
-- ReliabilityHead: pooled summary statistics -> s in [0, 1]"""
+- UncertaintyHead: per-pixel features -> log sigma via sigma_min + softplus(u)
+- ReliabilityHead: pooled summary statistics -> s in [0, 1]
+"""
 
 from math import log
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _conv_bn_relu(in_c: int, out_c: int, k: int = 3) -> nn.Sequential:
@@ -20,14 +22,15 @@ def _conv_bn_relu(in_c: int, out_c: int, k: int = 3) -> nn.Sequential:
 
 
 class HomographyHead(nn.Module):
-    """Consumes [F_a^(1/8), F_b^(1/8), correlation_c] concatenated channelwise
-    and regresses 8 corner offsets via global average pooling + MLP.
+    """Consumes pooled cross-image features and regresses 8 corner offsets.
 
-    Output is in pixels, scaled by `rho` so the network outputs are roughly
-    unit-magnitude at initialization.
+    Output is bounded: offset = rho * tanh(raw). The tanh bound caps the
+    maximum corner displacement at `rho` px regardless of feature magnitude,
+    which prevents fold-over of the warp grid and any single step from
+    collapsing the homography to a degenerate state.
     """
 
-    def __init__(self, in_channels: int, rho: float = 32.0):
+    def __init__(self, in_channels: int, rho: float = 16.0):
         super().__init__()
         self.rho = rho
         self.tower = nn.Sequential(
@@ -42,26 +45,23 @@ class HomographyHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(256, 8),
         )
-        # Init scale chosen so that initial corner offsets are ~5-10 px (inf
-        # norm). Smaller inits collapse H to identity and the triplet sees
-        # d_pos == d_neg (hinge pinned at margin), preventing H from escaping
-        # the identity basin. Bias stays zero so the *mean* offset is zero.
-        nn.init.normal_(self.fc[-1].weight, std=0.03)
+        # Init scale chosen so that initial raw is O(0.5) and the tanh
+        # is in its linear regime; initial offset is then ~rho * 0.5 ~= 8 px
+        # for rho=16. Bias stays zero so initial *mean* offset is zero.
+        nn.init.normal_(self.fc[-1].weight, std=0.05)
         nn.init.zeros_(self.fc[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, in_channels, H, W). Returns (B, 8) corner offset in pixels."""
         h = self.tower(x)
         h = self.pool(h)
-        offset = self.fc(h)
-        return offset * self.rho
+        raw = self.fc(h)
+        return self.rho * torch.tanh(raw)
 
 
 class PosteriorHead(nn.Module):
     """Per-pixel posterior P(z=1 | I_a, I_b). Final bias is initialized so
-    that q ≈ 0.7 at init, which prevents the early-training collapse the
-    user observed in v1 (mask all-zero around iter 65k).
-    """
+    that q ~= init_prob at init."""
 
     def __init__(self, in_channels: int, hidden: int = 64, init_prob: float = 0.7):
         super().__init__()
@@ -73,8 +73,6 @@ class PosteriorHead(nn.Module):
         self.head = nn.Conv2d(hidden, 1, kernel_size=1)
 
         with torch.no_grad():
-            # Small weight + biased toward init_prob. Pure zero weight would
-            # kill upstream gradient on the first step.
             nn.init.normal_(self.head.weight, std=1e-3)
             init_prob = float(min(max(init_prob, 1e-3), 1.0 - 1e-3))
             self.head.bias.fill_(log(init_prob / (1.0 - init_prob)))
@@ -87,11 +85,16 @@ class PosteriorHead(nn.Module):
 
 
 class UncertaintyHead(nn.Module):
-    """Per-pixel log sigma. Clamped to [-5, 5] to prevent numerical blow-up
-    inside the Kendall-Gal likelihood."""
+    """Per-pixel uncertainty parameterized as sigma = sigma_min + softplus(u).
 
-    def __init__(self, in_channels: int, hidden: int = 64,
-                 log_sigma_min: float = -5.0, log_sigma_max: float = 5.0):
+    This is strictly better than clamp(log_sigma): softplus is differentiable
+    everywhere, lower-bounded by sigma_min, and grows linearly with u so the
+    Kendall-Gal denominator can adapt without dead gradient zones. Without an
+    upper clamp the value can in principle grow large; the L_sigma_reg term
+    in train.py keeps it near 1.
+    """
+
+    def __init__(self, in_channels: int, hidden: int = 64, sigma_min: float = 0.05):
         super().__init__()
         self.tower = nn.Sequential(
             _conv_bn_relu(in_channels, hidden),
@@ -99,16 +102,19 @@ class UncertaintyHead(nn.Module):
             _conv_bn_relu(hidden, hidden),
         )
         self.head = nn.Conv2d(hidden, 1, kernel_size=1)
-        self.lo, self.hi = log_sigma_min, log_sigma_max
+        self.sigma_min = sigma_min
 
         with torch.no_grad():
             nn.init.normal_(self.head.weight, std=1e-3)
-            self.head.bias.zero_()                   # init sigma = 1
+            # u=0 -> sigma = sigma_min + softplus(0) = sigma_min + log(2) ~= 0.74
+            # for sigma_min=0.05, matching the prior clamp lower bound.
+            self.head.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.tower(x)
-        log_sigma = self.head(h)
-        return log_sigma.clamp(self.lo, self.hi)
+        u = self.head(h)
+        sigma = self.sigma_min + F.softplus(u)
+        return torch.log(sigma)
 
 
 class ReliabilityHead(nn.Module):

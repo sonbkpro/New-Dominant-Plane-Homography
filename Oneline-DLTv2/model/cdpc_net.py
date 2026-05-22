@@ -1,31 +1,31 @@
-"""Top-level Calibrated Dominant-Plane Consensus network.
+"""Top-level Calibrated Dominant-Plane Consensus network -- v2 overhaul.
 
-Pipeline (one direction, predicts H_ab only). The H regression path uses a
-JOINT 2-channel backbone (v1-style channel-stacked input) so every conv layer
-sees both images. The per-pixel posterior/uncertainty heads keep using the
-per-image multi-scale backbone, where having clean per-image features matters
-for residual computation.
+Key differences from the earlier v2:
 
-    (I_a_patch, I_b_patch)
+(1) Full-image warping (planv2 P0). The per-image backbone runs on the FULL
+    image, not the patch. The H regression branch still consumes the cropped
+    pair (joint 2-channel backbone); but the per-pixel branch's residual is
+    computed as
 
-      ┌─ joint:    cat(I_a, I_b)              -> JointBackbone (2-ch)
-      │              -> F_joint^{1/8}
-      │              -> HomographyHead([F_joint^{1/8}, c^{1/8}]) -> 4-pt offset
-      │              -> H_ab (DLT_solve, in patch-local pixel coords)
-      │
-      └─ per-image: I_a, I_b separately       -> MultiScaleBackbone (1-ch)
-                     -> F_a^{1/4}, F_a^{1/8}, F_b^{1/4}, F_b^{1/8}
-                     -> Correlation(F_a^{1/8}, F_b^{1/8})   -> c^{1/8}
-                     -> warp F_a^{1/4} by H_ab              -> F_a_warped^{1/4}
-                     -> residual r = mean_c |F_b - F_a_warped|
-                     -> PosteriorHead([F_b^{1/4}, F_a_warped, c^{1/4}, r]) -> q
-                     -> UncertaintyHead([F_b^{1/4}, F_a_warped, c^{1/4}, r]) -> log sigma
-                     -> cycle features                      -> ReliabilityHead -> s
+        F_a_warped(p_b) = sample( F_a_full, H_full^{-1} (p_b + crop_xy_b) )
 
-Outputs are returned as a dictionary so train.py can apply individual losses.
+    by giving warp_by_homography an out_origin_xy = crop_xy/scale. This
+    exactly replicates v1's transform-then-crop pipeline without ever
+    materializing the warped full image.
+
+(2) Bounded corner offset via rho * tanh in HomographyHead (heads.py).
+(3) Sigma via sigma_min + softplus(u), not clamp (heads.py).
+(4) Coordinate channels on the H input so the 1/8 GAP-pooled feature stays
+    aware of absolute spatial layout.
+(5) phi (reliability features) extended with kappa(H) and A_v, and the
+    reliability head receives phi.detach() so L_rel never distorts geometry.
+(6) Optional Hartley-normalized DLT (utils/dlt_normalized.py).
+
+The forward signature now requires both the full images and the cropped
+patches; the dataset returns both.
 """
 
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -35,8 +35,11 @@ from model.backbone import MultiScaleBackbone
 from model.correlation import LocalCorrelation
 from model.heads import HomographyHead, PosteriorHead, UncertaintyHead, ReliabilityHead
 from utils.dlt import DLT_solve
-from utils.warping import warp_patch_by_homography, make_validity_mask
-from utils.inverse import safe_inverse_3x3
+from utils.dlt_normalized import DLT_solve_normalized
+from utils.warping import (
+    warp_by_homography, warp_patch_by_homography, make_validity_mask,
+)
+from utils.inverse import safe_inverse_3x3, condition_number_3x3
 
 
 def _rescale_homography(H: torch.Tensor, scale_in_to_out: float) -> torch.Tensor:
@@ -52,6 +55,50 @@ def _rescale_homography(H: torch.Tensor, scale_in_to_out: float) -> torch.Tensor
     return torch.bmm(torch.bmm(S_b, H), Si_b)
 
 
+def _patch_to_full(H_patch: torch.Tensor, crop_xy: torch.Tensor) -> torch.Tensor:
+    """H_full = T(+crop) @ H_patch @ T(-crop). See train.py.patch_to_full_homography."""
+    B = H_patch.shape[0]
+    device, dtype = H_patch.device, H_patch.dtype
+    T = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+    T[:, 0, 2] = crop_xy[:, 0]
+    T[:, 1, 2] = crop_xy[:, 1]
+    T_inv = T.clone()
+    T_inv[:, 0, 2] = -crop_xy[:, 0]
+    T_inv[:, 1, 2] = -crop_xy[:, 1]
+    return torch.bmm(torch.bmm(T, H_patch), T_inv)
+
+
+def _add_coord_channels(x: torch.Tensor) -> torch.Tensor:
+    """Append two channels (x/W in [-1,1], y/H in [-1,1]) to a (B,C,H,W) tensor.
+    Lets a pooled regressor know absolute spatial location."""
+    B, C, H, W = x.shape
+    device, dtype = x.device, x.dtype
+    ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype).view(1, 1, H, 1).expand(B, 1, H, W)
+    xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype).view(1, 1, 1, W).expand(B, 1, H, W)
+    return torch.cat([x, xs, ys], dim=1)
+
+
+def _crop_feature(feat: torch.Tensor, origin_xy: torch.Tensor,
+                  out_h: int, out_w: int) -> torch.Tensor:
+    """Differentiable crop of a per-image feature map at a per-batch origin.
+    Used to extract patch-located features from a feature map computed over
+    the FULL image. origin_xy is in feature-map pixel coords."""
+    B, C, H, W = feat.shape
+    device, dtype = feat.device, feat.dtype
+    # Build a destination grid that just translates by origin_xy.
+    ys = torch.arange(out_h, device=device, dtype=dtype).view(1, out_h, 1).expand(B, out_h, out_w)
+    xs = torch.arange(out_w, device=device, dtype=dtype).view(1, 1, out_w).expand(B, out_h, out_w)
+    ox = origin_xy[:, 0].view(B, 1, 1).to(dtype)
+    oy = origin_xy[:, 1].view(B, 1, 1).to(dtype)
+    sx = xs + ox
+    sy = ys + oy
+    nx = 2.0 * sx / max(W - 1, 1) - 1.0
+    ny = 2.0 * sy / max(H - 1, 1) - 1.0
+    sample_grid = torch.stack([nx, ny], dim=-1)                    # (B, out_h, out_w, 2)
+    return F.grid_sample(feat, sample_grid, mode="bilinear",
+                         padding_mode="zeros", align_corners=True)
+
+
 class CDPCNet(nn.Module):
     def __init__(
         self,
@@ -62,18 +109,20 @@ class CDPCNet(nn.Module):
         corr_out_channels: int = 32,
         bb_quarter_channels: int = 64,
         bb_eighth_channels: int = 128,
-        homography_rho: float = 32.0,
+        homography_rho: float = 16.0,
         post_init_prob: float = 0.7,
-        log_sigma_min: float = -5.0,
-        log_sigma_max: float = 5.0,
+        sigma_min: float = 0.05,
+        use_normalized_dlt: bool = True,
+        # Legacy kwargs ignored; retained so older configs still load.
+        log_sigma_min: float = None,
+        log_sigma_max: float = None,
     ):
         super().__init__()
         self.patch_h = patch_h
         self.patch_w = patch_w
+        self.use_normalized_dlt = use_normalized_dlt
 
-        # Per-image multi-scale backbone -- feeds the per-pixel heads (q, sigma)
-        # and the residual computation. Keeps clean per-image features so the
-        # consensus / uncertainty reasoning is well-defined.
+        # Per-image backbone runs on FULL images.
         self.backbone = MultiScaleBackbone(
             pretrained=backbone_pretrained,
             in_channels=1,
@@ -81,9 +130,7 @@ class CDPCNet(nn.Module):
             out_channels_eighth=bb_eighth_channels,
         )
 
-        # JOINT 2-channel backbone -- feeds the H regression head. v1-style
-        # (channel-stacked I_a, I_b) so every conv layer is cross-image-aware.
-        # This is the architectural change that lets H regression match v1.
+        # Joint 2-channel backbone on the cropped patch pair, for H regression.
         self.joint_backbone = MultiScaleBackbone(
             pretrained=backbone_pretrained,
             in_channels=2,
@@ -95,25 +142,19 @@ class CDPCNet(nn.Module):
             radius=corr_radius, out_channels=corr_out_channels,
         )
 
-        # H head now consumes joint features + correlation (not per-image features).
-        homo_in = bb_eighth_channels + corr_out_channels
+        # +2 for the coord channels appended in forward().
+        homo_in = bb_eighth_channels + corr_out_channels + 2
         self.homography_head = HomographyHead(homo_in, rho=homography_rho)
 
-        # Posterior / uncertainty heads consume [F_b^{1/4}, F_a_warped^{1/4},
-        # c^{1/4}_upsampled, residual] — c is part of the input per planv1.txt
-        # §5.3, ensuring q and sigma depend on inter-image correspondence quality.
+        # Per-pixel heads input: [F_b^{1/4}, F_a_warped^{1/4}, c^{1/4}, r].
         post_in = 2 * bb_quarter_channels + corr_out_channels + 1
         self.posterior_head = PosteriorHead(post_in, init_prob=post_init_prob)
-        self.uncertainty_head = UncertaintyHead(
-            post_in,
-            log_sigma_min=log_sigma_min,
-            log_sigma_max=log_sigma_max,
-        )
+        self.uncertainty_head = UncertaintyHead(post_in, sigma_min=sigma_min)
 
-        # Reliability features: 8-dim vector defined in forward().
-        self.reliability_head = ReliabilityHead(feat_dim=8)
+        # phi now has 10 dims: q_mean, q_var, q_area, r_mean, qr_mean,
+        # sigma_mean, cycle_mean, offset_norm, kappa_H, area_valid.
+        self.reliability_head = ReliabilityHead(feat_dim=10)
 
-        # Reusable patch-corner template for the DLT.
         h4p = torch.tensor(
             [0, 0,
              0, patch_h,
@@ -127,83 +168,122 @@ class CDPCNet(nn.Module):
 
     @staticmethod
     def _pool_stat(x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        """Returns (B,) mean over spatial dims. Optional mask of same shape."""
         if mask is None:
             return x.mean(dim=(1, 2, 3))
         denom = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
         return (x * mask).sum(dim=(1, 2, 3)) / denom
 
+    def _solve_dlt(self, h4p_batch: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        if self.use_normalized_dlt:
+            return DLT_solve_normalized(h4p_batch, offset)
+        return DLT_solve(h4p_batch, offset)
+
     # ----- forward ----------------------------------------------------------
 
-    def forward(self, I_a: torch.Tensor, I_b: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """I_a, I_b: (B, 1, patch_h, patch_w) normalized grayscale patches."""
-        B = I_a.shape[0]
-        device = I_a.device
+    def forward(
+        self,
+        I_a_full: torch.Tensor,
+        I_b_full: torch.Tensor,
+        I_a_patch: torch.Tensor,
+        I_b_patch: torch.Tensor,
+        crop_xy: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            I_a_full, I_b_full: (B, 1, H_full, W_full) normalized grayscale.
+            I_a_patch, I_b_patch: (B, 1, patch_h, patch_w) cropped patches at crop_xy.
+            crop_xy: (B, 2) [x, y] crop origin in full-image pixel coords.
+        Returns: dict with all geometry / posterior / reliability outputs.
+        """
+        B = I_a_patch.shape[0]
+        device = I_a_patch.device
+        dtype = I_a_patch.dtype
+        ph, pw = self.patch_h, self.patch_w
+        H_full_img, W_full_img = I_a_full.shape[-2:]
 
-        # --- per-image features (for q, sigma, residual) --------------------
-        fa = self.backbone(I_a)
-        fb = self.backbone(I_b)
-        F_a4, F_a8 = fa["quarter"], fa["eighth"]
-        F_b4, F_b8 = fb["quarter"], fb["eighth"]
+        # --- per-image features on the FULL images --------------------------
+        fa_full = self.backbone(I_a_full)
+        fb_full = self.backbone(I_b_full)
+        F_a_full4, F_a_full8 = fa_full["quarter"], fa_full["eighth"]
+        F_b_full4, F_b_full8 = fb_full["quarter"], fb_full["eighth"]
 
-        # --- joint features (for H regression) ------------------------------
-        # Channel-stacked input means every conv layer in the joint backbone
-        # processes the pair simultaneously, building cross-image features at
-        # every spatial scale (v1's recipe).
-        joint_in = torch.cat([I_a, I_b], dim=1)                     # (B, 2, H, W)
+        # --- joint features on patches -- predicts H in patch-local coords --
+        joint_in = torch.cat([I_a_patch, I_b_patch], dim=1)         # (B, 2, ph, pw)
         f_joint = self.joint_backbone(joint_in)
-        F_joint8 = f_joint["eighth"]                                # (B, C, H/8, W/8)
+        F_joint8_patch = f_joint["eighth"]
 
-        # --- correlation at 1/8 ---------------------------------------------
-        c8 = self.correlation(F_a8, F_b8)                           # (B, Cc, H/8, W/8)
+        # --- crop patch features from FULL feature maps for correlation
+        #     and for the per-pixel heads. The correlation must be on the
+        #     patch features (not the full image) because that is what is
+        #     being matched.
+        crop_xy_8 = crop_xy / 8.0
+        crop_xy_4 = crop_xy / 4.0
+        ph_8, pw_8 = ph // 8, pw // 8
+        ph_4, pw_4 = ph // 4, pw // 4
+
+        F_a8_patch = _crop_feature(F_a_full8, crop_xy_8, ph_8, pw_8)
+        F_b8_patch = _crop_feature(F_b_full8, crop_xy_8, ph_8, pw_8)
+        F_b4_patch = _crop_feature(F_b_full4, crop_xy_4, ph_4, pw_4)
+        F_a4_patch = _crop_feature(F_a_full4, crop_xy_4, ph_4, pw_4)
+
+        # --- correlation on patch features at 1/8 ---------------------------
+        c8 = self.correlation(F_a8_patch, F_b8_patch)
 
         # --- homography prediction ------------------------------------------
-        homo_in = torch.cat([F_joint8, c8], dim=1)
-        offset = self.homography_head(homo_in)                      # (B, 8) in pixels
+        homo_in = torch.cat([F_joint8_patch, c8], dim=1)
+        homo_in = _add_coord_channels(homo_in)                      # +2 channels
+        offset = self.homography_head(homo_in)                      # (B, 8) px, bounded
 
         h4p_batch = self.h4p_patch.expand(B, -1).to(device)
-        H_ab = DLT_solve(h4p_batch, offset)                         # (B, 3, 3) in patch coords
+        H_patch = self._solve_dlt(h4p_batch, offset)                # (B, 3, 3) patch coords
+        H_full = _patch_to_full(H_patch, crop_xy)                   # full-image pixel coords
 
-        # --- warp F_a^{1/4} onto F_b^{1/4} frame ----------------------------
-        H_quarter = _rescale_homography(H_ab, 0.25)
-        F_a_warped = warp_patch_by_homography(F_a4, H_quarter, padding_mode="zeros")
+        # --- FULL-IMAGE warp at quarter scale, output cropped to patch ------
+        # This is v1's transform-then-crop: warp samples from anywhere in
+        # F_a_full4, gated only by the *full image* extent rather than the
+        # patch extent. Out-of-bounds occurs only when H sends the source
+        # pixel outside the full image, not the patch.
+        H_full_q = _rescale_homography(H_full, 0.25)
+        F_a_warped = warp_by_homography(
+            F_a_full4, H_full_q,
+            out_size=(ph_4, pw_4),
+            out_origin_xy=crop_xy_4,
+            padding_mode="zeros",
+        )
         valid_mask = make_validity_mask(
-            H_quarter,
-            out_size=F_b4.shape[-2:],
-            in_size=F_a4.shape[-2:],
-            out_origin_xy=(0, 0),
+            H_full_q,
+            out_size=(ph_4, pw_4),
+            in_size=F_a_full4.shape[-2:],
+            out_origin_xy=crop_xy_4,
         )
 
         # --- residual map ---------------------------------------------------
-        # Channel-MEAN (not sum) so per-pixel residual stays in ~[0, 5] regardless
-        # of channel count. With channel-sum, residual ~ O(C) makes the triplet
-        # margin m=1 effectively zero and lets L_align numerics misbehave.
-        r = (F_b4 - F_a_warped).abs().mean(dim=1, keepdim=True)     # (B, 1, H/4, W/4)
+        r = (F_b4_patch - F_a_warped).abs().mean(dim=1, keepdim=True)
 
         # --- posterior + uncertainty ----------------------------------------
-        # Upsample correlation feature from 1/8 to 1/4 so it can feed the
-        # per-pixel heads (planv1.txt §5.3).
-        c4 = F.interpolate(c8, size=F_b4.shape[-2:],
+        c4 = F.interpolate(c8, size=F_b4_patch.shape[-2:],
                            mode="bilinear", align_corners=True)
-        post_in = torch.cat([F_b4, F_a_warped, c4, r], dim=1)
-        q = self.posterior_head(post_in)                            # (B, 1, H/4, W/4)
-        log_sigma = self.uncertainty_head(post_in)                  # (B, 1, H/4, W/4)
+        post_in = torch.cat([F_b4_patch, F_a_warped, c4, r], dim=1)
+        q = self.posterior_head(post_in)
+        log_sigma = self.uncertainty_head(post_in)
 
-        # Mask out invalid (out-of-bounds) pixels so the loss does not chase them.
         q = q * valid_mask
-        # log_sigma stays as-is; loss multiplies by q so invalid regions vanish.
 
-        # --- cycle residual for reliability features ------------------------
-        H_inv_quarter, cond_valid = safe_inverse_3x3(H_quarter)
-        F_a_recovered = warp_patch_by_homography(F_a_warped, H_inv_quarter, padding_mode="zeros")
+        # --- cycle residual (in-patch, patch coords) ------------------------
+        # Cycle uses H_patch (already in patch coords) and patch-only warp,
+        # since the cycle is a self-consistency check, not the alignment loss.
+        H_patch_q = _rescale_homography(H_patch, 0.25)
+        H_patch_q_inv, cond_valid = safe_inverse_3x3(H_patch_q)
+        F_a_recovered = warp_patch_by_homography(F_a_warped, H_patch_q_inv,
+                                                 padding_mode="zeros")
         cycle_valid = valid_mask * make_validity_mask(
-            H_inv_quarter,
-            out_size=F_a4.shape[-2:],
+            H_patch_q_inv,
+            out_size=F_a4_patch.shape[-2:],
             in_size=F_a_warped.shape[-2:],
         )
-        cycle_r = (F_a4 - F_a_recovered).abs().mean(dim=1, keepdim=True)
+        cycle_r = (F_a4_patch - F_a_recovered).abs().mean(dim=1, keepdim=True)
 
-        # --- reliability features -------------------------------------------
+        # --- reliability features (10-dim phi) ------------------------------
         tau = 0.5
         q_above = (q > tau).float()
         q_mean = self._pool_stat(q)
@@ -213,45 +293,54 @@ class CDPCNet(nn.Module):
         qr_mean = self._pool_stat(q * r, valid_mask)
         sigma_mean = self._pool_stat(log_sigma.exp(), valid_mask)
         cycle_mean = self._pool_stat(cycle_r, cycle_valid) * cond_valid \
-            + (1.0 - cond_valid) * 10.0    # penalize ill-conditioned H
+            + (1.0 - cond_valid) * 10.0
         offset_norm = offset.abs().mean(dim=1)
+        kappa_H = condition_number_3x3(H_full).to(dtype)
+        # Squash kappa to log-scale so the regressor input stays bounded.
+        log_kappa = torch.log(kappa_H.clamp(min=1.0))
+        area_valid = valid_mask.mean(dim=(1, 2, 3))
 
         phi = torch.stack(
-            [q_mean, q_var, q_area, r_mean, qr_mean, sigma_mean, cycle_mean, offset_norm],
+            [q_mean, q_var, q_area, r_mean, qr_mean, sigma_mean,
+             cycle_mean, offset_norm, log_kappa, area_valid],
             dim=1,
         )
-        s = self.reliability_head(phi)                              # (B,)
 
-        # Full-scale closed-form inverse (planv1 §5.1: not a learned head).
-        H_ab_inv, _ = safe_inverse_3x3(H_ab)
+        # DETACHED reliability: L_rel never reshapes geometry features.
+        s = self.reliability_head(phi.detach())
+
+        # Full-scale closed-form inverse for downstream eval / cycle losses.
+        H_ab_inv, _ = safe_inverse_3x3(H_patch)
 
         return {
-            # ----- plan §7.3 canonical names -----
-            "H_ab": H_ab,
-            "H_ab_inv": H_ab_inv,
-            "offset_ab": offset,
-            "q_ab": q,
+            "H_ab":       H_patch,
+            "H_ab_inv":   H_ab_inv,
+            "H_full":     H_full,
+            "offset_ab":  offset,
+            "q_ab":       q,
             "log_sigma_ab": log_sigma,
             "reliability_score": s,
-            "residual_map_ab": r,
-            "feature_a": F_a4,
-            "feature_b": F_b4,
-            # ----- additional internals used by losses / training ----------
-            "H_quarter": H_quarter,
-            "H_inv_quarter": H_inv_quarter,
-            "F_a_warped": F_a_warped,
+            "residual_map_ab":   r,
+            "feature_a":  F_a4_patch,
+            "feature_b":  F_b4_patch,
+            # internals
+            "H_patch":      H_patch,
+            "H_patch_q":    H_patch_q,
+            "H_patch_q_inv": H_patch_q_inv,
+            "F_a_warped":   F_a_warped,
             "F_a_recovered": F_a_recovered,
-            "valid_mask": valid_mask,
-            "cycle_valid": cycle_valid,
-            "cond_valid": cond_valid,
+            "valid_mask":   valid_mask,
+            "cycle_valid":  cycle_valid,
+            "cond_valid":   cond_valid,
             "cycle_residual": cycle_r,
-            "phi": phi,
-            # ----- back-compat aliases (no _ab suffix) ---------------------
-            "offset": offset,
-            "q": q,
-            "log_sigma": log_sigma,
-            "s": s,
-            "residual": r,
-            "F_a4": F_a4,
-            "F_b4": F_b4,
+            "phi":          phi,
+            "kappa_H":      kappa_H,
+            # back-compat aliases
+            "offset":       offset,
+            "q":            q,
+            "log_sigma":    log_sigma,
+            "s":            s,
+            "residual":     r,
+            "F_a4":         F_a4_patch,
+            "F_b4":         F_b4_patch,
         }

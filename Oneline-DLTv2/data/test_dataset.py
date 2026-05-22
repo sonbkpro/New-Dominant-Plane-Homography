@@ -1,11 +1,12 @@
-"""Test dataset matching v1's protocol: same patch crop at fixed (40, 23),
-and exposes the manual 6-point correspondences (from Data/Coordinate/*.npy)
-for L2 reprojection evaluation."""
+"""Test dataset for the full-image-warp pipeline.
+
+Matches v1's protocol: same patch crop at fixed (40, 23), and exposes the
+manual 6-point correspondences (from Data/Coordinate/*.npy) for L2 evaluation.
+Now also returns the full images so the network can warp the full feature map
+and crop the patch destination (v1 transform-then-crop)."""
 
 import os
-from typing import List, Tuple
 
-import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -45,7 +46,21 @@ class TestDataset(Dataset):
         super().__init__()
         self.work_dir = os.path.join(data_root, "Data")
         self.test_root = os.path.join(self.work_dir, "Test")
-        self.npy_root = os.path.join(self.work_dir, "Coordinate")
+        # The coordinate .npy files live in one of two places depending on
+        # whether the user is using the v1 or v2 (Coordinate-v2.zip) labels.
+        # Try v2 first (the doubly-nested unzip layout the user actually has),
+        # then fall back to v1's flat Coordinate/.
+        candidates = [
+            os.path.join(self.work_dir, "Coordinate-v2", "Coordinate-v2"),
+            os.path.join(self.work_dir, "Coordinate-v2"),
+            os.path.join(self.work_dir, "Coordinate"),
+        ]
+        self.npy_root = next(
+            (p for p in candidates if os.path.isdir(p)
+             and any(f.endswith(".npy") for f in os.listdir(p))),
+            candidates[-1],   # fallback to v1 path so the FileNotFoundError
+                              # below still surfaces with a familiar message
+        )
         with open(os.path.join(self.work_dir, "Test_List.txt"), "r") as f:
             self.lines = [ln.strip() for ln in f if ln.strip()]
 
@@ -56,8 +71,7 @@ class TestDataset(Dataset):
     def __len__(self) -> int:
         return len(self.lines)
 
-    def _resolve(self, token: str) -> Tuple[str, str]:
-        """v1's Test_List has trailing 'M' / newline markers; strip them."""
+    def _resolve(self, token: str) -> str:
         token = token.rstrip()
         if token.endswith("M"):
             token = token[:-1]
@@ -71,17 +85,13 @@ class TestDataset(Dataset):
 
         a_path = os.path.join(self.test_root, a_token)
         b_path = os.path.join(self.test_root, b_token)
-        img_a = _load_normalized_gray(a_path, self.img_w, self.img_h)
-        img_b = _load_normalized_gray(b_path, self.img_w, self.img_h)
+        img_a_full = _load_normalized_gray(a_path, self.img_w, self.img_h)
+        img_b_full = _load_normalized_gray(b_path, self.img_w, self.img_h)
 
         x, y = self.patch_x, self.patch_y
-        I_a_patch = img_a[:, y:y + self.patch_h, x:x + self.patch_w]
-        I_b_patch = img_b[:, y:y + self.patch_h, x:x + self.patch_w]
+        I_a_patch = img_a_full[:, y:y + self.patch_h, x:x + self.patch_w]
+        I_b_patch = img_b_full[:, y:y + self.patch_h, x:x + self.patch_w]
 
-        # Manual point correspondences (in full-image coordinates).
-        # Note: v1 wrote `parts[1].split("/")[1][:-1]` because v1 did NOT strip
-        # the trailing newline from the line. v2 strips it in __init__, so
-        # do NOT chop the last char or "00000100_10011.jpg" becomes ".jp".
         npy_name = (parts[0].split("/")[1] + "_" +
                     parts[1].split("/")[1] + ".npy")
         npy_path = os.path.join(self.npy_root, npy_name)
@@ -89,10 +99,12 @@ class TestDataset(Dataset):
         pts = np.array(point_dict["matche_pts"], dtype=np.float32)   # (K, 2, 2)
 
         return {
+            "I_a_full":  torch.from_numpy(img_a_full.copy()).float(),
+            "I_b_full":  torch.from_numpy(img_b_full.copy()).float(),
             "I_a_patch": torch.from_numpy(I_a_patch.copy()).float(),
             "I_b_patch": torch.from_numpy(I_b_patch.copy()).float(),
-            "points": torch.from_numpy(pts),                          # (K, 2, 2)
-            "crop_xy": torch.tensor([x, y], dtype=torch.float32),
+            "points":    torch.from_numpy(pts),
+            "crop_xy":   torch.tensor([x, y], dtype=torch.float32),
             "video_name": video_name,
-            "scene": scene_category(video_name),
+            "scene":     scene_category(video_name),
         }

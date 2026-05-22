@@ -1,8 +1,9 @@
-"""Full trustworthiness evaluation for CDPC v2.
+"""Full trustworthiness evaluation for CDPC v2 (full-image-warp pipeline).
 
 Reports per-category and overall:
   - L2 reprojection: mean, median, AUC@{1,3,5}, inlier@{1,3,5}
-  - failure detection: AUROC, AUPRC (failure = err > tau)
+    for direct / inverse / symmetric / identity / v1 (planv2 §2.5)
+  - failure detection: AUROC, AUPRC (failure = err > tau, against the v1 err)
   - calibration: ECE, NLL of s_ab against the failure label
   - risk-coverage curve driven by reliability score s_ab
 """
@@ -27,7 +28,18 @@ from utils.eval_metrics import (
     point_reprojection_error, auc_at_thresholds, inlier_ratio_at_thresholds,
     auroc, auprc, expected_calibration_error, risk_coverage_curve,
 )
+from utils.inverse import safe_inverse_3x3
 from train import patch_to_full_homography
+
+
+SCENES = ("RE", "LT", "LL", "SF", "LF")
+METRICS = ("direct", "inverse", "symmetric", "identity", "v1")
+
+
+def _eye_like(H: torch.Tensor) -> torch.Tensor:
+    B = H.shape[0]
+    I = torch.eye(3, device=H.device, dtype=H.dtype)
+    return I.unsqueeze(0).expand(B, -1, -1).contiguous()
 
 
 def _load_state(net, ckpt_path: str):
@@ -56,8 +68,8 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
         bb_eighth_channels=cfg.bb_eighth_channels,
         homography_rho=cfg.homography_rho,
         post_init_prob=cfg.post_init_prob,
-        log_sigma_min=cfg.log_sigma_min,
-        log_sigma_max=cfg.log_sigma_max,
+        sigma_min=cfg.sigma_min,
+        use_normalized_dlt=cfg.use_normalized_dlt,
     ).to(device)
     _load_state(net, ckpt_path)
     net.eval()
@@ -67,73 +79,85 @@ def evaluate(ckpt_path: str, tau_list=(3.0, 5.0)) -> dict:
                           img_h=cfg.img_h, img_w=cfg.img_w)
     test_loader = DataLoader(test_ds, batch_size=1, num_workers=0, shuffle=False)
 
-    errs, scenes, reliabilities = [], [], []
+    # Per-pair lists for each of the 5 metrics; reliability score; scenes.
+    per_metric = {m: [] for m in METRICS}
+    reliabilities, scenes = [], []
+    n_illcond = 0
+
     for batch in test_loader:
-        I_a = batch["I_a_patch"].to(device)
-        I_b = batch["I_b_patch"].to(device)
-        crop_xy = batch["crop_xy"].to(device)
-        out = net(I_a, I_b)
+        I_a_full  = batch["I_a_full"].to(device)
+        I_b_full  = batch["I_b_full"].to(device)
+        I_a_patch = batch["I_a_patch"].to(device)
+        I_b_patch = batch["I_b_patch"].to(device)
+        crop_xy   = batch["crop_xy"].to(device)
+
+        out = net(I_a_full, I_b_full, I_a_patch, I_b_patch, crop_xy)
         H_full = patch_to_full_homography(out["H_ab"], crop_xy)
-        # Match v1's protocol: first 6 correspondences only, and per-point
-        # min over the (A,B) / (B,A) swap, then mean. Mean-then-min is a
-        # different metric — and every downstream number here (AUC, inlier,
-        # AUROC, AUPRC, ECE, NLL, risk-coverage) is built from this per-pair
-        # err, so the v1↔v2 trustworthiness table is only comparable when
-        # the per-pair scalar is computed v1's way.
-        pts = batch["points"].to(device)[:, :6, :, :]   # (B, 6, 2, 2)
+        H_full_inv, cond_valid = safe_inverse_3x3(H_full)
+        if float(cond_valid.item()) < 0.5:
+            n_illcond += 1
+
+        pts = batch["points"].to(device)[:, :6, :, :]
         pts_a = pts[:, :, 0, :]
         pts_b = pts[:, :, 1, :]
-        err_ab = point_reprojection_error(H_full, pts_a, pts_b)         # (B, 6)
-        err_ba = point_reprojection_error(H_full, pts_b, pts_a)         # (B, 6)
-        err = torch.minimum(err_ab, err_ba).mean(dim=1)                 # (B,)
-        for j in range(I_a.shape[0]):
-            errs.append(float(err[j]))
-            scenes.append(batch["scene"][j])
-            reliabilities.append(float(out["s"][j]))
+        err_ab  = point_reprojection_error(H_full,            pts_a, pts_b)
+        err_ba  = point_reprojection_error(H_full,            pts_b, pts_a)
+        err_inv = point_reprojection_error(H_full_inv,        pts_b, pts_a)
+        err_id  = point_reprojection_error(_eye_like(H_full), pts_a, pts_b)
 
-    errs = np.array(errs, dtype=np.float64)
-    rel  = np.array(reliabilities, dtype=np.float64)
+        per_metric["direct"].append(   float(err_ab.mean(dim=1).item()))
+        per_metric["inverse"].append(  float(err_inv.mean(dim=1).item()))
+        per_metric["symmetric"].append(float(((err_ab + err_inv) / 2.0).mean(dim=1).item()))
+        per_metric["identity"].append( float(err_id.mean(dim=1).item()))
+        per_metric["v1"].append(       float(torch.minimum(err_ab, err_ba).mean(dim=1).item()))
+
+        scenes.append(batch["scene"][0])
+        reliabilities.append(float(out["s"][0]))
+
     scenes = np.array(scenes)
+    rel = np.array(reliabilities, dtype=np.float64)
 
-    def _per_scene(arr: np.ndarray):
-        out = {"overall": float(arr.mean()) if len(arr) else float("nan")}
+    def _per_scene(errs: np.ndarray):
+        d = {"overall": float(errs.mean()) if len(errs) else float("nan")}
         for s in sorted(set(scenes)):
             mask = scenes == s
-            out[s] = float(arr[mask].mean()) if mask.any() else float("nan")
-        return out
+            d[s] = float(errs[mask].mean()) if mask.any() else float("nan")
+        return d
 
-    summary = {
-        "n_pairs": int(len(errs)),
-        "L2_mean":   _per_scene(errs),
-        "L2_median": {k: float(np.median(errs[scenes == k]) if (scenes == k).any() else float("nan"))
-                      for k in sorted(set(scenes))},
-        "AUC@1":     auc_at_thresholds(errs, [1.0])[0],
-        "AUC@3":     auc_at_thresholds(errs, [3.0])[0],
-        "AUC@5":     auc_at_thresholds(errs, [5.0])[0],
-        "inlier@1":  inlier_ratio_at_thresholds(errs, [1.0])[0],
-        "inlier@3":  inlier_ratio_at_thresholds(errs, [3.0])[0],
-        "inlier@5":  inlier_ratio_at_thresholds(errs, [5.0])[0],
-    }
-    summary["L2_median"]["overall"] = float(np.median(errs))
+    # The "v1" series is the authoritative one for failure-detection labels.
+    errs_v1 = np.array(per_metric["v1"], dtype=np.float64)
 
-    # Failure-detection trustworthiness metrics.
+    summary = {"n_pairs": int(len(errs_v1)), "n_illcond_H": n_illcond}
+    for m in METRICS:
+        e = np.array(per_metric[m], dtype=np.float64)
+        summary[f"L2_mean_{m}"] = _per_scene(e)
+        summary[f"L2_median_{m}"] = {
+            **{s: float(np.median(e[scenes == s]) if (scenes == s).any() else float("nan"))
+               for s in sorted(set(scenes))},
+            "overall": float(np.median(e)),
+        }
+        summary[f"AUC@1_{m}"]    = auc_at_thresholds(e, [1.0])[0]
+        summary[f"AUC@3_{m}"]    = auc_at_thresholds(e, [3.0])[0]
+        summary[f"AUC@5_{m}"]    = auc_at_thresholds(e, [5.0])[0]
+        summary[f"inlier@1_{m}"] = inlier_ratio_at_thresholds(e, [1.0])[0]
+        summary[f"inlier@3_{m}"] = inlier_ratio_at_thresholds(e, [3.0])[0]
+        summary[f"inlier@5_{m}"] = inlier_ratio_at_thresholds(e, [5.0])[0]
+
+    # Failure-detection trustworthiness metrics (labels from `v1`).
     trust = {}
     for tau in tau_list:
-        labels = (errs > tau).astype(np.int32)
-        # Score is "higher = more likely failure": use 1 - reliability.
+        labels = (errs_v1 > tau).astype(np.int32)
         fail_score = 1.0 - rel
         trust[f"AUROC_tau={tau}"] = auroc(fail_score, labels)
         trust[f"AUPRC_tau={tau}"] = auprc(fail_score, labels)
         trust[f"ECE_tau={tau}"]   = expected_calibration_error(fail_score, labels)
-        # NLL of the failure label under the reliability score.
         eps = 1e-6
         s = np.clip(rel, eps, 1.0 - eps)
         nll = -(labels * np.log(1.0 - s) + (1 - labels) * np.log(s)).mean()
         trust[f"NLL_tau={tau}"] = float(nll)
     summary["trustworthiness"] = trust
 
-    # Risk-coverage curve.
-    cov, risk = risk_coverage_curve(errs, rel)
+    cov, risk = risk_coverage_curve(errs_v1, rel)
     summary["risk_coverage"] = {f"cov={c:.2f}": r for c, r in zip(cov, risk)}
 
     return summary

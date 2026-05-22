@@ -3,9 +3,10 @@
 Convention: `H` is the source -> destination homography (i.e. for a source
 pixel at (x, y), H * [x, y, 1]^T is its homogeneous destination location).
 To synthesize the warped image at destination coordinates, we apply H^{-1}
-to the destination grid and sample the source image."""
+to the destination grid and sample the source image.
+"""
 
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -23,11 +24,34 @@ def _make_pixel_grid(H_out: int, W_out: int, device: torch.device, dtype: torch.
     return grid
 
 
+def _resolve_origin(
+    out_origin_xy: Union[Tuple[float, float], torch.Tensor],
+    B: int,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """Returns (ox, oy) each shaped (B, 1) for broadcasting onto (B, N) grids.
+
+    Accepts either a 2-tuple (same origin for all batch elements) or a per-
+    batch tensor of shape (B, 2). The per-batch form is what lets us extract
+    a different patch destination per sample (random crop in training)."""
+    if isinstance(out_origin_xy, torch.Tensor):
+        o = out_origin_xy.to(device=device, dtype=dtype)
+        if o.dim() == 1:
+            o = o.unsqueeze(0).expand(B, -1)
+        ox = o[:, 0].view(B, 1)
+        oy = o[:, 1].view(B, 1)
+    else:
+        ox = torch.full((B, 1), float(out_origin_xy[0]), device=device, dtype=dtype)
+        oy = torch.full((B, 1), float(out_origin_xy[1]), device=device, dtype=dtype)
+    return ox, oy
+
+
 def warp_by_homography(
     img: torch.Tensor,
     H_src_to_dst: torch.Tensor,
     out_size: Tuple[int, int],
-    out_origin_xy: Tuple[int, int] = (0, 0),
+    out_origin_xy: Union[Tuple[float, float], torch.Tensor] = (0, 0),
     padding_mode: str = "zeros",
     align_corners: bool = True,
 ) -> torch.Tensor:
@@ -38,9 +62,8 @@ def warp_by_homography(
         H_src_to_dst: (B, 3, 3) source -> destination homography.
         out_size: (H_out, W_out) of the warped image.
         out_origin_xy: top-left corner of the output patch in destination
-            coordinates. Use this when the destination region you want is a
-            patch inside a larger destination image (default (0, 0) assumes
-            the destination origin is the image origin).
+            coordinates. Either a 2-tuple (same for all batch elements) or a
+            (B, 2) tensor for per-sample origin (e.g. random crop locations).
     Returns:
         (B, C, H_out, W_out) warped image, sampled in destination coordinates.
     """
@@ -50,8 +73,9 @@ def warp_by_homography(
 
     grid = _make_pixel_grid(H_out, W_out, device, dtype)        # (3, N)
     grid = grid.unsqueeze(0).expand(B, -1, -1).clone()          # (B, 3, N)
-    grid[:, 0, :] += out_origin_xy[0]
-    grid[:, 1, :] += out_origin_xy[1]
+    ox, oy = _resolve_origin(out_origin_xy, B, device, dtype)
+    grid[:, 0, :] = grid[:, 0, :] + ox
+    grid[:, 1, :] = grid[:, 1, :] + oy
 
     # linalg.inv requires fp32; force it inside any autocast scope.
     with torch.amp.autocast(device_type=device.type, enabled=False):
@@ -62,7 +86,6 @@ def warp_by_homography(
     sx = src_coords[:, 0, :]
     sy = src_coords[:, 1, :]
 
-    # Normalize to [-1, 1] for grid_sample (align_corners=True).
     nx = 2.0 * sx / max(W_in - 1, 1) - 1.0
     ny = 2.0 * sy / max(H_in - 1, 1) - 1.0
     sample_grid = torch.stack([nx, ny], dim=-1).reshape(B, H_out, W_out, 2)
@@ -79,10 +102,9 @@ def warp_patch_by_homography(
     H_src_to_dst: torch.Tensor,
     padding_mode: str = "zeros",
 ) -> torch.Tensor:
-    """Convenience wrapper that warps a patch-aligned feature map of size
-    (H, W) onto itself, returning the same spatial extent. The homography is
-    assumed to be expressed in the same pixel coordinates as the feature map.
-    """
+    """Patch-aligned wrapper: warp feature map of size (H, W) onto itself.
+    The homography is assumed expressed in the same pixel coordinates as the
+    feature map. Used only for in-patch operations like the cycle residual."""
     B, C, H_in, W_in = feat.shape
     return warp_by_homography(feat, H_src_to_dst, (H_in, W_in), (0, 0), padding_mode)
 
@@ -91,7 +113,7 @@ def make_validity_mask(
     H_src_to_dst: torch.Tensor,
     out_size: Tuple[int, int],
     in_size: Tuple[int, int],
-    out_origin_xy: Tuple[int, int] = (0, 0),
+    out_origin_xy: Union[Tuple[float, float], torch.Tensor] = (0, 0),
 ) -> torch.Tensor:
     """Returns (B, 1, H_out, W_out) float mask indicating where the warp
     drew from inside the source image (1) vs outside (0). Used to suppress
@@ -104,8 +126,9 @@ def make_validity_mask(
 
     grid = _make_pixel_grid(H_out, W_out, device, dtype)
     grid = grid.unsqueeze(0).expand(B, -1, -1).clone()
-    grid[:, 0, :] += out_origin_xy[0]
-    grid[:, 1, :] += out_origin_xy[1]
+    ox, oy = _resolve_origin(out_origin_xy, B, device, dtype)
+    grid[:, 0, :] = grid[:, 0, :] + ox
+    grid[:, 1, :] = grid[:, 1, :] + oy
 
     with torch.amp.autocast(device_type=device.type, enabled=False):
         H_inv = torch.linalg.inv(H_src_to_dst.float())
