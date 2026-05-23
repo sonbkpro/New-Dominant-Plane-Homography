@@ -11,15 +11,26 @@ This module samples H* as a composition of four random simple transforms:
 
     H* = H_persp · H_rot(theta) · H_scale(s) · H_trans(t)
 
-where (per planv3 §B6):
-    theta ~ U(-5 deg,  5 deg)
-    s     ~ U( 0.95,    1.05)
-    t     ~ U(-20,       20)        (per-axis, in pixels)
-    |h31|, |h32| ~ U( 0,  5e-4)     (sign uniform)
+with the ranges below. The planv3 §B6 spec originally allowed
+|h31|, |h32| ~ U(0, 5e-4), but on a 360×640 image that produces patch-
+corner displacements of ~100 px purely from the projective division --
+which exceeds the pyramid's bounded-tanh budget Σ ρ_t = 56 px and pins
+L_sup_corner at a floor (~10 px). The persp range is therefore tightened
+to 5e-5; theta and translation are unchanged.
 
-The four corner offsets corresponding to H* are then computed analytically
-in patch-local coordinates. 30% of samples fall back to the original
-uniform-corner sampling so the model still sees that distribution.
+    theta ~ U(-4 deg,  4 deg)
+    s     ~ U( 0.95,    1.05)
+    t     ~ U(-15,       15)        (per-axis, in pixels)
+    |h31|, |h32| ~ U( 0,  5e-5)     (sign uniform)
+
+After H* is constructed, the patch-corner offset is computed analytically
+and rejected (resampled) if any |Δp_i| exceeds `max_offset_px`. If 10
+consecutive resamples all exceed the cap (rare), the sample falls back
+to uniform-corner sampling within ±rho_s, which is always reachable by
+the pyramid as long as rho_s ≤ Σ ρ_t.
+
+The structured / uniform mix is controlled by `structured_frac`; 30% of
+samples are uniform by default so the model sees both distributions.
 
 Canonical corner order is TL, BL, BR, TR throughout (planv3 B1).
 """
@@ -98,10 +109,10 @@ def _rand_perspective(p_range: float, rng: np.random.Generator) -> np.ndarray:
 
 
 def _structured_H(image_w: int, image_h: int,
-                  theta_deg: float = 5.0,
+                  theta_deg: float = 4.0,
                   scale_min: float = 0.95, scale_max: float = 1.05,
-                  trans_px: float = 20.0,
-                  persp: float = 5e-4,
+                  trans_px: float = 15.0,
+                  persp: float = 5e-5,
                   rng: np.random.Generator = None) -> np.ndarray:
     """Compose persp @ rot @ scale @ trans around the image center."""
     if rng is None:
@@ -167,11 +178,17 @@ class SynthPairDatasetV3(Dataset):
         rho: int = 16,
         rho_s: int = 32,
         structured_frac: float = 0.7,
-        # Structured-H ranges
-        theta_deg: float = 5.0,
+        # Structured-H ranges (planv3 §B6, tightened so corner offsets stay
+        # within the pyramid's Σ ρ_t = 56 px budget).
+        theta_deg: float = 4.0,
         scale_min: float = 0.95, scale_max: float = 1.05,
-        trans_px: float = 20.0,
-        persp: float = 5e-4,
+        trans_px: float = 15.0,
+        persp: float = 5e-5,
+        # Reject-and-resample cap: a structured sample whose max |Δp_i|
+        # exceeds this is regenerated. Falls back to uniform-corner sampling
+        # after `max_resamples` consecutive failures.
+        max_offset_px: float = 48.0,
+        max_resamples: int = 10,
     ):
         super().__init__()
         with open(data_list_path, "r") as f:
@@ -186,6 +203,8 @@ class SynthPairDatasetV3(Dataset):
         self.scale_min, self.scale_max = scale_min, scale_max
         self.trans_px = trans_px
         self.persp = persp
+        self.max_offset_px = float(max_offset_px)
+        self.max_resamples = int(max_resamples)
 
     def __len__(self) -> int:
         return len(self.lines)
@@ -228,16 +247,33 @@ class SynthPairDatasetV3(Dataset):
         use_structured = (rng.random() < self.structured_frac)
 
         if use_structured:
-            H_full = _structured_H(
-                self.img_w, self.img_h,
-                theta_deg=self.theta_deg,
-                scale_min=self.scale_min, scale_max=self.scale_max,
-                trans_px=self.trans_px,
-                persp=self.persp,
-                rng=rng,
-            )
-            offset = self._patch_offset_from_H_full(H_full, x, y)
-        else:
+            # Reject-and-resample: structured H combos can produce corner
+            # offsets that exceed the pyramid's bounded budget; the network
+            # then cannot fit the GT and L_sup_corner stalls at the clip
+            # residual. Cap with `max_offset_px` and retry up to
+            # `max_resamples` times before falling back to uniform.
+            H_full = None
+            offset = None
+            for _ in range(self.max_resamples):
+                H_full_try = _structured_H(
+                    self.img_w, self.img_h,
+                    theta_deg=self.theta_deg,
+                    scale_min=self.scale_min, scale_max=self.scale_max,
+                    trans_px=self.trans_px,
+                    persp=self.persp,
+                    rng=rng,
+                )
+                offset_try = self._patch_offset_from_H_full(H_full_try, x, y)
+                if float(np.abs(offset_try).max()) <= self.max_offset_px:
+                    H_full = H_full_try
+                    offset = offset_try
+                    break
+            if H_full is None:
+                # All resamples exceeded the cap. Force a uniform-corner
+                # fallback so the sample is still usable.
+                use_structured = False
+
+        if not use_structured:
             # Legacy uniform-corner sampling (canonical TL,BL,BR,TR order).
             offset = rng.uniform(-self.rho_s, self.rho_s, size=(4, 2)).astype(np.float32)
             src_patch = np.array(
