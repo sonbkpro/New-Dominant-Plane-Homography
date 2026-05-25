@@ -784,6 +784,17 @@ def _parse_args(cfg: Config):
     p.add_argument("--triplet_margin",    type=float, default=cfg.triplet_margin)
     p.add_argument("--sigma_min", type=float, default=cfg.sigma_min)
     p.add_argument("--alpha_support",     type=float, default=cfg.alpha_support)
+    # Warmups: protect H/q during early h_only training. In q_only / sigma_only
+    # / joint where H is frozen or already stable, set both to 0 so EM and
+    # align-soft fire from iter 0 instead of wasting iters.
+    p.add_argument("--em_warmup_iters",    type=int, default=cfg.em_warmup_iters,
+                   help="Iters before L_em starts ramping. Set to 0 in q_only "
+                        "stage so EM trains q from the first batch.")
+    p.add_argument("--align_warmup_iters", type=int, default=cfg.align_warmup_iters,
+                   help="Iters before L_align_soft starts ramping. Set to 0 "
+                        "in q_only/joint where H is frozen or stable.")
+    p.add_argument("--em_ramp_iters",      type=int, default=cfg.em_ramp_iters)
+    p.add_argument("--align_ramp_iters",   type=int, default=cfg.align_ramp_iters)
     p.add_argument("--use_cosine_lr",  action="store_true", default=cfg.use_cosine_lr)
     p.add_argument("--no_cosine_lr",   dest="use_cosine_lr", action="store_false")
     args = p.parse_args()
@@ -815,6 +826,10 @@ def _parse_args(cfg: Config):
     cfg.triplet_margin = args.triplet_margin
     cfg.sigma_min = args.sigma_min
     cfg.alpha_support = args.alpha_support
+    cfg.em_warmup_iters = args.em_warmup_iters
+    cfg.align_warmup_iters = args.align_warmup_iters
+    cfg.em_ramp_iters = args.em_ramp_iters
+    cfg.align_ramp_iters = args.align_ramp_iters
     cfg.use_cosine_lr = args.use_cosine_lr
     return args
 
