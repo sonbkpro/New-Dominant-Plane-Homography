@@ -45,10 +45,55 @@ def align_soft_loss(
     """Soft q-weighted Charbonnier on the residual, normalized by Σ v (not Σ q·v).
 
     Returns the batch-mean loss. Sigma is NOT used here.
+
+    KNOWN LIMITATION (planv3 §B-postmortem): this L1-style loss on raw feature
+    residuals rewards the backbone for producing small-magnitude features
+    (||F|| → 0 minimizes |F_b − F_a_warped| trivially). When run as part of
+    h_only or joint with the backbone unfrozen, features collapse and H stops
+    being learned. Prefer `align_soft_cosine_loss` below for any stage that
+    trains the backbone.
     """
     rho = _charbonnier(residual, eps=charbonnier_eps)
     w = q * valid_mask
     num = (rho * w).sum(dim=(1, 2, 3))
+    den = valid_mask.sum(dim=(1, 2, 3)).clamp(min=weight_eps)
+    return (num / den).mean()
+
+
+def align_soft_cosine_loss(
+    F_b: torch.Tensor,             # (B, C, H, W)
+    F_a_warped: torch.Tensor,      # (B, C, H, W)
+    q: torch.Tensor,               # (B, 1, H, W)
+    valid_mask: torch.Tensor,      # (B, 1, H, W)
+    weight_eps: float = 1e-6,
+    cos_eps: float = 1e-6,
+) -> torch.Tensor:
+    """Scale-invariant q-weighted cosine alignment loss (Fix A).
+
+    Per-pixel:  L_i = 1 - cos(F_b(i), F_a_warped(i))
+                    = 1 - <F_b(i), F_a_warped(i)> / (||F_b(i)|| ||F_a_warped(i)||)
+
+    Loss aggregation: L = sum_i q_i v_i L_i / sum_i v_i.
+
+    Why this fixes feature collapse: cosine measures *direction* only, not
+    magnitude. Setting F → 0 gives 0/0 (undefined, clamped via eps to 0
+    similarity → loss 1, not 0). The only way to minimize the loss is for
+    F_b and F_a_warped to *point in the same direction*, which requires
+    accurate H (geometric content) AND non-degenerate features. Magnitude
+    is free to be whatever the backbone wants; collapse provides no benefit.
+
+    Like align_soft, denominator is sum_i v_i (NOT sum_i q_i v_i) so q cannot
+    suppress hard regions by going to zero — it can only emphasize/de-emphasize
+    relative to a fixed denominator.
+    """
+    # Normalize along the channel axis.
+    # F.normalize handles the eps internally; result has ||·||_2 = 1 per pixel.
+    Fb_n = torch.nn.functional.normalize(F_b,        dim=1, eps=cos_eps)
+    Fa_n = torch.nn.functional.normalize(F_a_warped, dim=1, eps=cos_eps)
+    cos = (Fb_n * Fa_n).sum(dim=1, keepdim=True)                  # (B, 1, H, W)
+    per_pixel = 1.0 - cos                                          # in [0, 2]
+    w = q * valid_mask
+    num = (per_pixel * w).sum(dim=(1, 2, 3))
     den = valid_mask.sum(dim=(1, 2, 3)).clamp(min=weight_eps)
     return (num / den).mean()
 

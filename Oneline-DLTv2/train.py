@@ -83,14 +83,18 @@ sys.path.insert(0, _THIS_DIR)
 from configs.default import Config
 from model.cdpc_net import CDPCNet
 from losses.triplet import triplet_loss
-from losses.align_v3 import align_soft_loss, align_het_loss, selection_set_stats
+from losses.align_v3 import (
+    align_soft_loss, align_soft_cosine_loss, align_het_loss, selection_set_stats,
+)
 from losses.em import em_posterior_loss
 from losses.support import support_loss
 from losses.smooth import edge_aware_smoothness
 from losses.reliability import reliability_loss, build_invalid_pair_labels
 from losses.cycle import cycle_loss
 from losses.fold import fold_loss
-from losses.photo_image import photometric_image_loss
+from losses.photo_image import (
+    photometric_image_loss, photometric_image_q_weighted_loss,
+)
 from losses.sigma_prior import sigma_prior_loss
 from data.pairs import TrainPairDataset
 from data.synth_pairs import SynthPairDataset
@@ -523,15 +527,28 @@ def train(args, cfg: Config):
 
                 # ============================================================
                 # Image-space photometric anchor (planv3 B5)
+                # Fix B (--use_q_weighted_photo_img): weight by q so non-planar
+                # pixels (low q) don't contribute. Collapse-immune because the
+                # loss is on raw grayscale, not features.
                 # ============================================================
                 if stage in ("h_only", "joint", "full"):
-                    L["photo_img"] = photometric_image_loss(
-                        I_a_full_nat, I_b_patch_nat,
-                        H_full_nat, crop_xy[:B].float(),
-                    )
+                    if cfg.use_q_weighted_photo_img and stage in ("joint", "full"):
+                        L["photo_img"] = photometric_image_q_weighted_loss(
+                            I_a_full_nat, I_b_patch_nat,
+                            H_full_nat, crop_xy[:B].float(),
+                            q_nat,
+                        )
+                    else:
+                        L["photo_img"] = photometric_image_loss(
+                            I_a_full_nat, I_b_patch_nat,
+                            H_full_nat, crop_xy[:B].float(),
+                        )
 
                 # ============================================================
                 # Alignment split: soft (drives H/q) + heteroscedastic (sigma)
+                # Fix A (--use_cosine_align_soft): replace L1 feature residual
+                # with 1 - cos(F_b, F_a_warped). Scale-invariant -> backbone
+                # cannot reduce loss by shrinking features.
                 # ============================================================
                 if stage in ("h_only", "q_only", "joint", "full"):
                     # In h_only, q is at its init bias (~post_init_prob), so
@@ -540,9 +557,14 @@ def train(args, cfg: Config):
                     if stage == "joint":
                         # q_dagger = sg(max(q, q_min)) breaks the H<->q loop.
                         q_for_soft = torch.clamp(q_nat, min=cfg.q_min_floor).detach()
-                    L["align_soft"] = align_soft_loss(
-                        residual_nat, q_for_soft, valid_nat,
-                    )
+                    if cfg.use_cosine_align_soft:
+                        L["align_soft"] = align_soft_cosine_loss(
+                            F_b_nat, F_a_warped_nat, q_for_soft, valid_nat,
+                        )
+                    else:
+                        L["align_soft"] = align_soft_loss(
+                            residual_nat, q_for_soft, valid_nat,
+                        )
                 if stage in ("sigma_only", "joint", "full"):
                     L["align_het"] = align_het_loss(
                         residual_nat, log_sigma_nat, q_nat, valid_nat,
@@ -805,6 +827,19 @@ def _parse_args(cfg: Config):
     p.add_argument("--align_ramp_iters",   type=int, default=cfg.align_ramp_iters)
     p.add_argument("--use_cosine_lr",  action="store_true", default=cfg.use_cosine_lr)
     p.add_argument("--no_cosine_lr",   dest="use_cosine_lr", action="store_false")
+    # Probabilistic-gating fixes (see configs.default).
+    p.add_argument("--use_cosine_align_soft",  action="store_true",
+                   default=cfg.use_cosine_align_soft,
+                   help="Fix A: replace align_soft L1-residual with cosine "
+                        "similarity. Scale-invariant; prevents feature collapse.")
+    p.add_argument("--no_cosine_align_soft", dest="use_cosine_align_soft",
+                   action="store_false")
+    p.add_argument("--use_q_weighted_photo_img", action="store_true",
+                   default=cfg.use_q_weighted_photo_img,
+                   help="Fix B: weight image-space photo_img by q. Gives q "
+                        "a real H-gating role without feature collapse.")
+    p.add_argument("--no_q_weighted_photo_img", dest="use_q_weighted_photo_img",
+                   action="store_false")
     args = p.parse_args()
 
     cfg.batch_size = args.batch_size
@@ -844,6 +879,8 @@ def _parse_args(cfg: Config):
     cfg.em_ramp_iters = args.em_ramp_iters
     cfg.align_ramp_iters = args.align_ramp_iters
     cfg.use_cosine_lr = args.use_cosine_lr
+    cfg.use_cosine_align_soft = args.use_cosine_align_soft
+    cfg.use_q_weighted_photo_img = args.use_q_weighted_photo_img
     return args
 
 

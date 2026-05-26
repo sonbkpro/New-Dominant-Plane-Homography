@@ -142,6 +142,19 @@ class Config:
     # ---- AMP
     use_amp: bool = True
 
+    # ---- Probabilistic-gating fixes (postmortem of joint v1/v2 collapse).
+    # The default v3 q-weighted feature L1 loss (`align_soft`) collapses
+    # backbone features when run in h_only/joint. These flags swap to
+    # collapse-immune variants:
+    #   use_cosine_align_soft     : 1 - cos(F_b, F_a_warped) instead of L1.
+    #                               Scale-invariant; setting ||F||→0 doesn't
+    #                               minimize loss.
+    #   use_q_weighted_photo_img  : multiply photo_img by q (upsampled to
+    #                               patch resolution). Gives q a real H-gating
+    #                               role in image space.
+    use_cosine_align_soft: bool = False
+    use_q_weighted_photo_img: bool = False
+
     # ---- Paths (relative to repo root unless absolute)
     train_list: str = "Data/Train_List.txt"
     train_root: str = "Data/Train"
