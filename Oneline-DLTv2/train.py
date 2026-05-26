@@ -781,6 +781,14 @@ def _parse_args(cfg: Config):
     p.add_argument("--lambda_align_soft", type=float, default=cfg.lambda_align_soft)
     p.add_argument("--lambda_align_het",  type=float, default=cfg.lambda_align_het)
     p.add_argument("--lambda_sigma",      type=float, default=cfg.lambda_sigma)
+    p.add_argument("--lambda_cycle",      type=float, default=cfg.lambda_cycle,
+                   help="Feature-cycle loss weight. Set to 0 in joint if "
+                        "feature collapse is observed (cyc value dropping "
+                        "rapidly + r_med collapsing).")
+    p.add_argument("--lambda_em",         type=float, default=cfg.lambda_em)
+    p.add_argument("--lambda_support",    type=float, default=cfg.lambda_support)
+    p.add_argument("--lambda_smooth",     type=float, default=cfg.lambda_smooth)
+    p.add_argument("--lambda_fold",       type=float, default=cfg.lambda_fold)
     p.add_argument("--triplet_margin",    type=float, default=cfg.triplet_margin)
     p.add_argument("--sigma_min", type=float, default=cfg.sigma_min)
     p.add_argument("--alpha_support",     type=float, default=cfg.alpha_support)
@@ -826,6 +834,11 @@ def _parse_args(cfg: Config):
     cfg.triplet_margin = args.triplet_margin
     cfg.sigma_min = args.sigma_min
     cfg.alpha_support = args.alpha_support
+    cfg.lambda_cycle = args.lambda_cycle
+    cfg.lambda_em = args.lambda_em
+    cfg.lambda_support = args.lambda_support
+    cfg.lambda_smooth = args.lambda_smooth
+    cfg.lambda_fold = args.lambda_fold
     cfg.em_warmup_iters = args.em_warmup_iters
     cfg.align_warmup_iters = args.align_warmup_iters
     cfg.em_ramp_iters = args.em_ramp_iters
