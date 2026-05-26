@@ -1,42 +1,37 @@
-"""Multi-stage training driver for CDPC v3.
+"""Multi-stage training driver for CDPC-v4.
 
-Stages (planv3 §6):
+Stages (4 total + a `full` end-to-end ablation):
 
-  --stage synth     : supervised geometric bootstrap
-                      Active: backbone + homography_pyramid.
-                      Loss:   Huber(offset_pred, offset_gt) at the final
-                              level (and per-level if homography_levels>1)
-                              + L_sup_H (Frobenius) + L_fold.
+  --stage synth : supervised geometric bootstrap on synthetic warps
+                  Active: trunk + refiner.
+                  Loss:   Huber(offset_total, offset_gt)
+                          + Frobenius(H_full, H_full_gt)
+                          + fold(offset_total)
 
-  --stage h_only    : real-pair unsupervised H refinement
-                      Active: backbone + homography_pyramid.
-                      Loss:   L_photo_img (image-space Charbonnier) +
-                              L_triplet + L_fold.
+  --stage geom  : unsupervised H training on real pairs
+                  Active: trunk + refiner.
+                  Loss:   triplet(sf_b, sf_a_warped, sf_a, valid_mask_patch)
+                          + photo_img(I_a_full, I_b_patch, H_full)
+                          + fold(offset_total)
+                  This is the bulk-of-training stage; expect 50-150k iters
+                  to reach the v1-target neighborhood (<0.5 px).
 
-  --stage q_only    : posterior head only
-                      Active: posterior_head only. backbone + H +
-                              uncertainty + reliability frozen.
-                      Loss:   L_em + L_support + L_smooth.
+  --stage cdpc  : downstream posterior + uncertainty training
+                  Active: posterior_head + uncertainty_head.
+                  Loss:   em(q, r, sigma) + align_het(r, log_sigma, q)
+                          + sigma_prior(log_sigma, r)
+                          + support(q) + smooth(q, I_b_patch)
+                  Geometry is frozen so q/sigma cannot collapse it.
 
-  --stage sigma_only: uncertainty head only
-                      Active: uncertainty_head only.
-                      Loss:   L_align_het (Kendall-Gal on q-selected set
-                              with sg(sigma) in residual numerator) +
-                              L_sigma (data-adaptive log-r prior).
+  --stage rel   : reliability calibrator only
+                  Active: reliability_head.
+                  Loss:   BCE(s, invalid-pair label) on detached phi.
 
-  --stage joint     : joint fine-tune with q_dagger and (initially) sg(sigma)
-                      Active: everything except reliability.
-                      Loss:   L_photo_img + L_triplet + L_align_soft +
-                              L_align_het + L_em + L_support + L_smooth +
-                              L_sigma + L_cycle + L_fold.
+  --stage full  : end-to-end ablation (all modules train jointly).
+                  Uses all geom and cdpc losses + rel.
 
-  --stage rel       : reliability calibrator only
-                      Active: reliability_head.
-                      Loss:   L_rel on detached phi.
-
-  --stage full      : legacy end-to-end ablation (back-compat with v2 runs).
-
-Each stage logs the planv3 §8 panel.
+Each stage logs the same panel: total loss + per-loss components + a
+diagnostic block (offset norms, q/sigma stats, residual median, kappa).
 """
 
 import argparse
@@ -83,18 +78,14 @@ sys.path.insert(0, _THIS_DIR)
 from configs.default import Config
 from model.cdpc_net import CDPCNet
 from losses.triplet import triplet_loss
-from losses.align_v3 import (
-    align_soft_loss, align_soft_cosine_loss, align_het_loss, selection_set_stats,
-)
+from losses.align_v3 import align_het_loss, selection_set_stats
 from losses.em import em_posterior_loss
 from losses.support import support_loss
 from losses.smooth import edge_aware_smoothness
 from losses.reliability import reliability_loss, build_invalid_pair_labels
 from losses.cycle import cycle_loss
 from losses.fold import fold_loss
-from losses.photo_image import (
-    photometric_image_loss, photometric_image_q_weighted_loss,
-)
+from losses.photo_image import photometric_image_loss
 from losses.sigma_prior import sigma_prior_loss
 from data.pairs import TrainPairDataset
 from data.synth_pairs import SynthPairDataset
@@ -110,8 +101,7 @@ from utils.inverse import safe_inverse_3x3
 # ---------------------------------------------------------------------------
 
 def patch_to_full_homography(H_patch: torch.Tensor, crop_xy: torch.Tensor) -> torch.Tensor:
-    """Conjugate H_patch with the crop translation to obtain its full-image
-    equivalent."""
+    """H_full = T(+crop) @ H_patch @ T(-crop)."""
     B = H_patch.shape[0]
     device, dtype = H_patch.device, H_patch.dtype
     T = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
@@ -134,49 +124,42 @@ def _set_requires_grad(module, flag: bool):
         p.requires_grad_(flag)
 
 
+# Module names in CDPC-v4. The geometry trunks (trunk + refiner) form one
+# logical group for staged freezing; the CDPC heads form another.
 def _freeze_for_stage(net, stage: str):
-    """Configure which modules are trainable for a given stage (planv3 §6).
-
-    Note: the joint_backbone is gone in v3; the active sets reference only
-    the modules that actually exist on the v3 network.
-    """
     all_mods = {
-        "backbone":           net.backbone,
-        "homography_pyramid": net.homography_pyramid,
-        "posterior_head":     net.posterior_head,
-        "uncertainty_head":   net.uncertainty_head,
-        "reliability_head":   net.reliability_head,
+        "trunk":            net.trunk,
+        "refiner":          net.refiner,
+        "posterior_head":   net.posterior_head,
+        "uncertainty_head": net.uncertainty_head,
+        "reliability_head": net.reliability_head,
     }
-
     if stage == "synth":
-        active = {"backbone", "homography_pyramid"}
-    elif stage == "h_only":
-        active = {"backbone", "homography_pyramid"}
-    elif stage == "q_only":
-        active = {"posterior_head"}
-    elif stage == "sigma_only":
-        active = {"uncertainty_head"}
-    elif stage == "joint":
-        active = {"backbone", "homography_pyramid",
-                  "posterior_head", "uncertainty_head"}
+        active = {"trunk", "refiner"}
+    elif stage == "geom":
+        active = {"trunk", "refiner"}
+    elif stage == "cdpc":
+        active = {"posterior_head", "uncertainty_head"}
     elif stage == "rel":
         active = {"reliability_head"}
     elif stage == "full":
         active = set(all_mods.keys())
     else:
-        raise ValueError(f"unknown --stage: {stage}")
-
+        raise ValueError(
+            f"unknown --stage: {stage}. "
+            f"Valid: synth, geom, cdpc, rel, full."
+        )
     for name, mod in all_mods.items():
         _set_requires_grad(mod, name in active)
     return active
 
 
-def _make_param_groups(net, cfg: Config, stage: str):
+def _make_param_groups(net, cfg: Config, stage: str):  # noqa: ARG001 (stage kept for symmetry with v3 callers)
     """Differential LRs per group. Only trainable params end up in the
     optimizer so frozen modules contribute zero-size groups (excluded)."""
-    h_mods    = [net.homography_pyramid]
-    bb_mods   = [net.backbone]
-    head_mods = [net.posterior_head, net.uncertainty_head, net.reliability_head]
+    trunk_mods   = [net.trunk]
+    refiner_mods = [net.refiner]
+    head_mods    = [net.posterior_head, net.uncertainty_head, net.reliability_head]
 
     def _params(mods):
         ps = []
@@ -184,25 +167,20 @@ def _make_param_groups(net, cfg: Config, stage: str):
             ps += [p for p in m.parameters() if p.requires_grad]
         return ps
 
-    lr_h  = cfg.lr_h
-    lr_bb = cfg.lr_backbone
-    lr_d  = cfg.lr_heads
-
-    # Joint fine-tune lowers geometry LR by 10x (planv3 §7).
-    if stage == "joint":
-        lr_h  *= 0.1
-        lr_bb *= 0.1
+    lr_trunk   = cfg.lr_trunk
+    lr_refiner = cfg.lr_refiner
+    lr_heads   = cfg.lr_heads
 
     groups = []
-    p_h = _params(h_mods)
-    p_b = _params(bb_mods)
-    p_d = _params(head_mods)
+    p_t = _params(trunk_mods)
+    p_r = _params(refiner_mods)
+    p_h = _params(head_mods)
+    if p_t:
+        groups.append({"params": p_t, "lr": lr_trunk})
+    if p_r:
+        groups.append({"params": p_r, "lr": lr_refiner})
     if p_h:
-        groups.append({"params": p_h, "lr": lr_h})
-    if p_b:
-        groups.append({"params": p_b, "lr": lr_bb})
-    if p_d:
-        groups.append({"params": p_d, "lr": lr_d})
+        groups.append({"params": p_h, "lr": lr_heads})
     if not groups:
         groups.append({"params": list(net.parameters()), "lr": cfg.lr})
     return groups
@@ -216,19 +194,12 @@ def _save_checkpoint(net, save_dir: str, filename: str, **extra) -> str:
         print(f"[ckpt] saved {path}", flush=True)
         return path
     except (OSError, RuntimeError) as e:
-        print(f"[ckpt] FAILED to save {path}: {type(e).__name__}: {e}",
-              flush=True)
+        print(f"[ckpt] FAILED to save {path}: {type(e).__name__}: {e}", flush=True)
         return ""
 
 
 def _try_load_init(net, ckpt_path: str):
-    """Soft-load (strict=False) a checkpoint when explicitly requested.
-
-    Architectural changes between v2 and v3 mean a v2 checkpoint will report
-    many missing/unexpected keys; this is expected and we warn loudly rather
-    than fail, since users may legitimately want to inherit ImageNet-init
-    portions of the trunk.
-    """
+    """Soft-load (strict=False) a checkpoint when explicitly requested."""
     if not ckpt_path:
         return
     candidates = [ckpt_path]
@@ -261,7 +232,6 @@ EVAL_METRICS = ("direct", "inverse", "symmetric", "identity", "v1", "v1_compat")
 
 @torch.no_grad()
 def run_eval_l2(net, test_loader, device, max_batches=None) -> dict:
-    """Eval-L2 with all six conventions (planv3 B2)."""
     net.eval()
     per_scene = {m: {s: [] for s in SCENES} for m in EVAL_METRICS}
 
@@ -336,18 +306,18 @@ def train(args, cfg: Config):
     # --- model ---
     net = CDPCNet(
         patch_h=cfg.patch_h, patch_w=cfg.patch_w,
-        backbone_pretrained=cfg.backbone_pretrained,
-        bb_quarter_channels=cfg.bb_quarter_channels,
-        bb_eighth_channels=cfg.bb_eighth_channels,
-        bb_sixteenth_channels=cfg.bb_sixteenth_channels,
-        corr_radius=cfg.corr_radius,
-        corr_out_channels=cfg.corr_out_channels,
-        rho_per_level=cfg.rho_per_level,
-        homography_levels=cfg.homography_levels,
+        trunk_pretrained=cfg.trunk_pretrained,
+        trunk_rho_init=cfg.trunk_rho_init,
+        share_feature_channels=cfg.share_feature_channels,
+        refiner_feat_channels=cfg.refiner_feat_channels,
+        refiner_radius=cfg.refiner_radius,
+        refiner_pretrained=cfg.refiner_pretrained,
+        refiner_corner_window=cfg.refiner_corner_window,
+        refiner_temperature=cfg.refiner_temperature,
+        refiner_rho_max=cfg.refiner_rho_max,
         use_normalized_dlt=cfg.use_normalized_dlt,
         post_init_prob=cfg.post_init_prob,
         sigma_min=cfg.sigma_min,
-        detach_head_inputs=cfg.detach_head_inputs,
     ).to(device)
     _try_load_init(net, cfg.init_ckpt)
     active = _freeze_for_stage(net, stage)
@@ -387,9 +357,7 @@ def train(args, cfg: Config):
 
     # --- optimizer ---
     param_groups = _make_param_groups(net, cfg, stage)
-    optimizer = torch.optim.AdamW(
-        param_groups, weight_decay=cfg.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     if cfg.use_cosine_lr:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=cfg.max_epoch, eta_min=1e-7,
@@ -449,161 +417,111 @@ def train(args, cfg: Config):
 
             # All losses computed in fp32 to keep DLT / linalg stable under AMP.
             with torch.amp.autocast("cuda", enabled=False):
-                F_b_nat        = out["F_b4"][:B].float()
-                F_a_warped_nat = out["F_a_warped"][:B].float()
-                F_a_nat        = out["F_a4"][:B].float()
-                F_a_rec_nat    = out["F_a_recovered"][:B].float()
+                # ShareFeature triplet inputs (patch resolution, 1-ch).
+                sf_b           = out["sf_b"][:B].float()
+                sf_a_warped    = out["sf_a_warped"][:B].float()
+                sf_a           = out["sf_a"][:B].float()
+                valid_patch    = out["valid_mask_patch"][:B].float()
+
+                # 1/4-resolution refiner features (used by cdpc, cycle, fold).
+                F_a4           = out["F_a4"][:B].float()
+                F_a_rec        = out["F_a_recovered"][:B].float()
                 q_nat          = out["q"][:B].float()
                 log_sigma_nat  = out["log_sigma"][:B].float()
                 residual_nat   = out["residual"][:B].float()
-                valid_nat      = out["valid_mask"][:B].float()
-                cycle_valid_nat = out["cycle_valid"][:B].float()
-                cond_valid_nat  = out["cond_valid"][:B].float()
+                valid_quarter  = out["valid_mask"][:B].float()
+                cycle_valid    = out["cycle_valid"][:B].float()
+                cond_valid     = out["cond_valid"][:B].float()
                 offset_nat     = out["offset"][:B].float()
                 H_patch_nat    = out["H_patch"][:B].float()
-                per_level_off_nat = [t[:B].float() for t in out["per_level_offset"]]
                 s_all          = out["s"].float()
 
-                # Pull I_a_full / I_b_patch in fp32 (used for image-space photo).
-                I_a_full_nat = I_a_full_all[:B].float()
+                I_a_full_nat  = I_a_full_all[:B].float()
                 I_b_patch_nat = I_b_patch_all[:B].float()
 
-                # Full-image H, used by the image-space photometric loss.
                 H_full_nat = patch_to_full_homography(H_patch_nat, crop_xy[:B].float())
 
                 L = dict.fromkeys(
-                    ["triplet", "align_soft", "align_het", "em", "support",
-                     "smooth", "rel", "cycle", "sigma_prior", "fold",
-                     "photo_img", "sup_corner", "sup_H"],
+                    ["triplet", "photo_img", "fold", "sup_corner", "sup_H",
+                     "em", "support", "smooth", "align_het", "sigma_prior",
+                     "cycle", "rel"],
                     torch.zeros((), device=device),
                 )
 
-                # ---- Fold penalty: cheap, always on when H trains ----
-                if stage in ("synth", "h_only", "q_only", "sigma_only",
-                             "joint", "full"):
+                # ---- Always-on: fold penalty when H trains ----
+                if stage in ("synth", "geom", "full"):
                     L["fold"] = fold_loss(offset_nat, cfg.patch_h, cfg.patch_w)
 
                 # ============================================================
-                # Stage SYNTH: supervised corner + Frobenius supervision
+                # SYNTH: supervised corner offset + Frobenius
                 # ============================================================
                 if stage == "synth":
                     if "offset_gt" not in batch:
                         raise KeyError(
-                            "stage=synth requires an offset_gt label; the "
-                            "training dataloader is not a SynthPair dataset.")
+                            "stage=synth requires offset_gt; the training "
+                            "dataloader is not a SynthPair dataset.")
                     offset_gt = batch["offset_gt"].to(device).float()
-                    # Final-level offset supervision.
-                    sup_corner = F.smooth_l1_loss(offset_nat, offset_gt, beta=1.0)
-                    # Per-level supervision (each cumulative δp at level t
-                    # should also approach the GT offset). Skipped if only 1 level.
-                    if len(per_level_off_nat) > 1:
-                        cumul = torch.zeros_like(per_level_off_nat[0])
-                        for delta in per_level_off_nat:
-                            cumul = cumul + delta
-                            sup_corner = sup_corner + 0.5 * F.smooth_l1_loss(
-                                cumul, offset_gt, beta=1.0)
-                        sup_corner = sup_corner / float(len(per_level_off_nat))
-                    L["sup_corner"] = sup_corner
-
-                    # Frobenius supervision on the final H (normalized).
+                    L["sup_corner"] = F.smooth_l1_loss(offset_nat, offset_gt, beta=1.0)
                     if "H_full_gt" in batch:
                         H_full_gt = batch["H_full_gt"].to(device).float()
-                        # Normalize both so H[2,2]=1 and compare in fro norm.
                         H_pred = H_full_nat / (H_full_nat[:, 2:3, 2:3] + 1e-8)
                         H_gt   = H_full_gt   / (H_full_gt[:, 2:3, 2:3]   + 1e-8)
-                        denom = (H_gt.flatten(1).norm(dim=1).clamp(min=1e-6))
+                        denom = H_gt.flatten(1).norm(dim=1).clamp(min=1e-6)
                         diff  = (H_pred - H_gt).flatten(1).norm(dim=1)
                         L["sup_H"] = (diff / denom).mean()
 
                 # ============================================================
-                # Stages that use the triplet loss
+                # GEOM: unsupervised real-pair training (triplet + photo_img)
                 # ============================================================
-                if stage in ("h_only", "joint", "full"):
-                    use_q = (stage in ("joint", "full")) and cfg.triplet_use_q_weighting
+                if stage in ("geom", "synth", "full"):
+                    # Synth stage also gets the triplet + photo_img signal as
+                    # an auxiliary unsupervised cue (cheap, doesn't hurt).
                     L["triplet"] = triplet_loss(
-                        F_b_nat, F_a_warped_nat, F_a_nat,
-                        q_nat, valid_nat, margin=cfg.triplet_margin,
-                        use_q_weighting=use_q,
+                        sf_b, sf_a_warped, sf_a,
+                        q=valid_patch,  # use valid mask as the per-pixel weight (no q gating)
+                        valid_mask=valid_patch,
+                        margin=cfg.triplet_margin,
+                        use_q_weighting=False,
+                    )
+                    L["photo_img"] = photometric_image_loss(
+                        I_a_full_nat, I_b_patch_nat,
+                        H_full_nat, crop_xy[:B].float(),
                     )
 
                 # ============================================================
-                # Image-space photometric anchor (planv3 B5)
-                # Fix B (--use_q_weighted_photo_img): weight by q so non-planar
-                # pixels (low q) don't contribute. Collapse-immune because the
-                # loss is on raw grayscale, not features.
+                # CDPC: posterior + uncertainty (downstream, geometry frozen)
                 # ============================================================
-                if stage in ("h_only", "joint", "full"):
-                    if cfg.use_q_weighted_photo_img and stage in ("joint", "full"):
-                        L["photo_img"] = photometric_image_q_weighted_loss(
-                            I_a_full_nat, I_b_patch_nat,
-                            H_full_nat, crop_xy[:B].float(),
-                            q_nat,
-                        )
-                    else:
-                        L["photo_img"] = photometric_image_loss(
-                            I_a_full_nat, I_b_patch_nat,
-                            H_full_nat, crop_xy[:B].float(),
-                        )
-
-                # ============================================================
-                # Alignment split: soft (drives H/q) + heteroscedastic (sigma)
-                # Fix A (--use_cosine_align_soft): replace L1 feature residual
-                # with 1 - cos(F_b, F_a_warped). Scale-invariant -> backbone
-                # cannot reduce loss by shrinking features.
-                # ============================================================
-                if stage in ("h_only", "q_only", "joint", "full"):
-                    # In h_only, q is at its init bias (~post_init_prob), so
-                    # the soft term acts like a uniform-weighted Charbonnier.
-                    q_for_soft = q_nat
-                    if stage == "joint":
-                        # q_dagger = sg(max(q, q_min)) breaks the H<->q loop.
-                        q_for_soft = torch.clamp(q_nat, min=cfg.q_min_floor).detach()
-                    if cfg.use_cosine_align_soft:
-                        L["align_soft"] = align_soft_cosine_loss(
-                            F_b_nat, F_a_warped_nat, q_for_soft, valid_nat,
-                        )
-                    else:
-                        L["align_soft"] = align_soft_loss(
-                            residual_nat, q_for_soft, valid_nat,
-                        )
-                if stage in ("sigma_only", "joint", "full"):
-                    L["align_het"] = align_het_loss(
-                        residual_nat, log_sigma_nat, q_nat, valid_nat,
-                        tau_q=cfg.q_select_tau,
-                    )
-                if stage in ("sigma_only", "joint", "full"):
-                    L["sigma_prior"] = sigma_prior_loss(
-                        log_sigma_nat, residual_nat, valid_nat,
-                    )
-
-                # ============================================================
-                # Posterior training: EM + support + smoothness
-                # ============================================================
-                if stage in ("q_only", "joint", "full"):
-                    # Self-paced EM gate (planv3 §4.3): smooth fade with med(r).
-                    em_warmed = glob_iter >= cfg.em_warmup_iters
+                if stage in ("cdpc", "full"):
+                    em_warmed = (stage == "cdpc") or (glob_iter >= cfg.em_warmup_iters)
                     if em_warmed:
                         beta = cfg.em_self_paced_beta if cfg.use_em_self_paced_gate else 0.0
                         L["em"] = em_posterior_loss(
-                            q_nat, residual_nat, log_sigma_nat, valid_nat,
+                            q_nat, residual_nat, log_sigma_nat, valid_quarter,
                             pi=cfg.em_prior_pi, r_max=cfg.em_r_max,
                             self_paced_beta=beta,
                         )
-                    L["support"] = support_loss(q_nat, valid_nat, alpha=cfg.alpha_support)
+                    L["support"] = support_loss(q_nat, valid_quarter, alpha=cfg.alpha_support)
                     L["smooth"]  = edge_aware_smoothness(
                         q_nat, I_b_patch_nat, gamma=cfg.smoothness_gamma,
                     )
+                    L["align_het"] = align_het_loss(
+                        residual_nat, log_sigma_nat, q_nat, valid_quarter,
+                        tau_q=cfg.q_select_tau,
+                    )
+                    L["sigma_prior"] = sigma_prior_loss(
+                        log_sigma_nat, residual_nat, valid_quarter,
+                    )
 
-                # ============================================================
-                # Cycle consistency (joint only)
-                # ============================================================
-                if stage in ("joint", "full"):
+                # Cycle loss is a diagnostic / safety prior on the refiner.
+                # Only enabled in `full` stage; geometry-only stages should
+                # not be slowed by it.
+                if stage == "full":
                     L["cycle"] = cycle_loss(
-                        F_a_nat, F_a_rec_nat, cycle_valid_nat, cond_valid_nat,
+                        F_a4, F_a_rec, cycle_valid, cond_valid,
                     )
 
                 # ============================================================
-                # Reliability calibration
+                # REL: reliability calibrator on detached phi
                 # ============================================================
                 if do_rel:
                     r_mean_nat = residual_nat.mean(dim=(1, 2, 3))
@@ -615,25 +533,24 @@ def train(args, cfg: Config):
                     L["rel"] = reliability_loss(s_all, y_target)
 
                 # ---- Total ----
-                lam_align_soft_eff = cfg.lambda_align_soft * _ramp(
-                    glob_iter, cfg.align_warmup_iters, cfg.align_ramp_iters)
                 lam_em_eff = cfg.lambda_em * _ramp(
-                    glob_iter, cfg.em_warmup_iters, cfg.em_ramp_iters)
-
+                    glob_iter,
+                    0 if stage == "cdpc" else cfg.em_warmup_iters,
+                    cfg.em_ramp_iters,
+                )
                 L_total = (
                     cfg.lambda_triplet     * L["triplet"]
-                    + lam_align_soft_eff   * L["align_soft"]
-                    + cfg.lambda_align_het * L["align_het"]
-                    + lam_em_eff           * L["em"]
-                    + cfg.lambda_support   * L["support"]
-                    + cfg.lambda_smooth    * L["smooth"]
-                    + cfg.lambda_rel       * L["rel"]
-                    + cfg.lambda_cycle     * L["cycle"]
-                    + cfg.lambda_sigma     * L["sigma_prior"]
-                    + cfg.lambda_fold      * L["fold"]
                     + cfg.lambda_photo_img * L["photo_img"]
+                    + cfg.lambda_fold      * L["fold"]
                     + cfg.lambda_sup_corner * L["sup_corner"]
                     + cfg.lambda_sup_H     * L["sup_H"]
+                    + lam_em_eff           * L["em"]
+                    + cfg.lambda_align_het * L["align_het"]
+                    + cfg.lambda_sigma     * L["sigma_prior"]
+                    + cfg.lambda_support   * L["support"]
+                    + cfg.lambda_smooth    * L["smooth"]
+                    + cfg.lambda_cycle     * L["cycle"]
+                    + cfg.lambda_rel       * L["rel"]
                 )
 
             scaler.scale(L_total).backward()
@@ -650,40 +567,39 @@ def train(args, cfg: Config):
                 offset_abs = offset_nat.abs()
                 offset_inf = float(offset_abs.max())
                 offset_mean = float(offset_abs.mean())
+                offset_init_mean = float(out["offset_init"][:B].abs().mean())
+                offset_resid_mean = float(out["offset_residual"][:B].abs().mean())
                 kappa_H_nat = out["kappa_H"][:B].detach().float()
                 kappa_log = float(torch.log(kappa_H_nat.clamp(min=1.0)).mean())
                 fold_count = float((L["fold"] > 0).float())
-                area_valid = float(valid_nat.mean())
+                area_valid_q = float(valid_quarter.mean())
+                area_valid_p = float(valid_patch.mean())
                 q_mean = float(q_nat.mean())
                 q_var  = float(((q_nat - q_nat.mean()) ** 2).mean())
                 q_area = float((q_nat > 0.5).float().mean())
                 sigma_mean = float(log_sigma_nat.exp().mean())
                 r_median   = float(residual_nat.median())
                 sel_frac, q_in_S = selection_set_stats(
-                    q_nat, valid_nat, tau_q=cfg.q_select_tau)
+                    q_nat, valid_quarter, tau_q=cfg.q_select_tau)
                 sel_frac_m = float(sel_frac.mean())
                 q_in_S_m   = float(q_in_S.mean())
-                # Per-pyramid-level offset infinity norm.
-                per_lvl_inf = [float(t.abs().max()) for t in per_level_off_nat]
-                per_lvl_mean = [float(t.abs().mean()) for t in per_level_off_nat]
 
             for k, v in L.items():
                 writer.add_scalar(f"loss/{k}", float(v), glob_iter)
             writer.add_scalar("loss/total", float(L_total), glob_iter)
             writer.add_scalar("opt/lr", optimizer.param_groups[0]["lr"], glob_iter)
-            writer.add_scalar("opt/lambda_align_soft_eff", lam_align_soft_eff, glob_iter)
-            writer.add_scalar("opt/lambda_em_eff",         lam_em_eff,         glob_iter)
+            writer.add_scalar("opt/lambda_em_eff", lam_em_eff, glob_iter)
             writer.add_scalar("H/offset_inf_px",  offset_inf,  glob_iter)
             writer.add_scalar("H/offset_mean_px", offset_mean, glob_iter)
+            writer.add_scalar("H/offset_init_mean_px",  offset_init_mean, glob_iter)
+            writer.add_scalar("H/offset_residual_mean_px", offset_resid_mean, glob_iter)
             writer.add_scalar("H/kappa_log",      kappa_log,   glob_iter)
             writer.add_scalar("H/fold_count",     fold_count,  glob_iter)
-            for t, (inf_, mean_) in enumerate(zip(per_lvl_inf, per_lvl_mean)):
-                writer.add_scalar(f"H/level{t}/offset_inf_px",  inf_,  glob_iter)
-                writer.add_scalar(f"H/level{t}/offset_mean_px", mean_, glob_iter)
             writer.add_scalar("q/mean",           q_mean,      glob_iter)
             writer.add_scalar("q/var",            q_var,       glob_iter)
             writer.add_scalar("q/area_above_tau", q_area,      glob_iter)
-            writer.add_scalar("q/A_v",            area_valid,  glob_iter)
+            writer.add_scalar("q/A_v_quarter",    area_valid_q, glob_iter)
+            writer.add_scalar("q/A_v_patch",      area_valid_p, glob_iter)
             writer.add_scalar("q/selected_frac",  sel_frac_m,  glob_iter)
             writer.add_scalar("q/in_S_mean",      q_in_S_m,    glob_iter)
             writer.add_scalar("sigma/mean",       sigma_mean,  glob_iter)
@@ -691,14 +607,13 @@ def train(args, cfg: Config):
 
             if glob_iter % 100 == 0:
                 for mod_name, mod in [
-                    ("backbone",           net.backbone),
-                    ("homography_pyramid", net.homography_pyramid),
-                    ("posterior_head",     net.posterior_head),
-                    ("uncertainty_head",   net.uncertainty_head),
-                    ("reliability_head",   net.reliability_head),
+                    ("trunk",            net.trunk),
+                    ("refiner",          net.refiner),
+                    ("posterior_head",   net.posterior_head),
+                    ("uncertainty_head", net.uncertainty_head),
+                    ("reliability_head", net.reliability_head),
                 ]:
-                    g2 = 0.0
-                    n = 0
+                    g2 = 0.0; n = 0
                     for p in mod.parameters():
                         if p.grad is not None:
                             g2 += float(p.grad.norm() ** 2)
@@ -712,20 +627,20 @@ def train(args, cfg: Config):
                        f"sup_c={float(L['sup_corner']):.3f} "
                        f"sup_H={float(L['sup_H']):.3f} "
                        f"trip={float(L['triplet']):.3f} "
-                       f"asoft={float(L['align_soft']):.3f} "
-                       f"ahet={float(L['align_het']):.3f} "
+                       f"ph_img={float(L['photo_img']):.3f} "
                        f"em={float(L['em']):.3f} "
+                       f"ahet={float(L['align_het']):.3f} "
+                       f"sig={float(L['sigma_prior']):.3f} "
                        f"sup={float(L['support']):.3f} "
                        f"sm={float(L['smooth']):.4f} "
-                       f"rel={float(L['rel']):.3f} "
                        f"cyc={float(L['cycle']):.3f} "
-                       f"ph_img={float(L['photo_img']):.3f} "
-                       f"sig={float(L['sigma_prior']):.3f} "
+                       f"rel={float(L['rel']):.3f} "
                        f"fold={float(L['fold']):.3f}  "
                        f"q={q_mean:.3f} sig_e={sigma_mean:.3f} "
                        f"r_med={r_median:.3f} "
+                       f"off_init={offset_init_mean:.2f}px "
+                       f"off_res={offset_resid_mean:.2f}px "
                        f"off_inf={offset_inf:.2f}px "
-                       f"off_avg={offset_mean:.2f}px "
                        f"kap_log={kappa_log:.2f}")
                 print(msg, flush=True)
 
@@ -740,6 +655,12 @@ def train(args, cfg: Config):
                 line = "  ".join(f"{m}={summary[m]['overall']:.3f}"
                                  for m in EVAL_METRICS)
                 print(f"[eval @ it {glob_iter}] {line}  ({dt:.1f}s)", flush=True)
+                # Spotlight the v1_compat per-scene numbers (paper targets).
+                vc = summary["v1_compat"]
+                tgts = ("RE", "LT", "LL", "SF", "LF")
+                tline = "  ".join(f"{s}={vc[s]:.3f}" for s in tgts)
+                print(f"[eval @ it {glob_iter}] v1_compat per-scene: {tline}"
+                      f"  AVG={vc['overall']:.3f}", flush=True)
 
             if glob_iter > 0 and glob_iter % cfg.model_save_freq == 0:
                 _save_checkpoint(
@@ -773,6 +694,9 @@ def _parse_args(cfg: Config):
     p.add_argument("--batch_size", type=int, default=cfg.batch_size)
     p.add_argument("--max_epoch", type=int, default=cfg.max_epoch)
     p.add_argument("--lr",       type=float, default=cfg.lr)
+    p.add_argument("--lr_trunk",   type=float, default=cfg.lr_trunk)
+    p.add_argument("--lr_refiner", type=float, default=cfg.lr_refiner)
+    p.add_argument("--lr_heads",   type=float, default=cfg.lr_heads)
     p.add_argument("--patch_h",  type=int, default=cfg.patch_h)
     p.add_argument("--patch_w",  type=int, default=cfg.patch_w)
     p.add_argument("--img_h",    type=int, default=cfg.img_h)
@@ -786,73 +710,53 @@ def _parse_args(cfg: Config):
     p.add_argument("--log_dir",   type=str, default=cfg.log_dir)
     p.add_argument("--model_save_dir", type=str, default=cfg.model_save_dir)
     p.add_argument("--stage", type=str, default=cfg.stage,
-                   choices=["synth", "h_only", "q_only", "sigma_only",
-                            "joint", "rel", "full"])
+                   choices=["synth", "geom", "cdpc", "rel", "full"])
     p.add_argument("--init_ckpt", type=str, default=cfg.init_ckpt)
-    p.add_argument("--max_frame_gap", type=int, default=0,
-                   help="Stage h_only curriculum: max abs(frame_b - frame_a). 0 = no filter.")
-    p.add_argument("--homography_levels", type=int, default=cfg.homography_levels,
-                   help="Number of coarse-to-fine levels in the H pyramid (1, 2, or 3).")
-    p.add_argument("--synth_rho_max", type=int, default=cfg.synth_rho_max,
-                   help="Max per-corner perturbation for the synth dataset, in px.")
-    p.add_argument("--use_v3_synth", action="store_true", default=cfg.use_v3_synth,
-                   help="Use the structured-affine SynthPairDatasetV3 (planv3 B6).")
+    p.add_argument("--max_frame_gap", type=int, default=0)
+    p.add_argument("--synth_rho_max", type=int, default=cfg.synth_rho_max)
+    p.add_argument("--use_v3_synth", action="store_true", default=cfg.use_v3_synth)
     p.add_argument("--no_v3_synth", dest="use_v3_synth", action="store_false")
     p.add_argument("--model_save_freq", type=int, default=cfg.model_save_freq)
+    # ---- Trunk / refiner ----
+    p.add_argument("--trunk_pretrained", action="store_true",
+                   default=cfg.trunk_pretrained)
+    p.add_argument("--no_trunk_pretrained", dest="trunk_pretrained",
+                   action="store_false")
+    p.add_argument("--trunk_rho_init",     type=float, default=cfg.trunk_rho_init)
+    p.add_argument("--refiner_feat_channels", type=int, default=cfg.refiner_feat_channels)
+    p.add_argument("--refiner_radius",     type=int, default=cfg.refiner_radius)
+    p.add_argument("--refiner_corner_window", type=int, default=cfg.refiner_corner_window)
+    p.add_argument("--refiner_temperature",   type=float, default=cfg.refiner_temperature)
+    p.add_argument("--refiner_rho_max",       type=float, default=cfg.refiner_rho_max)
+    # ---- Loss weights ----
     p.add_argument("--lambda_triplet",    type=float, default=cfg.lambda_triplet)
     p.add_argument("--lambda_photo_img",  type=float, default=cfg.lambda_photo_img)
-    p.add_argument("--lambda_align_soft", type=float, default=cfg.lambda_align_soft)
+    p.add_argument("--lambda_fold",       type=float, default=cfg.lambda_fold)
     p.add_argument("--lambda_align_het",  type=float, default=cfg.lambda_align_het)
-    p.add_argument("--lambda_sigma",      type=float, default=cfg.lambda_sigma)
-    p.add_argument("--lambda_cycle",      type=float, default=cfg.lambda_cycle,
-                   help="Feature-cycle loss weight. Set to 0 in joint if "
-                        "feature collapse is observed (cyc value dropping "
-                        "rapidly + r_med collapsing).")
     p.add_argument("--lambda_em",         type=float, default=cfg.lambda_em)
     p.add_argument("--lambda_support",    type=float, default=cfg.lambda_support)
     p.add_argument("--lambda_smooth",     type=float, default=cfg.lambda_smooth)
-    p.add_argument("--lambda_fold",       type=float, default=cfg.lambda_fold)
+    p.add_argument("--lambda_sigma",      type=float, default=cfg.lambda_sigma)
+    p.add_argument("--lambda_cycle",      type=float, default=cfg.lambda_cycle)
+    p.add_argument("--lambda_rel",        type=float, default=cfg.lambda_rel)
+    p.add_argument("--lambda_sup_corner", type=float, default=cfg.lambda_sup_corner)
+    p.add_argument("--lambda_sup_H",      type=float, default=cfg.lambda_sup_H)
     p.add_argument("--triplet_margin",    type=float, default=cfg.triplet_margin)
-    p.add_argument("--sigma_min", type=float, default=cfg.sigma_min)
+    p.add_argument("--sigma_min",         type=float, default=cfg.sigma_min)
     p.add_argument("--alpha_support",     type=float, default=cfg.alpha_support)
-    # Warmups: protect H/q during early h_only training. In q_only / sigma_only
-    # / joint where H is frozen or already stable, set both to 0 so EM and
-    # align-soft fire from iter 0 instead of wasting iters.
-    p.add_argument("--em_warmup_iters",    type=int, default=cfg.em_warmup_iters,
-                   help="Iters before L_em starts ramping. Set to 0 in q_only "
-                        "stage so EM trains q from the first batch.")
-    p.add_argument("--align_warmup_iters", type=int, default=cfg.align_warmup_iters,
-                   help="Iters before L_align_soft starts ramping. Set to 0 "
-                        "in q_only/joint where H is frozen or stable.")
+    # ---- Warmups (used in `full`) ----
+    p.add_argument("--em_warmup_iters",    type=int, default=cfg.em_warmup_iters)
     p.add_argument("--em_ramp_iters",      type=int, default=cfg.em_ramp_iters)
-    p.add_argument("--align_ramp_iters",   type=int, default=cfg.align_ramp_iters)
-    p.add_argument("--use_cosine_lr",  action="store_true", default=cfg.use_cosine_lr)
-    p.add_argument("--no_cosine_lr",   dest="use_cosine_lr", action="store_false")
-    # Probabilistic-gating fixes (see configs.default).
-    p.add_argument("--use_cosine_align_soft",  action="store_true",
-                   default=cfg.use_cosine_align_soft,
-                   help="Fix A: replace align_soft L1-residual with cosine "
-                        "similarity. Scale-invariant; prevents feature collapse.")
-    p.add_argument("--no_cosine_align_soft", dest="use_cosine_align_soft",
-                   action="store_false")
-    p.add_argument("--use_q_weighted_photo_img", action="store_true",
-                   default=cfg.use_q_weighted_photo_img,
-                   help="Fix B: weight image-space photo_img by q. Gives q "
-                        "a real H-gating role without feature collapse.")
-    p.add_argument("--no_q_weighted_photo_img", dest="use_q_weighted_photo_img",
-                   action="store_false")
-    p.add_argument("--detach_head_inputs", action="store_true",
-                   default=cfg.detach_head_inputs,
-                   help="Fix C: detach q/sigma head inputs from backbone graph. "
-                        "Prevents joint-stage feature collapse via the q-head "
-                        "gradient path. Recommended for joint runs.")
-    p.add_argument("--no_detach_head_inputs", dest="detach_head_inputs",
-                   action="store_false")
+    p.add_argument("--use_cosine_lr",      action="store_true", default=cfg.use_cosine_lr)
+    p.add_argument("--no_cosine_lr",       dest="use_cosine_lr", action="store_false")
     args = p.parse_args()
 
     cfg.batch_size = args.batch_size
     cfg.max_epoch = args.max_epoch
     cfg.lr = args.lr
+    cfg.lr_trunk = args.lr_trunk
+    cfg.lr_refiner = args.lr_refiner
+    cfg.lr_heads = args.lr_heads
     cfg.patch_h = args.patch_h
     cfg.patch_w = args.patch_w
     cfg.img_h = args.img_h
@@ -865,31 +769,34 @@ def _parse_args(cfg: Config):
     cfg.model_save_dir = args.model_save_dir
     cfg.stage = args.stage
     cfg.init_ckpt = args.init_ckpt
-    cfg.homography_levels = args.homography_levels
     cfg.synth_rho_max = args.synth_rho_max
     cfg.use_v3_synth = args.use_v3_synth
     cfg.model_save_freq = args.model_save_freq
+    cfg.trunk_pretrained = args.trunk_pretrained
+    cfg.trunk_rho_init = args.trunk_rho_init
+    cfg.refiner_feat_channels = args.refiner_feat_channels
+    cfg.refiner_radius = args.refiner_radius
+    cfg.refiner_corner_window = args.refiner_corner_window
+    cfg.refiner_temperature = args.refiner_temperature
+    cfg.refiner_rho_max = args.refiner_rho_max
     cfg.lambda_triplet = args.lambda_triplet
     cfg.lambda_photo_img = args.lambda_photo_img
-    cfg.lambda_align_soft = args.lambda_align_soft
+    cfg.lambda_fold = args.lambda_fold
     cfg.lambda_align_het = args.lambda_align_het
-    cfg.lambda_sigma = args.lambda_sigma
-    cfg.triplet_margin = args.triplet_margin
-    cfg.sigma_min = args.sigma_min
-    cfg.alpha_support = args.alpha_support
-    cfg.lambda_cycle = args.lambda_cycle
     cfg.lambda_em = args.lambda_em
     cfg.lambda_support = args.lambda_support
     cfg.lambda_smooth = args.lambda_smooth
-    cfg.lambda_fold = args.lambda_fold
+    cfg.lambda_sigma = args.lambda_sigma
+    cfg.lambda_cycle = args.lambda_cycle
+    cfg.lambda_rel = args.lambda_rel
+    cfg.lambda_sup_corner = args.lambda_sup_corner
+    cfg.lambda_sup_H = args.lambda_sup_H
+    cfg.triplet_margin = args.triplet_margin
+    cfg.sigma_min = args.sigma_min
+    cfg.alpha_support = args.alpha_support
     cfg.em_warmup_iters = args.em_warmup_iters
-    cfg.align_warmup_iters = args.align_warmup_iters
     cfg.em_ramp_iters = args.em_ramp_iters
-    cfg.align_ramp_iters = args.align_ramp_iters
     cfg.use_cosine_lr = args.use_cosine_lr
-    cfg.use_cosine_align_soft = args.use_cosine_align_soft
-    cfg.use_q_weighted_photo_img = args.use_q_weighted_photo_img
-    cfg.detach_head_inputs = args.detach_head_inputs
     return args
 
 

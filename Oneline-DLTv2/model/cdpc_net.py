@@ -217,6 +217,17 @@ class CDPCNet(nn.Module):
         # ===== 3. Image-coord H ============================================
         H_full = _patch_to_full(H_patch, crop_xy)
 
+        # ===== 3b. ShareFeature warp at PATCH scale (drives triplet loss) ==
+        # Gradient flows through H_patch (-> trunk + refiner) and through
+        # ShareFeature(I_a_patch). This is the v1-style supervision signal
+        # that drives geometry training in the `geom` stage.
+        sf_a_warped = warp_patch_by_homography(sf_a, H_patch, padding_mode="zeros")
+        valid_mask_patch = make_validity_mask(
+            H_patch,
+            out_size=(ph, pw),
+            in_size=(ph, pw),
+        )
+
         # ===== 4. Warp F_a at 1/4 for CDPC residual map (DETACHED) ========
         # The CDPC heads do not backprop into the refinement trunk: their
         # input is the warped-then-detached F_a_quarter.
@@ -302,6 +313,8 @@ class CDPCNet(nn.Module):
             # ---- ShareFeature outputs for triplet loss ----
             "sf_a":         sf_a,
             "sf_b":         sf_b,
+            "sf_a_warped":  sf_a_warped,
+            "valid_mask_patch": valid_mask_patch,
             # ---- features for legacy losses (cycle/triplet on F4) ----
             "feature_a":    F_a4,
             "feature_b":    F_b4,
