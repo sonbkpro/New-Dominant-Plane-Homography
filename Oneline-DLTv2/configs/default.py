@@ -154,6 +154,12 @@ class Config:
     #                               role in image space.
     use_cosine_align_soft: bool = False
     use_q_weighted_photo_img: bool = False
+    # Fix C (postmortem of Fix A+B): detach q/sigma head inputs from the
+    # backbone graph in joint, so EM/support/smooth/q-weighted-photo cannot
+    # collapse the backbone by gradient-flowing through the q-head inputs
+    # (F_b, F_a_warped, r). Defaults False to preserve planv3 forward-pass
+    # behavior; recommended True for any joint run.
+    detach_head_inputs: bool = False
 
     # ---- Paths (relative to repo root unless absolute)
     train_list: str = "Data/Train_List.txt"

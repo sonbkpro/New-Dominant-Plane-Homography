@@ -119,6 +119,14 @@ class CDPCNet(nn.Module):
         # Pixel heads.
         post_init_prob: float = 0.7,
         sigma_min: float = 0.5,
+        # Postmortem fix: detach the q/sigma head inputs from the backbone
+        # graph. Without this, in joint stage the backbone gradient via
+        # (q-head input = F_b, F_a_warped, r) drives features to collapse
+        # (the backbone learns to produce features that minimize EM loss
+        # by shrinking r, not by encoding useful structure). With detach,
+        # q and sigma heads still train against current features but cannot
+        # reshape the backbone -- restoring the planv3-intended decoupling.
+        detach_head_inputs: bool = False,
         # Legacy kwargs (ignored, retained so older configs still load).
         homography_rho: float = None,
         log_sigma_min: float = None,
@@ -127,6 +135,7 @@ class CDPCNet(nn.Module):
         super().__init__()
         self.patch_h = patch_h
         self.patch_w = patch_w
+        self.detach_head_inputs = detach_head_inputs
 
         # ---- Per-image Siamese trunk ---------------------------------------
         self.backbone = FeaturePyramid(
@@ -255,7 +264,17 @@ class CDPCNet(nn.Module):
         r = (F_b4 - F_a_warped).abs().mean(dim=1, keepdim=True)
 
         # ---- Posterior + uncertainty (planv3 §3.4: single 1/4 scale, no corr) -
-        post_in = torch.cat([F_b4, F_a_warped, r], dim=1)
+        if self.detach_head_inputs:
+            # Backbone gradient does NOT flow into q-head / sigma-head losses.
+            # Prevents the joint-stage feature-collapse feedback where the
+            # backbone shrinks features to make r small (EM target trivially
+            # inlier-everywhere). q and sigma still update from the current
+            # features; they just can't update the features.
+            post_in = torch.cat(
+                [F_b4.detach(), F_a_warped.detach(), r.detach()], dim=1,
+            )
+        else:
+            post_in = torch.cat([F_b4, F_a_warped, r], dim=1)
         q = self.posterior_head(post_in)
         log_sigma = self.uncertainty_head(post_in)
         q = q * valid_mask                                    # mask invalid pixels

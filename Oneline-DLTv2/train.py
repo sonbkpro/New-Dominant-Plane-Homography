@@ -347,6 +347,7 @@ def train(args, cfg: Config):
         use_normalized_dlt=cfg.use_normalized_dlt,
         post_init_prob=cfg.post_init_prob,
         sigma_min=cfg.sigma_min,
+        detach_head_inputs=cfg.detach_head_inputs,
     ).to(device)
     _try_load_init(net, cfg.init_ckpt)
     active = _freeze_for_stage(net, stage)
@@ -840,6 +841,13 @@ def _parse_args(cfg: Config):
                         "a real H-gating role without feature collapse.")
     p.add_argument("--no_q_weighted_photo_img", dest="use_q_weighted_photo_img",
                    action="store_false")
+    p.add_argument("--detach_head_inputs", action="store_true",
+                   default=cfg.detach_head_inputs,
+                   help="Fix C: detach q/sigma head inputs from backbone graph. "
+                        "Prevents joint-stage feature collapse via the q-head "
+                        "gradient path. Recommended for joint runs.")
+    p.add_argument("--no_detach_head_inputs", dest="detach_head_inputs",
+                   action="store_false")
     args = p.parse_args()
 
     cfg.batch_size = args.batch_size
@@ -881,6 +889,7 @@ def _parse_args(cfg: Config):
     cfg.use_cosine_lr = args.use_cosine_lr
     cfg.use_cosine_align_soft = args.use_cosine_align_soft
     cfg.use_q_weighted_photo_img = args.use_q_weighted_photo_img
+    cfg.detach_head_inputs = args.detach_head_inputs
     return args
 
 
