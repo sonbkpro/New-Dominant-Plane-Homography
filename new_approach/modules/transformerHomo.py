@@ -2,12 +2,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.model_zoo as model_zoo
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 try:
-    from .featureHomo import FeatureExtractor, feature_extractor
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 except ImportError:
+    def to_2tuple(x):
+        return tuple(x) if isinstance(x, (tuple, list)) else (x, x)
+
+    def trunc_normal_(tensor, mean=0.0, std=1.0):
+        return nn.init.trunc_normal_(tensor, mean=mean, std=std)
+
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob=0.0):
+            super().__init__()
+            self.drop_prob = float(drop_prob)
+
+        def forward(self, x):
+            if self.drop_prob == 0.0 or not self.training:
+                return x
+            keep_prob = 1.0 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            random_tensor.floor_()
+            return x.div(keep_prob) * random_tensor
+
+try:
+    from ..geometry_homo import flow_mask_to_homography
+    from .featureHomo import FeatureExtractor, feature_extractor
+    from .maskFlowHomo import DominantMaskFlow, build_mask_condition
+except ImportError:
+    try:
+        from geometry_homo import flow_mask_to_homography
+    except ImportError:
+        flow_mask_to_homography = None
     from featureHomo import FeatureExtractor, feature_extractor
+    from maskFlowHomo import DominantMaskFlow, build_mask_condition
 
 # Ported from megvii-research/HomoGAN:
 # https://github.com/megvii-research/HomoGAN
@@ -23,6 +52,26 @@ model_urls = {
     "resnet101": "https://download.pytorch.org/models/resnet101-5d3b4d8f.pth",
     "resnet152": "https://download.pytorch.org/models/resnet152-b121ed2d.pth",
 }
+
+
+def _param(params, name, default=None):
+    if isinstance(params, dict):
+        return params.get(name, default)
+    return getattr(params, name, default)
+
+
+def _param_tuple(params, name, default):
+    value = _param(params, name, default)
+    if isinstance(value, str):
+        return tuple(int(v.strip()) for v in value.split(",") if v.strip())
+    return tuple(value)
+
+
+def _param_bool(params, name, default=False):
+    value = _param(params, name, default)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 class ASPP(nn.Module):
@@ -89,18 +138,17 @@ def tensor_dilation(bin_img, ksize=5):
     return dilation
 
 
-def get_grid(batch_size, H, W, start=0):
-    if torch.cuda.is_available():
-        xx = torch.arange(0, W).cuda()
-        yy = torch.arange(0, H).cuda()
-    else:
-        xx = torch.arange(0, W)
-        yy = torch.arange(0, H)
+def get_grid(batch_size, H, W, start=0, device=None, dtype=torch.float32):
+    if torch.is_tensor(start):
+        device = start.device if device is None else device
+        dtype = start.dtype if dtype is None else dtype
+    xx = torch.arange(0, W, device=device, dtype=dtype)
+    yy = torch.arange(0, H, device=device, dtype=dtype)
     xx = xx.view(1, -1).repeat(H, 1)
     yy = yy.view(-1, 1).repeat(1, W)
     xx = xx.view(1, 1, H, W).repeat(batch_size, 1, 1, 1)
     yy = yy.view(1, 1, H, W).repeat(batch_size, 1, 1, 1)
-    ones = torch.ones_like(xx).cuda() if torch.cuda.is_available() else torch.ones_like(xx)
+    ones = torch.ones_like(xx)
     grid = torch.cat((xx, yy, ones), 1).float()
 
     grid[:, :2, :, :] = grid[:, :2, :, :] + start
@@ -166,10 +214,7 @@ def transformer(I, vgrid, train=True):
         dim1 = width * height
         dim2 = width
 
-        if torch.cuda.is_available():
-            base = torch.arange(0, num_batch).int().cuda()
-        else:
-            base = torch.arange(0, num_batch).int()
+        base = torch.arange(0, num_batch, device=im.device).int()
 
         base = base * dim1
         base = base.repeat_interleave(out_height * out_width, axis=0)
@@ -232,7 +277,14 @@ def transformer(I, vgrid, train=True):
 
 def get_warp_flow(img, flow, start=0):
     batch_size, _, patch_size_h, patch_size_w = flow.shape
-    grid_warp = get_grid(batch_size, patch_size_h, patch_size_w, start)[:, :2, :, :] + flow
+    grid_warp = get_grid(
+        batch_size,
+        patch_size_h,
+        patch_size_w,
+        start,
+        device=flow.device,
+        dtype=flow.dtype,
+    )[:, :2, :, :] + flow
     img_warp = transformer(img, grid_warp)
     return img_warp
 
@@ -1201,7 +1253,23 @@ class HomoNet(nn.Module):
         self.h_net = backbone(params, norm_layer=norm_layer)
         self.basis = gen_basis(self.params.crop_size[0], self.params.crop_size[1]).unsqueeze(0).reshape(1, 8, -1)
         self.apply(self._init_weights)
-        self.mask_pred = self.mask_predictor(32)
+        self.mask_method = str(_param(self.params, "mask_method", "flow_matching")).lower()
+        self.mask_pred = None
+        self.mask_flow = None
+        if self.mask_method == "homogan_cnn":
+            self.mask_pred = self.mask_predictor(32)
+        elif self.mask_method == "flow_matching":
+            self.mask_flow = DominantMaskFlow(
+                cond_channels=int(_param(self.params, "mask_flow_cond_channels", 7)),
+                base_channels=int(_param(self.params, "mask_flow_base_channels", 32)),
+                channel_mults=_param_tuple(self.params, "mask_flow_channel_mults", (1, 2, 4, 4)),
+                time_dim=int(_param(self.params, "mask_flow_time_dim", 128)),
+                temperature=float(_param(self.params, "mask_flow_temperature", 1.0)),
+                noise_sigma=float(_param(self.params, "mask_flow_noise_sigma", 1.0)),
+                dropout=float(_param(self.params, "mask_flow_dropout", 0.0)),
+            )
+        elif self.mask_method not in {"none", "all_one", "all_ones"}:
+            raise ValueError(f"Unsupported mask_method: {self.mask_method}")
 
     def _init_weights(self, m):
         if "swin" in self.init_mode:
@@ -1289,8 +1357,53 @@ class HomoNet(nn.Module):
         img1_patch_warp_fea, img2_patch_warp_fea = list(
             map(self.fea_extra, [warp_img1_patch, warp_img2_patch]))
         # ============================= mask==========================================
-        if self.params.pretrain_phase:
+        img1_mask_cond, img2_mask_cond = None, None
+        if _param_bool(self.params, "pretrain_phase", False):
             img1_patch_mask, img2_patch_mask, warp_img1_patch_mask, warp_img2_patch_mask = None, None, None, None
+        elif self.mask_method in {"none", "all_one", "all_ones"}:
+            img1_patch_mask = torch.ones_like(img1_patch)
+            img2_patch_mask = torch.ones_like(img2_patch)
+            warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
+            warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
+        elif self.mask_method == "flow_matching":
+            detach_condition = _param_bool(self.params, "mask_flow_detach_condition", True)
+            sample_grad = _param_bool(self.params, "mask_flow_sample_grad", False)
+            sample_steps = int(_param(self.params, "mask_flow_steps", 1))
+            sample_solver = str(_param(self.params, "mask_flow_solver", "euler"))
+            sample_init = str(_param(self.params, "mask_flow_init", "zero"))
+
+            img1_mask_cond = build_mask_condition(
+                reference_feature=img1_patch_fea,
+                warped_feature=warp_img2_patch_fea,
+                reference_image=img1_patch,
+                warped_image=warp_img2_patch,
+                flow=H_flow_f,
+                detach=detach_condition,
+            )
+            img2_mask_cond = build_mask_condition(
+                reference_feature=img2_patch_fea,
+                warped_feature=warp_img1_patch_fea,
+                reference_image=img2_patch,
+                warped_image=warp_img1_patch,
+                flow=H_flow_b,
+                detach=detach_condition,
+            )
+            img1_patch_mask = self.mask_flow.sample(
+                img1_mask_cond,
+                steps=sample_steps,
+                solver=sample_solver,
+                init=sample_init,
+                requires_grad=sample_grad,
+            )
+            img2_patch_mask = self.mask_flow.sample(
+                img2_mask_cond,
+                steps=sample_steps,
+                solver=sample_solver,
+                init=sample_init,
+                requires_grad=sample_grad,
+            )
+            warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
+            warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
         else:
             if self.params.mask_use_fea:
                 img1_patch_mask = self.mask_pred(
@@ -1305,6 +1418,13 @@ class HomoNet(nn.Module):
             warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
             warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
 
+        H_f, H_b = None, None
+        if _param_bool(self.params, "return_h_matrix", False):
+            if flow_mask_to_homography is None:
+                raise ImportError("flow_mask_to_homography is unavailable")
+            H_f = flow_mask_to_homography(H_flow_f, img1_patch_mask)
+            H_b = flow_mask_to_homography(H_flow_b, img2_patch_mask)
+
         if not self.training:
             H_flow_f = upsample2d_flow_as(H_flow_f, img1_full, mode="bilinear", if_rate=True)
             H_flow_b = upsample2d_flow_as(H_flow_b, img1_full, mode="bilinear", if_rate=True)
@@ -1316,7 +1436,9 @@ class HomoNet(nn.Module):
                 "img1_patch_fea": img1_patch_fea, "img2_patch_fea": img2_patch_fea,
                 "flow_f": H_flow_f, "flow_b": H_flow_b,
                 "img1_patch_mask": img1_patch_mask, "img2_patch_mask": img2_patch_mask,
-                "warp_img1_patch_mask": warp_img1_patch_mask, "warp_img2_patch_mask": warp_img2_patch_mask}
+                "warp_img1_patch_mask": warp_img1_patch_mask, "warp_img2_patch_mask": warp_img2_patch_mask,
+                "img1_mask_cond": img1_mask_cond, "img2_mask_cond": img2_mask_cond,
+                "mask_method": self.mask_method, "H_f": H_f, "H_b": H_b}
 
 
 def Ms_Transformer(pretrained=False, **kwargs):
@@ -1328,11 +1450,12 @@ def Ms_Transformer(pretrained=False, **kwargs):
 
 
 def fetch_net(params):
-    if params.net_type == "HomoGAN":
+    if _param(params, "net_type", "HomoGAN") == "HomoGAN":
         HNet = Ms_Transformer(params=params)
     else:
         raise NotImplementedError
-    if params.pretrain_phase:
+    mask_method = str(_param(params, "mask_method", "flow_matching")).lower()
+    if _param_bool(params, "pretrain_phase", False) or mask_method != "homogan_cnn":
         return HNet
     else:
         DNet = Discriminator()

@@ -1,0 +1,1696 @@
+PLAN: Replace HomoGAN Coplanarity-Aware GAN with a Conditional Flow-Matching Dominant Mask Module
+
+Authoring goal:
+This document is written as an implementation blueprint for Claude or another coding agent. It assumes the current repository already contains:
+
+- new_approach/modules/featureHomo.py
+- new_approach/modules/transformerHomo.py
+
+The goal is to estimate a homography matrix or flow between two input images using the existing HomoGAN feature projector and homography transformer, while omitting the original Coplanarity-Aware GAN discriminator. The replacement should determine a dominant-plane/trusted mask more efficiently.
+
+
+================================================================================
+1. Decision Summary
+================================================================================
+
+Use a conditional Flow Matching model, preferably a small rectified-flow or OT-flow mask generator.
+
+Do not use a full score-based SDE model or a standard DDPM-style diffusion model for the first implementation.
+
+Reason:
+
+1. The target is a dense geometric trust mask, not open-ended image generation.
+2. The model is strongly conditioned on geometry:
+   - image features from featureHomo.py
+   - warped features from transformerHomo.py
+   - feature residuals
+   - photometric residuals
+   - forward/backward flow consistency
+3. Flow Matching learns a vector field that transports an easy initial distribution to the mask distribution.
+4. Inference can be deterministic and cheap:
+   - 1 Euler step for fastest inference
+   - 4 Euler/Heun steps for more stable masks
+5. This avoids the instability and training complexity of CA-GAN:
+   - no discriminator
+   - no gradient reversal
+   - no WGAN gradient penalty
+   - no adversarial balance problem
+
+Core replacement:
+
+Old HomoGAN:
+    feature maps + warped feature maps -> mask_pred -> masks
+    masks + discriminator -> coplanarity regularization
+
+New approach:
+    feature maps + warped feature maps + residuals + consistency cues
+        -> conditional flow-matching mask generator
+        -> dominant/trusted soft masks
+        -> masked homography alignment loss
+
+
+================================================================================
+2. Conceptual Target
+================================================================================
+
+The dominant mask should answer:
+
+    "Which pixels in the two image patches are likely explained by the same dominant homography?"
+
+The mask should be:
+
+1. High on the dominant plane.
+2. Low on independently moving foreground objects.
+3. Low on regions from other depth planes that cannot be aligned by the current homography.
+4. Smooth enough for stable alignment.
+5. Large enough not to collapse to zero.
+6. Not forced to cover the full image.
+7. Bidirectionally consistent:
+   - image A mask warped into B should agree with B mask
+   - image B mask warped into A should agree with A mask
+
+Important:
+The mask is a training and inference aid for homography estimation. It is not required to be a semantic segmentation mask. It should prioritize geometric usefulness over visual neatness.
+
+
+================================================================================
+3. Current Codebase Anchors
+================================================================================
+
+Use these current files:
+
+1. new_approach/modules/featureHomo.py
+
+   Contains:
+   - FeatureExtractor
+   - feature_extractor
+
+   feature_extractor is the shallow feature projector from HomoGAN:
+   image -> shallow feature map.
+
+2. new_approach/modules/transformerHomo.py
+
+   Contains:
+   - SwinTransformer
+   - HomoNet
+   - Discriminator
+   - ASPP
+   - gen_basis
+   - get_warp_flow
+   - upsample2d_flow_as
+   - Ms_Transformer
+   - fetch_net
+
+   Current mask area:
+   - HomoNet.__init__ creates self.mask_pred = self.mask_predictor(32)
+   - HomoNet.forward predicts img1_patch_mask and img2_patch_mask with self.mask_pred
+   - It also warps masks into the opposite frame:
+       warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
+       warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
+
+   These mask output keys should remain compatible:
+   - img1_patch_mask
+   - img2_patch_mask
+   - warp_img1_patch_mask
+   - warp_img2_patch_mask
+
+
+================================================================================
+4. Files To Create
+================================================================================
+
+Create these files:
+
+1. new_approach/modules/maskFlowHomo.py
+
+   Main model file for conditional Flow Matching dominant mask prediction.
+
+   Recommended classes/functions:
+
+   - SinusoidalTimeEmbedding
+   - ConvNormAct
+   - ResBlock
+   - DownBlock
+   - UpBlock
+   - MaskFlowUNet
+   - DominantMaskFlow
+   - build_mask_condition
+   - make_flow_matching_batch
+   - logits_from_mask
+   - mask_from_logits
+
+2. new_approach/losses_homo.py
+
+   Loss functions for the new approach.
+
+   Recommended classes/functions:
+
+   - masked_triplet_alignment_loss
+   - feature_identity_loss
+   - flow_matching_loss
+   - mask_area_loss
+   - mask_total_variation_loss
+   - mask_entropy_loss
+   - bidirectional_mask_intersection
+   - pseudo_mask_from_residuals
+   - morphology_close_soft
+
+3. new_approach/train_mask_flow.py
+
+   Optional but strongly recommended.
+   Train the mask flow module separately from homography.
+
+4. new_approach/train_new.py
+
+   Optional full training script for:
+   - homography pretraining
+   - mask flow training
+   - joint fine-tuning
+
+5. new_approach/configs/default_flow_homo.json
+
+   Optional config file for hyperparameters.
+
+6. new_approach/README_new_approach.md
+
+   Optional documentation for running the new approach.
+
+
+================================================================================
+5. Files To Modify
+================================================================================
+
+Modify:
+
+1. new_approach/modules/transformerHomo.py
+
+   Required changes:
+
+   - Import DominantMaskFlow and build_mask_condition from maskFlowHomo.py.
+   - Add a parameter switch to HomoNet:
+       params.mask_method
+
+     Supported values:
+       "none"
+       "homogan_cnn"
+       "flow_matching"
+
+   - Keep "homogan_cnn" initially for compatibility.
+   - Use "flow_matching" as the new default after implementation is verified.
+   - Remove Discriminator from actual training path when mask_method == "flow_matching".
+
+   - In HomoNet.__init__:
+       if params.mask_method == "flow_matching":
+           self.mask_flow = DominantMaskFlow(...)
+       elif params.mask_method == "homogan_cnn":
+           self.mask_pred = self.mask_predictor(32)
+       else:
+           self.mask_flow = None
+           self.mask_pred = None
+
+   - In HomoNet.forward:
+       compute features and homography exactly as before.
+       compute warped images and warped features exactly as before.
+       replace mask generation branch with:
+
+       if params.mask_method == "none" or params.pretrain_phase:
+           masks = None or all-one masks depending on training stage.
+       elif params.mask_method == "homogan_cnn":
+           current code path.
+       elif params.mask_method == "flow_matching":
+           build conditions and sample masks from self.mask_flow.
+
+2. new_approach/modules/__init__.py
+
+   Add exports:
+       from .maskFlowHomo import DominantMaskFlow, build_mask_condition
+
+3. Training code
+
+   Current repository may not yet have a new_approach training script.
+   If reusing HomoGAN training code, remove:
+   - DNet
+   - Discriminator optimizer parameters
+   - revgrad
+   - compute_gradient_penalty
+   - mp_loss/wp_loss adversarial terms
+
+
+================================================================================
+6. Flow Matching Model Design
+================================================================================
+
+6.1 Model Input and Output
+
+The model predicts a velocity field for a mask logit tensor.
+
+Inputs:
+
+    z_t:  noisy/intermediate mask logit
+          shape [B, 1, H, W]
+
+    t:    continuous timestep
+          shape [B] or [B, 1]
+          values in [0, 1]
+
+    cond: condition tensor
+          shape [B, C_cond, H, W]
+
+Output:
+
+    v_theta: velocity field
+             shape [B, 1, H, W]
+
+At inference:
+
+    z_0 = zeros or Gaussian noise
+    integrate dz/dt = v_theta(z_t, t, cond)
+    mask = sigmoid(z_1)
+
+
+6.2 Recommended Conditioning Tensor
+
+Construct two conditions:
+
+Forward mask in image2/B frame:
+
+    cond_f = condition for img2_patch_mask
+
+Backward mask in image1/A frame:
+
+    cond_b = condition for img1_patch_mask
+
+Available tensors from HomoNet.forward:
+
+    img1_patch
+    img2_patch
+    img1_patch_fea
+    img2_patch_fea
+    warp_img1_patch
+    warp_img2_patch
+    warp_img1_patch_fea
+    warp_img2_patch_fea
+    H_flow_f
+    H_flow_b
+
+Interpretation of HomoGAN variable names:
+
+    H_flow_f maps image2 toward image1 usage in code:
+        warp_img2_patch = get_warp_flow(img2_full or img2_patch, H_flow_f, start)
+
+    H_flow_b maps image1 toward image2 usage in code:
+        warp_img1_patch = get_warp_flow(img1_full or img1_patch, H_flow_b, start)
+
+The existing code uses:
+
+    img1_patch_mask = mask_pred(concat(img1_patch_fea, warp_img2_patch_fea))
+    img2_patch_mask = mask_pred(concat(img2_patch_fea, warp_img1_patch_fea))
+
+Keep the same spirit:
+
+    cond_b for img1_patch_mask:
+        concat(
+            img1_patch_fea,
+            warp_img2_patch_fea,
+            abs(img1_patch_fea - warp_img2_patch_fea),
+            abs(img1_patch - warp_img2_patch),
+            flow features for H_flow_f or upsampled inverse cue
+        )
+
+    cond_f for img2_patch_mask:
+        concat(
+            img2_patch_fea,
+            warp_img1_patch_fea,
+            abs(img2_patch_fea - warp_img1_patch_fea),
+            abs(img2_patch - warp_img1_patch),
+            flow features for H_flow_b or upsampled inverse cue
+        )
+
+Minimum condition channels:
+
+    1. reference feature
+    2. warped opposite feature
+    3. feature absolute residual
+    4. image absolute residual
+    5. flow x
+    6. flow y
+    7. flow magnitude
+
+If the shallow feature projector outputs 1 channel, this gives roughly:
+
+    C_cond = 1 + 1 + 1 + 1 + 2 + 1 = 7
+
+If later feature channels increase, build_mask_condition must infer channels dynamically.
+
+
+6.3 Flow Features
+
+For each flow:
+
+    flow_x = flow[:, 0:1]
+    flow_y = flow[:, 1:2]
+    flow_mag = sqrt(flow_x**2 + flow_y**2 + eps)
+
+Normalize flow:
+
+    flow_x_norm = flow_x / max(W, 1)
+    flow_y_norm = flow_y / max(H, 1)
+    flow_mag_norm = flow_mag / sqrt(H*H + W*W)
+
+Use normalized flow features in cond.
+
+
+6.4 Small U-Net Architecture
+
+Use a lightweight U-Net, not a large diffusion U-Net.
+
+Suggested default:
+
+    base_channels = 32
+    channel_mults = [1, 2, 4, 4]
+    num_res_blocks_per_level = 2
+    normalization = GroupNorm
+    activation = SiLU
+    dropout = 0.0 or 0.05
+
+Input channels:
+
+    1 + C_cond
+
+where 1 is z_t.
+
+Timestep conditioning:
+
+    t -> SinusoidalTimeEmbedding(dim=base_channels*4)
+      -> MLP
+      -> injected into ResBlocks with additive bias or FiLM
+
+Output:
+
+    Conv2d(base_channels, 1, kernel_size=3, padding=1)
+
+Initialize final conv weight near zero for stable early training.
+
+
+6.5 Flow Matching Training Objective
+
+Let target soft mask be m_star in [0, 1].
+
+Convert target mask to logits:
+
+    x_1 = logit(clamp(m_star, eps, 1 - eps))
+
+Sample source:
+
+    x_0 ~ Normal(0, sigma0)
+
+Recommended:
+
+    sigma0 = 1.0
+
+Alternative for stability:
+
+    x_0 = zeros_like(x_1) + small noise
+
+Sample timestep:
+
+    t ~ Uniform(t_min, 1)
+
+Use:
+
+    t_min = 1e-4
+
+Construct interpolant:
+
+    x_t = (1 - t) * x_0 + t * x_1
+
+Target velocity for rectified flow:
+
+    u_t = x_1 - x_0
+
+Model loss:
+
+    loss_fm = mean((v_theta(x_t, t, cond) - u_t)^2)
+
+Optional weighting:
+
+    weight high-confidence pixels more:
+        w = 1 + alpha * abs(m_star - 0.5) * 2
+
+    loss_fm = mean(w * (v_theta - u_t)^2)
+
+
+6.6 Inference Sampling
+
+DominantMaskFlow.sample(cond, steps):
+
+    if init == "zero":
+        z = zeros([B, 1, H, W], device=cond.device)
+    else:
+        z = noise_scale * randn(...)
+
+    for i in range(steps):
+        t = i / steps
+        v = self.forward(z, t, cond)
+        z = z + (1 / steps) * v
+
+    mask = sigmoid(z / temperature)
+    return mask
+
+Default:
+
+    steps = 1
+    temperature = 1.0
+
+If masks are too soft:
+
+    temperature = 0.7
+
+If masks are noisy:
+
+    steps = 4
+    use Heun solver:
+
+        v1 = f(z, t)
+        z_pred = z + dt * v1
+        v2 = f(z_pred, t + dt)
+        z = z + 0.5 * dt * (v1 + v2)
+
+
+================================================================================
+7. Mask Target Generation Without CA-GAN
+================================================================================
+
+The main challenge:
+Flow Matching requires target masks. Since the original goal is unsupervised homography estimation, create targets through synthetic masks and pseudo-labels.
+
+
+7.1 Synthetic Mask Pretraining
+
+This is the most important stabilizing step.
+
+Procedure:
+
+1. Sample a real image I.
+2. Randomly crop a patch.
+3. Apply a known homography H_dom to the whole patch to create the dominant-plane paired image.
+4. Create distractor/outlier regions:
+
+   Option A: paste a random foreground patch from another image.
+   Option B: select random polygon/ellipse rectangles and apply a different homography H_out.
+   Option C: copy moving-object-like blobs with random translation.
+   Option D: use CutMix-style pasted regions.
+
+5. The known dominant mask is:
+
+   1 where pixels belong to the region transformed by H_dom.
+   0 where pixels belong to pasted or differently transformed outlier regions.
+
+6. Soften mask boundaries:
+
+   m_star = gaussian_blur(mask, sigma=1 to 3)
+
+7. Train DominantMaskFlow with loss_fm.
+
+Synthetic targets provide direct supervision and prevent flow model collapse.
+
+
+7.2 Real Pseudo-Label Generation
+
+After homography pretraining, produce pseudo masks from feature residuals.
+
+Inputs:
+
+    img1_patch_fea
+    img2_patch_fea
+    warp_img1_patch_fea
+    warp_img2_patch_fea
+    img1_patch
+    img2_patch
+    warp_img1_patch
+    warp_img2_patch
+
+Forward residual in image2 frame:
+
+    r_fea_f = mean(abs(img2_patch_fea - warp_img1_patch_fea), dim=1, keepdim=True)
+    r_img_f = mean(abs(img2_patch - warp_img1_patch), dim=1, keepdim=True)
+
+Backward residual in image1 frame:
+
+    r_fea_b = mean(abs(img1_patch_fea - warp_img2_patch_fea), dim=1, keepdim=True)
+    r_img_b = mean(abs(img1_patch - warp_img2_patch), dim=1, keepdim=True)
+
+Normalize robustly per image:
+
+    median = median(r)
+    mad = median(abs(r - median)) + eps
+    r_norm = (r - median) / mad
+
+Convert to soft mask:
+
+    m = sigmoid((tau - r_norm) / temp)
+
+Suggested defaults:
+
+    tau = 1.0
+    temp = 0.5
+
+Combine feature and image residual:
+
+    m_f = m_fea_f * m_img_f
+    m_b = m_fea_b * m_img_b
+
+Optional confidence:
+
+    confidence = abs(m - 0.5) * 2
+
+Reject pseudo labels if:
+
+    mean(m) < 0.10
+    mean(m) > 0.95
+    confidence.mean() < 0.25
+
+Apply soft morphology:
+
+    close = dilation then erosion using maxpool/minpool approximation.
+
+Largest component:
+
+    If OpenCV or scipy is available, keep the largest connected high-confidence component.
+    If not, skip in first implementation.
+
+
+7.3 Bidirectional Pseudo-Label Consistency
+
+Use the same idea as HomoGAN:
+
+    trusted_f = img2_mask * warp(img1_mask)
+    trusted_b = img1_mask * warp(img2_mask)
+
+For pseudo-label construction:
+
+1. Generate raw m_f and m_b.
+2. Warp m_b to image2 frame:
+
+       warp_m_b = get_warp_flow(m_b, H_flow_b, start)
+
+3. Warp m_f to image1 frame:
+
+       warp_m_f = get_warp_flow(m_f, H_flow_f, start)
+
+4. Refine:
+
+       m_f_refined = m_f * warp_m_b
+       m_b_refined = m_b * warp_m_f
+
+5. Renormalize or lightly sharpen:
+
+       m = clamp(m, 0, 1)
+       m = sigmoid((m - 0.5) / mask_temp)
+
+Suggested:
+
+    mask_temp = 0.25
+
+
+================================================================================
+8. HomoNet Integration Details
+================================================================================
+
+8.1 Add Parameters
+
+Support these params:
+
+    mask_method: "flow_matching"
+    mask_flow_steps: 1
+    mask_flow_solver: "euler"
+    mask_flow_init: "zero"
+    mask_flow_base_channels: 32
+    mask_flow_channel_mults: [1, 2, 4, 4]
+    mask_flow_use_image_residual: true
+    mask_flow_use_flow: true
+    mask_flow_detach_condition: true
+    mask_flow_temperature: 1.0
+
+Compatibility:
+
+    pretrain_phase: true
+        disable masks or use all-one masks
+
+    pretrain_phase: false
+        use flow matching masks
+
+
+8.2 Modify HomoNet.__init__
+
+Pseudo-code:
+
+    self.mask_method = getattr(params, "mask_method", "homogan_cnn")
+
+    if self.mask_method == "flow_matching":
+        self.mask_flow = DominantMaskFlow(
+            cond_channels=params.mask_flow_cond_channels,
+            base_channels=params.mask_flow_base_channels,
+            channel_mults=params.mask_flow_channel_mults,
+            temperature=params.mask_flow_temperature,
+        )
+        self.mask_pred = None
+    elif self.mask_method == "homogan_cnn":
+        self.mask_pred = self.mask_predictor(32)
+        self.mask_flow = None
+    else:
+        self.mask_pred = None
+        self.mask_flow = None
+
+Important:
+cond_channels may be known only after building conditions. To avoid a brittle config, implement DominantMaskFlow with a lazy input adapter or set cond_channels explicitly based on feature/image/flow channels.
+
+Simple first implementation:
+
+    cond_channels = 7
+
+assuming:
+
+    feature channels = 1
+    image channels = 1
+    flow feature channels = 3
+
+
+8.3 Modify HomoNet.forward
+
+Keep all existing steps up through:
+
+    img1_patch_fea, img2_patch_fea
+    H_flow_f, H_flow_b
+    warp_img1_patch, warp_img1_patch_fea
+    warp_img2_patch, warp_img2_patch_fea
+
+Then replace mask branch:
+
+    if self.params.pretrain_phase or self.mask_method == "none":
+        if self.training:
+            img1_patch_mask = torch.ones_like(img1_patch)
+            img2_patch_mask = torch.ones_like(img2_patch)
+            warp_img1_patch_mask = torch.ones_like(img1_patch)
+            warp_img2_patch_mask = torch.ones_like(img2_patch)
+        else:
+            masks can be None or ones; choose ones for simpler downstream code.
+
+    elif self.mask_method == "homogan_cnn":
+        use current branch.
+
+    elif self.mask_method == "flow_matching":
+        cond_b = build_mask_condition(
+            reference_feature=img1_patch_fea,
+            warped_feature=warp_img2_patch_fea,
+            reference_image=img1_patch,
+            warped_image=warp_img2_patch,
+            flow=H_flow_f,
+            detach=self.params.mask_flow_detach_condition,
+        )
+
+        cond_f = build_mask_condition(
+            reference_feature=img2_patch_fea,
+            warped_feature=warp_img1_patch_fea,
+            reference_image=img2_patch,
+            warped_image=warp_img1_patch,
+            flow=H_flow_b,
+            detach=self.params.mask_flow_detach_condition,
+        )
+
+        if self.training and "target masks are provided":
+            output velocities for loss_fm can be computed outside HomoNet.
+
+        img1_patch_mask = self.mask_flow.sample(
+            cond_b,
+            steps=self.params.mask_flow_steps,
+            solver=self.params.mask_flow_solver,
+        )
+
+        img2_patch_mask = self.mask_flow.sample(
+            cond_f,
+            steps=self.params.mask_flow_steps,
+            solver=self.params.mask_flow_solver,
+        )
+
+        warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
+        warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
+
+Return dict must keep old keys and add new useful keys:
+
+    "mask_cond_f": cond_f
+    "mask_cond_b": cond_b
+    "mask_method": self.mask_method
+
+Optional during training:
+
+    "mask_logits_f"
+    "mask_logits_b"
+
+
+================================================================================
+9. Loss Functions
+================================================================================
+
+9.1 Masked Alignment Loss
+
+Reuse HomoGAN's important idea:
+
+    insec_mask_f = img2_patch_mask * warp_img1_patch_mask
+    insec_mask_b = img1_patch_mask * warp_img2_patch_mask
+
+Then compute masked triplet loss.
+
+Forward:
+
+    anchor = img2_patch_fea
+    positive = warp_img1_patch_fea
+    negative = img1_patch_fea
+
+Backward:
+
+    anchor = img1_patch_fea
+    positive = warp_img2_patch_fea
+    negative = img2_patch_fea
+
+Pixelwise triplet:
+
+    tri = max(abs(anchor - positive) - abs(anchor - negative) + margin, 0)
+
+Masked average:
+
+    loss = sum(tri * mask) / (sum(mask) + eps)
+
+
+9.2 Feature Identity Loss
+
+Keep HomoGAN's feature identity loss:
+
+    FIL =
+        L1(img2_patch_warp_fea, warp_img2_patch_fea)
+      + L1(img1_patch_warp_fea, warp_img1_patch_fea)
+
+Purpose:
+The shallow feature projector should be approximately warp-equivariant.
+
+
+9.3 Flow Matching Loss
+
+Function:
+
+    flow_matching_loss(mask_flow, cond, target_mask)
+
+Pseudo-code:
+
+    x1 = logits_from_mask(target_mask)
+    x0 = torch.randn_like(x1)
+    t = torch.rand(B, device=x1.device).clamp_min(1e-4)
+    t_view = t.view(B, 1, 1, 1)
+    xt = (1 - t_view) * x0 + t_view * x1
+    target_v = x1 - x0
+    pred_v = mask_flow(xt, t, cond)
+    return F.mse_loss(pred_v, target_v)
+
+
+9.4 Area Loss
+
+Purpose:
+Avoid all-zero and all-one masks.
+
+Recommended soft interval:
+
+    min_area = 0.15
+    max_area = 0.85
+
+Loss:
+
+    area = mask.mean()
+    loss_low = relu(min_area - area)^2
+    loss_high = relu(area - max_area)^2
+    loss_area = loss_low + loss_high
+
+Alternative:
+If data often has large planes, use:
+
+    min_area = 0.20
+    max_area = 0.95
+
+
+9.5 Total Variation Loss
+
+Purpose:
+Encourage spatially smooth masks.
+
+    loss_tv =
+        mean(abs(mask[:, :, 1:, :] - mask[:, :, :-1, :]))
+      + mean(abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]))
+
+
+9.6 Entropy/Binarization Loss
+
+Use only after warmup.
+
+    entropy = -m*log(m) - (1-m)*log(1-m)
+    loss_entropy = entropy.mean()
+
+Minimizing entropy sharpens masks.
+
+Warning:
+Do not apply too early or masks may become brittle.
+
+
+9.7 Final Losses By Stage
+
+Stage A: Homography pretrain
+
+    loss = h_weight * (triplet_forward + triplet_backward + FIL)
+
+No masks or all-one masks.
+
+Stage B: Synthetic mask flow pretrain
+
+    loss =
+        lambda_fm * loss_fm
+      + lambda_tv * loss_tv(sampled_mask)
+      + lambda_area * loss_area(sampled_mask)
+
+Stage C: Real pseudo-label mask flow training
+
+    loss =
+        lambda_fm * loss_fm
+      + lambda_tv * loss_tv
+      + lambda_area * loss_area
+
+Stage D: Joint fine-tuning
+
+    loss =
+        h_weight * masked_alignment_loss
+      + fil_weight * FIL
+      + fm_weight * loss_fm_if_targets_available
+      + area_weight * loss_area
+      + tv_weight * loss_tv
+      + entropy_weight * loss_entropy_after_warmup
+
+Suggested initial weights:
+
+    h_weight = 1.0
+    fil_weight = 1.0
+    fm_weight = 0.5
+    area_weight = 0.05
+    tv_weight = 0.01
+    entropy_weight = 0.001 after warmup
+
+
+================================================================================
+10. Training Schedule
+================================================================================
+
+Stage A: Homography Pretraining
+
+Goal:
+Train featureHomo + transformerHomo to predict reasonable homography before mask training.
+
+Settings:
+
+    params.pretrain_phase = true
+    params.mask_method = "none"
+
+Use HomoGAN pretrain loss:
+
+    unmasked triplet forward/backward + FIL
+
+Train until validation homography error plateaus.
+
+Expected:
+Homography may be compromised in multi-plane scenes, but should be good enough to produce usable residuals.
+
+
+Stage B: Synthetic Mask Flow Pretraining
+
+Goal:
+Teach DominantMaskFlow what a dominant-plane mask looks like.
+
+Inputs:
+
+    synthetic image pairs
+    known target masks
+    homography model frozen or optionally use known homography for warping
+
+Settings:
+
+    freeze HNet initially
+    train only mask_flow
+    use loss_fm + mask regularizers
+
+Epochs:
+
+    5 to 20 depending on dataset size
+
+Validation:
+
+    IoU or Dice on synthetic held-out masks
+    mask area distribution
+    visual check
+
+
+Stage C: Real Pseudo-Label Mask Training
+
+Goal:
+Adapt mask flow model to real image pairs.
+
+Procedure:
+
+1. Run HNet on real pairs.
+2. Build pseudo masks from residuals.
+3. Filter low-confidence pseudo masks.
+4. Train mask_flow on pseudo masks.
+
+Settings:
+
+    freeze HNet for first pass
+    train mask_flow
+
+Validation:
+
+    homography error using masks
+    visual masks
+    residual inside mask < residual outside mask
+
+
+Stage D: Joint Fine-Tuning
+
+Goal:
+Let homography and mask improve each other.
+
+Settings:
+
+    unfreeze HNet
+    train HNet + mask_flow
+    no discriminator
+    no adversarial loss
+
+Important:
+Use small learning rate for HNet.
+
+Suggested:
+
+    lr_HNet = 1e-5
+    lr_mask_flow = 5e-5 or 1e-4
+
+Potential gradient strategy:
+
+    First joint run:
+        detach mask condition from HNet features.
+
+    Later:
+        allow gradients through condition if stable.
+
+Default:
+
+    mask_flow_detach_condition = true
+
+
+Stage E: Fast Inference Calibration
+
+Goal:
+Make sure one-step masks are good enough.
+
+Compare:
+
+    steps = 1
+    steps = 2
+    steps = 4
+    steps = 8
+
+Pick the lowest step count with stable homography performance.
+
+If 1-step is weak:
+
+    train with step-distillation:
+        make 4-step sampled masks teacher
+        train 1-step student with L1/BCE to match teacher
+
+
+================================================================================
+11. Inference Pipeline
+================================================================================
+
+Input:
+
+    two grayscale images or patches:
+        img1, img2
+
+Steps:
+
+1. Build data_batch matching HomoGAN format:
+
+    imgs_gray_patch: [B, 2, H, W]
+    imgs_gray_full:  [B, 2, H_full, W_full]
+    start:           [B, 2, 1, 1] or compatible
+    pts:             optional if only inference
+
+2. HNet forward:
+
+    - feature projection
+    - transformer predicts forward/backward weights
+    - basis converts weights to dense flows
+    - warp features/images
+    - build mask conditions
+    - sample dominant masks with DominantMaskFlow
+    - output flows and masks
+
+3. Convert flow to homography matrix if required:
+
+Current HomoGAN predicts dense homography-induced flow from basis weights.
+If a 3x3 matrix is needed, implement one of:
+
+    Option A:
+        recover H from four corner displacements using DLT.
+
+    Option B:
+        expose transformer weights and basis coefficients, then derive matrix.
+
+    Option C:
+        fit H with least squares from dense flow points inside trusted mask.
+
+Recommended:
+    Option C for robust matrix output:
+
+    - sample a grid of points inside the dominant mask
+    - source points: grid xy
+    - destination points: grid xy + flow
+    - solve weighted DLT using mask values as weights
+    - normalize H so H[2,2] = 1
+
+4. Return:
+
+    flow_f
+    flow_b
+    H_f if implemented
+    img1_patch_mask
+    img2_patch_mask
+    trusted_f
+    trusted_b
+
+
+================================================================================
+12. Weighted DLT From Flow and Mask
+================================================================================
+
+Implement in new_approach/geometry_homo.py if matrix output is required.
+
+Function:
+
+    flow_mask_to_homography(flow, mask, min_points=16)
+
+Inputs:
+
+    flow: [B, H, W, 2] or [B, 2, H, W]
+    mask: [B, 1, H, W]
+
+Procedure:
+
+1. Create grid xy.
+2. Destination xy = grid xy + flow.
+3. Select points with mask > threshold.
+4. If too few points:
+       use top-k mask points.
+5. Build weighted DLT equations.
+6. Solve with torch.linalg.svd or torch.linalg.lstsq.
+7. Normalize H.
+
+Weighted DLT:
+
+For each correspondence (x, y) -> (u, v), use equations:
+
+    [-x, -y, -1,  0,  0,  0, u*x, u*y, u]
+    [ 0,  0,  0, -x, -y, -1, v*x, v*y, v]
+
+Multiply each row by sqrt(weight).
+
+Solve Ah = 0 by SVD. h is last right singular vector.
+
+Fallback:
+
+    If SVD fails, return identity or unweighted DLT on full grid.
+
+
+================================================================================
+13. Configuration Defaults
+================================================================================
+
+Add config values:
+
+    {
+      "mask_method": "flow_matching",
+      "mask_flow_steps": 1,
+      "mask_flow_solver": "euler",
+      "mask_flow_init": "zero",
+      "mask_flow_base_channels": 32,
+      "mask_flow_channel_mults": [1, 2, 4, 4],
+      "mask_flow_time_dim": 128,
+      "mask_flow_temperature": 1.0,
+      "mask_flow_detach_condition": true,
+      "mask_flow_noise_sigma": 1.0,
+      "mask_flow_t_min": 0.0001,
+      "mask_min_area": 0.15,
+      "mask_max_area": 0.90,
+      "lambda_fm": 0.5,
+      "lambda_area": 0.05,
+      "lambda_tv": 0.01,
+      "lambda_entropy": 0.001,
+      "entropy_warmup_epochs": 2,
+      "pseudo_tau": 1.0,
+      "pseudo_temperature": 0.5,
+      "pseudo_min_area": 0.10,
+      "pseudo_max_area": 0.95,
+      "pseudo_min_confidence": 0.25
+    }
+
+
+================================================================================
+14. Implementation Order For Claude
+================================================================================
+
+Claude should implement in this exact order.
+
+Step 1: Add maskFlowHomo.py
+
+Implement:
+
+    - time embedding
+    - small U-Net
+    - DominantMaskFlow.forward
+    - DominantMaskFlow.sample
+    - build_mask_condition
+    - make_flow_matching_batch
+
+Run:
+
+    python -m py_compile new_approach/modules/maskFlowHomo.py
+
+
+Step 2: Add losses_homo.py
+
+Implement:
+
+    - flow_matching_loss
+    - masked_triplet_alignment_loss
+    - feature_identity_loss
+    - mask regularizers
+    - pseudo mask generation
+
+Run:
+
+    python -m py_compile new_approach/losses_homo.py
+
+
+Step 3: Modify transformerHomo.py
+
+Add optional flow matching mask path while preserving old mask_pred path.
+
+Do not delete Discriminator yet.
+Just stop using it for mask_method == "flow_matching".
+
+Run:
+
+    python -m py_compile new_approach/modules/transformerHomo.py
+
+
+Step 4: Add a smoke test
+
+Create:
+
+    new_approach/smoke_test_flow_mask.py
+
+Purpose:
+
+    - instantiate DominantMaskFlow
+    - create random cond tensor
+    - sample mask with steps 1 and 4
+    - verify output shape [B, 1, H, W]
+    - verify values are in [0, 1]
+    - run one flow matching loss backward pass
+
+Run:
+
+    python new_approach/smoke_test_flow_mask.py
+
+
+Step 5: Add synthetic target generator
+
+Create:
+
+    new_approach/synthetic_mask_data.py
+
+Implement:
+
+    - random homography
+    - random outlier blobs
+    - known dominant mask
+    - paired patch output
+
+
+Step 6: Add training script for mask flow
+
+Create:
+
+    new_approach/train_mask_flow.py
+
+It should support:
+
+    - synthetic training only
+    - optional checkpoint loading for HNet
+    - saving mask_flow checkpoint
+    - visualizing masks every N steps
+
+
+Step 7: Add joint training script
+
+Create or modify:
+
+    new_approach/train_new.py
+
+Remove:
+
+    - DNet
+    - adversarial loss
+    - gradient reversal
+    - gradient penalty
+
+Use:
+
+    - masked alignment loss
+    - FIL
+    - optional flow matching loss from synthetic/pseudo targets
+    - area/TV regularizers
+
+
+Step 8: Add evaluation script
+
+Create:
+
+    new_approach/evaluate_new.py
+
+Evaluate:
+
+    - no mask
+    - flow matching mask steps=1
+    - flow matching mask steps=4
+
+Report:
+
+    - matching point error
+    - inference time
+    - mean mask area
+
+
+================================================================================
+15. Exact Pseudo-Code For maskFlowHomo.py
+================================================================================
+
+The implementation does not need to match this line-for-line, but should preserve the API.
+
+    class DominantMaskFlow(nn.Module):
+        def __init__(
+            self,
+            cond_channels,
+            base_channels=32,
+            channel_mults=(1, 2, 4, 4),
+            time_dim=128,
+            temperature=1.0,
+            noise_sigma=1.0,
+        ):
+            super().__init__()
+            self.net = MaskFlowUNet(
+                in_channels=1 + cond_channels,
+                out_channels=1,
+                base_channels=base_channels,
+                channel_mults=channel_mults,
+                time_dim=time_dim,
+            )
+            self.temperature = temperature
+            self.noise_sigma = noise_sigma
+
+        def forward(self, z_t, t, cond):
+            if t.ndim == 0:
+                t = t[None].repeat(z_t.shape[0])
+            if t.ndim == 1:
+                t = t.view(z_t.shape[0])
+            x = torch.cat([z_t, cond], dim=1)
+            return self.net(x, t)
+
+        @torch.no_grad()
+        def sample(self, cond, steps=1, solver="euler", init="zero"):
+            B, _, H, W = cond.shape
+            if init == "noise":
+                z = self.noise_sigma * torch.randn(B, 1, H, W, device=cond.device, dtype=cond.dtype)
+            else:
+                z = torch.zeros(B, 1, H, W, device=cond.device, dtype=cond.dtype)
+
+            dt = 1.0 / steps
+            for i in range(steps):
+                t = torch.full((B,), i / steps, device=cond.device, dtype=cond.dtype)
+                if solver == "heun" and steps > 1:
+                    v1 = self.forward(z, t, cond)
+                    z_pred = z + dt * v1
+                    t2 = torch.full((B,), min((i + 1) / steps, 1.0), device=cond.device, dtype=cond.dtype)
+                    v2 = self.forward(z_pred, t2, cond)
+                    z = z + 0.5 * dt * (v1 + v2)
+                else:
+                    v = self.forward(z, t, cond)
+                    z = z + dt * v
+
+            return torch.sigmoid(z / self.temperature)
+
+
+================================================================================
+16. Exact Pseudo-Code For build_mask_condition
+================================================================================
+
+    def build_mask_condition(
+        reference_feature,
+        warped_feature,
+        reference_image=None,
+        warped_image=None,
+        flow=None,
+        detach=True,
+        eps=1e-6,
+    ):
+        if detach:
+            reference_feature = reference_feature.detach()
+            warped_feature = warped_feature.detach()
+            if reference_image is not None:
+                reference_image = reference_image.detach()
+            if warped_image is not None:
+                warped_image = warped_image.detach()
+            if flow is not None:
+                flow = flow.detach()
+
+        feature_residual = torch.abs(reference_feature - warped_feature)
+        cond = [reference_feature, warped_feature, feature_residual]
+
+        if reference_image is not None and warped_image is not None:
+            image_residual = torch.abs(reference_image - warped_image)
+            cond.append(image_residual)
+
+        if flow is not None:
+            if flow.shape[1] != 2:
+                # If flow is [B, H, W, 2], convert to [B, 2, H, W].
+                flow = flow.permute(0, 3, 1, 2).contiguous()
+            B, _, H, W = flow.shape
+            flow_x = flow[:, 0:1] / max(W, 1)
+            flow_y = flow[:, 1:2] / max(H, 1)
+            flow_mag = torch.sqrt(flow_x * flow_x + flow_y * flow_y + eps)
+            cond.extend([flow_x, flow_y, flow_mag])
+
+        return torch.cat(cond, dim=1)
+
+
+================================================================================
+17. Compatibility Notes
+================================================================================
+
+1. Keep output dict keys stable.
+
+Existing downstream code may expect:
+
+    img1_patch_mask
+    img2_patch_mask
+    warp_img1_patch_mask
+    warp_img2_patch_mask
+
+Do not rename them.
+
+2. Keep homography flow output stable.
+
+Existing evaluation uses:
+
+    flow_f
+    flow_b
+
+Do not rename them.
+
+3. Avoid removing original HomoGAN code immediately.
+
+Keep:
+
+    Discriminator
+    mask_predictor
+
+until the flow-matching path is tested. This makes regression comparison easier.
+
+4. Device and dtype.
+
+All created tensors must use:
+
+    device = cond.device
+    dtype = cond.dtype
+
+5. Avoid hard-coded CUDA calls.
+
+The existing HomoGAN code has some torch.cuda.is_available branches. New code should prefer device-aware tensors from inputs.
+
+
+================================================================================
+18. Validation Checklist
+================================================================================
+
+Syntax:
+
+    python -m py_compile new_approach/modules/maskFlowHomo.py
+    python -m py_compile new_approach/losses_homo.py
+    python -m py_compile new_approach/modules/transformerHomo.py
+
+Unit shape tests:
+
+    - DominantMaskFlow.forward returns [B, 1, H, W]
+    - DominantMaskFlow.sample returns [B, 1, H, W]
+    - sampled mask min >= 0
+    - sampled mask max <= 1
+    - build_mask_condition returns expected channels
+    - masked loss does not NaN when mask is all zeros
+    - weighted DLT returns [B, 3, 3] if implemented
+
+Training smoke tests:
+
+    - one optimizer step for mask_flow on synthetic data
+    - one optimizer step for HNet + mask_flow joint
+    - gradients exist for mask_flow
+    - gradients do not reach feature extractor if mask_flow_detach_condition=true
+
+Visual sanity:
+
+    Save or display:
+
+    - img1
+    - img2
+    - warped img1
+    - img1 mask
+    - img2 mask
+    - trusted intersection
+    - residual heatmap
+
+Expected visual behavior:
+
+    - low masks on moving objects/foreground
+    - high masks on dominant planar/background area
+    - no checkerboard pattern
+    - no all-zero/all-one collapse
+
+Numerical sanity:
+
+    - mean mask area generally between 0.15 and 0.90
+    - residual inside mask lower than residual outside mask
+    - forward/backward trusted masks have non-trivial overlap
+
+
+================================================================================
+19. Ablation Plan
+================================================================================
+
+Run these comparisons:
+
+1. Baseline:
+   - transformerHomo + featureHomo
+   - no mask
+
+2. Simple residual threshold mask:
+   - no learned flow model
+   - pseudo mask directly from feature residual
+
+3. Flow matching mask, synthetic only:
+   - mask_flow trained on synthetic masks
+
+4. Flow matching mask, synthetic + pseudo real:
+   - expected best stable result before joint fine-tuning
+
+5. Flow matching mask, joint fine-tuned:
+   - expected best final result
+
+6. Original HomoGAN CA-GAN, if available:
+   - reference comparison
+
+Report:
+
+    - point matching error
+    - runtime
+    - mask area
+    - memory usage
+    - failure modes
+
+
+================================================================================
+20. Likely Failure Modes And Fixes
+================================================================================
+
+Failure: mask becomes all one.
+
+Possible causes:
+    - area loss max_area too high
+    - pseudo masks too permissive
+    - no entropy/binarization
+
+Fixes:
+    - lower max_area to 0.75 or 0.85
+    - increase residual threshold strictness
+    - add entropy loss after warmup
+    - increase TV only slightly; too much TV can also cause broad masks
+
+
+Failure: mask becomes all zero.
+
+Possible causes:
+    - pseudo masks too strict
+    - min_area too low or area loss too weak
+    - sampled logits too negative
+
+Fixes:
+    - increase min_area to 0.20
+    - increase area_weight
+    - initialize final bias positive
+    - use zero initialization rather than random-noise initialization at inference
+
+
+Failure: mask is noisy/speckled.
+
+Fixes:
+    - increase TV loss
+    - use morphology close in pseudo-labels
+    - increase sample steps to 4
+    - use Heun solver
+    - blur pseudo masks
+
+
+Failure: homography gets worse after adding masks.
+
+Possible causes:
+    - mask model hides useful regions
+    - joint training too aggressive
+    - conditions are stale due to bad pretraining
+
+Fixes:
+    - freeze HNet longer
+    - train mask_flow longer on synthetic
+    - use residual threshold mask as warmup
+    - lower lr_HNet
+    - use all-one masks for first N joint epochs, then blend:
+
+          mask_used = alpha * predicted_mask + (1 - alpha) * ones
+
+      increase alpha from 0 to 1.
+
+
+Failure: flow matching loss decreases but masks are poor.
+
+Possible causes:
+    - target masks poor
+    - model overfits synthetic masks
+    - condition channels missing critical residual signal
+
+Fixes:
+    - improve pseudo mask filter
+    - add image residual channel
+    - add forward/backward consistency channel
+    - add more realistic synthetic distractors
+
+
+================================================================================
+21. Minimal First Milestone
+================================================================================
+
+The minimal milestone should not try to solve everything at once.
+
+Implement:
+
+1. maskFlowHomo.py with DominantMaskFlow.
+2. build_mask_condition.
+3. transformerHomo.py integration with mask_method == "flow_matching".
+4. random synthetic smoke test.
+5. one-step sampled masks.
+
+Use random tensors first.
+
+Success criteria:
+
+    - code compiles
+    - forward pass produces masks
+    - output dict has same mask keys
+    - no discriminator is required
+    - no adversarial code is called
+
+Only after this milestone should Claude add full training and pseudo-label generation.
+
+
+================================================================================
+22. References
+================================================================================
+
+Use these references for conceptual grounding:
+
+1. HomoGAN:
+   Unsupervised Homography Estimation with Coplanarity-Aware GAN, CVPR 2022.
+   https://openaccess.thecvf.com/content/CVPR2022/html/Hong_Unsupervised_Homography_Estimation_With_Coplanarity-Aware_GAN_CVPR_2022_paper.html
+
+2. Score-based SDE models:
+   Score-Based Generative Modeling through Stochastic Differential Equations.
+   https://arxiv.org/abs/2011.13456
+
+3. DDPM:
+   Denoising Diffusion Probabilistic Models.
+   https://proceedings.neurips.cc/paper/2020/hash/4c5bcfec8584af0d967f1ab10179ca4b-Abstract.html
+
+4. Flow Matching:
+   Flow Matching for Generative Modeling.
+   https://openreview.net/forum?id=PqvMRDCJT9t
+
+5. Conditional Flow Matching:
+   Conditional Flow Matching.
+   https://openreview.net/forum?id=CD9Snc73AW
+
+6. Rectified Flow:
+   Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow.
+   https://arxiv.org/abs/2209.03003
+
+
+================================================================================
+23. Final Recommendation
+================================================================================
+
+Implement conditional Flow Matching first.
+
+Keep the homography transformer and feature projector unchanged as much as possible. Replace only the mask decision mechanism:
+
+    old:
+        mask_pred + Discriminator + adversarial loss
+
+    new:
+        DominantMaskFlow + synthetic/pseudo mask supervision + masked alignment loss
+
+This gives the cleanest engineering path:
+
+    - fewer unstable components
+    - faster inference than diffusion/score sampling
+    - compatible with HomoGAN's existing bidirectional trusted-mask loss
+    - direct path to one-step mask inference
+    - easy ablation against no-mask and CA-GAN variants
