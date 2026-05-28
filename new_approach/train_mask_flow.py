@@ -19,6 +19,14 @@ from new_approach.losses_homo import (
 from new_approach.modules.maskFlowHomo import DominantMaskFlow, build_mask_condition
 
 
+def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    pred = pred.flatten(1)
+    target = target.flatten(1)
+    intersection = (pred * target).sum(dim=1)
+    denom = pred.sum(dim=1) + target.sum(dim=1)
+    return (1.0 - (2.0 * intersection + eps) / (denom + eps)).mean()
+
+
 def warp_with_flow(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     if flow.shape[1] != 2:
         flow = flow.permute(0, 3, 1, 2).contiguous()
@@ -41,7 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--synthetic-max-translation", type=int, default=12)
+    parser.add_argument("--synthetic-min-outliers", type=int, default=2)
+    parser.add_argument("--synthetic-max-outliers", type=int, default=5)
+    parser.add_argument("--synthetic-min-outlier-size", type=int, default=24)
+    parser.add_argument("--synthetic-max-outlier-size", type=int, default=72)
+    parser.add_argument("--synthetic-blur-kernel", type=int, default=7)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lambda-fm", type=float, default=0.5)
+    parser.add_argument("--lambda-mask-bce", type=float, default=2.0)
+    parser.add_argument("--lambda-mask-dice", type=float, default=1.0)
+    parser.add_argument("--lambda-area", type=float, default=0.05)
+    parser.add_argument("--lambda-tv", type=float, default=0.01)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
     parser.add_argument("--save", default="models/dominant_mask_flow_synth.pth")
     parser.add_argument("--seed", type=int, default=230)
@@ -54,7 +73,17 @@ def main() -> None:
     device = resolve_device(args.device)
     print(f"using device: {device}")
 
-    config = SyntheticFlowMaskConfig(height=args.height, width=args.width, seed=args.seed)
+    config = SyntheticFlowMaskConfig(
+        height=args.height,
+        width=args.width,
+        max_translation=args.synthetic_max_translation,
+        min_outliers=args.synthetic_min_outliers,
+        max_outliers=args.synthetic_max_outliers,
+        min_outlier_size=args.synthetic_min_outlier_size,
+        max_outlier_size=args.synthetic_max_outlier_size,
+        blur_kernel=args.synthetic_blur_kernel,
+        seed=args.seed,
+    )
     loader = build_synthetic_flow_mask_loader(config, batch_size=args.batch_size, shuffle=True)
 
     model = DominantMaskFlow(cond_channels=7, base_channels=32).to(device)
@@ -86,7 +115,13 @@ def main() -> None:
         )
         loss_fm = flow_matching_loss(model, cond, target_mask)
         sampled_mask = model.sample(cond, steps=1, requires_grad=True)
-        loss = loss_fm + 0.05 * mask_area_loss(sampled_mask) + 0.01 * mask_total_variation_loss(sampled_mask)
+        loss_bce = F.binary_cross_entropy(sampled_mask.clamp(1e-6, 1.0 - 1e-6), target_mask)
+        loss_dice = soft_dice_loss(sampled_mask, target_mask)
+        loss_area = mask_area_loss(sampled_mask)
+        loss_tv = mask_total_variation_loss(sampled_mask)
+        loss = args.lambda_fm * loss_fm
+        loss = loss + args.lambda_mask_bce * loss_bce + args.lambda_mask_dice * loss_dice
+        loss = loss + args.lambda_area * loss_area + args.lambda_tv * loss_tv
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -95,7 +130,8 @@ def main() -> None:
         if step == 1 or step % 25 == 0:
             print(
                 f"step={step:05d} loss={loss.item():.5f} "
-                f"fm={loss_fm.item():.5f} mask_mean={sampled_mask.mean().item():.4f}"
+                f"fm={loss_fm.item():.5f} bce={loss_bce.item():.5f} dice={loss_dice.item():.5f} "
+                f"mask_mean={sampled_mask.mean().item():.4f} target_mean={target_mask.mean().item():.4f}"
             )
 
     save_path = Path(args.save)

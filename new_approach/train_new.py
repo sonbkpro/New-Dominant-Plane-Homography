@@ -258,6 +258,14 @@ def compute_mask_regularizers(output: Dict, args) -> Dict[str, torch.Tensor]:
     }
 
 
+def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    pred = pred.flatten(1)
+    target = target.flatten(1)
+    intersection = (pred * target).sum(dim=1)
+    denom = pred.sum(dim=1) + target.sum(dim=1)
+    return (1.0 - (2.0 * intersection + eps) / (denom + eps)).mean()
+
+
 def log_losses(prefix: str, epoch: int, step: int, losses: Dict[str, torch.Tensor]) -> None:
     pieces = [f"{prefix} epoch={epoch:03d} step={step:06d}"]
     for key, value in losses.items():
@@ -341,9 +349,13 @@ def train_synthetic_mask_epoch(mask_flow, optimizer, loader, device, args, epoch
         cond = build_mask_condition(img2, warped_img1, img2, warped_img1, flow, detach=False)
         fm = flow_matching_loss(mask_flow, cond, target, noise_sigma=args.mask_flow_noise_sigma)
         sampled = mask_flow.sample(cond, steps=args.mask_flow_steps, solver=args.mask_flow_solver, requires_grad=True)
+        bce = F.binary_cross_entropy(sampled.clamp(1e-6, 1.0 - 1e-6), target)
+        dice = soft_dice_loss(sampled, target)
         area = mask_area_loss(sampled, args.mask_min_area, args.mask_max_area)
         tv = mask_total_variation_loss(sampled)
-        total = args.lambda_fm * fm + args.lambda_area * area + args.lambda_tv * tv
+        total = args.lambda_fm * fm
+        total = total + args.lambda_mask_bce * bce + args.lambda_mask_dice * dice
+        total = total + args.lambda_area * area + args.lambda_tv * tv
 
         optimizer.zero_grad(set_to_none=True)
         total.backward()
@@ -354,7 +366,16 @@ def train_synthetic_mask_epoch(mask_flow, optimizer, loader, device, args, epoch
                 "synthetic_mask",
                 epoch,
                 step_count,
-                {"total": total, "fm": fm, "area": area, "tv": tv, "mask_mean": sampled.mean()},
+                {
+                    "total": total,
+                    "fm": fm,
+                    "bce": bce,
+                    "dice": dice,
+                    "area": area,
+                    "tv": tv,
+                    "mask_mean": sampled.mean(),
+                    "target_mean": target.mean(),
+                },
             )
         if args.max_steps_per_epoch and step_count >= args.max_steps_per_epoch:
             break
@@ -397,6 +418,12 @@ def run_synthetic_mask(args, device) -> Path:
         height=args.crop_h,
         width=args.crop_w,
         length=max(args.synthetic_length, args.batch_size * max(args.max_steps_per_epoch, 1)),
+        max_translation=args.synthetic_max_translation,
+        min_outliers=args.synthetic_min_outliers,
+        max_outliers=args.synthetic_max_outliers,
+        min_outlier_size=args.synthetic_min_outlier_size,
+        max_outlier_size=args.synthetic_max_outlier_size,
+        blur_kernel=args.synthetic_blur_kernel,
         seed=args.seed,
     )
     loader = build_synthetic_flow_mask_loader(
@@ -476,6 +503,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-steps", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--synthetic-length", type=int, default=10000)
+    parser.add_argument("--synthetic-max-translation", type=int, default=12)
+    parser.add_argument("--synthetic-min-outliers", type=int, default=2)
+    parser.add_argument("--synthetic-max-outliers", type=int, default=5)
+    parser.add_argument("--synthetic-min-outlier-size", type=int, default=64)
+    parser.add_argument("--synthetic-max-outlier-size", type=int, default=180)
+    parser.add_argument("--synthetic-blur-kernel", type=int, default=7)
     parser.add_argument("--val-freq", type=int, default=1)
     parser.add_argument("--skip-val", action=argparse.BooleanOptionalAction, default=False)
 
@@ -507,6 +540,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lambda-align", type=float, default=1.0)
     parser.add_argument("--lambda-fm", type=float, default=0.5)
+    parser.add_argument("--lambda-mask-bce", type=float, default=2.0)
+    parser.add_argument("--lambda-mask-dice", type=float, default=1.0)
     parser.add_argument("--lambda-area", type=float, default=0.05)
     parser.add_argument("--lambda-tv", type=float, default=0.01)
     parser.add_argument("--lambda-entropy", type=float, default=0.001)
