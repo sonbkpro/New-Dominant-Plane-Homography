@@ -6,3 +6,6 @@ CLAUDE.md
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Training artifacts
+new_approach/checkpoints/

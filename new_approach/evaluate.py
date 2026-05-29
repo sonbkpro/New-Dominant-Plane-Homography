@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 from Data.homo_flow_dataset import build_homo_flow_loader
 from new_approach.device_utils import resolve_device
 from new_approach.geometry_homo import flow_mask_to_homography
+from new_approach.geometry_tip import weighted_normalized_dlt
 from new_approach.modules.transformerHomo import Ms_Transformer
 
 try:
@@ -55,13 +56,16 @@ def collated_get(value: Any, index: int) -> Any:
 def default_params(args: argparse.Namespace) -> SimpleNamespace:
     crop_h = 320 if args.crop_h is None else args.crop_h
     crop_w = 512 if args.crop_w is None else args.crop_w
+    feature_channels = int(args.feature_channels)
+    corr_channels = (2 * int(args.corr_radius) + 1) ** 2 if args.use_correlation else 0
     return SimpleNamespace(
         net_type="HomoGAN",
         crop_size=[crop_h, crop_w],
         in_channels=2,
         patch_size=args.patch_size,
         rho=args.rho,
-        in_chans=2,
+        in_chans=2 * feature_channels + corr_channels,
+        est_ref_channels=feature_channels,
         num_basis=8,
         embed_dim=args.embed_dim,
         depths=tuple(args.depths),
@@ -81,6 +85,13 @@ def default_params(args: argparse.Namespace) -> SimpleNamespace:
         mask_use_fea=True,
         use_open=True,
         pretrain_phase=args.pretrain_phase,
+        refine_iters=args.refine_iters,
+        refine_detach_between=args.refine_detach_between,
+        refine_supervision=False,
+        refine_gamma=args.refine_gamma,
+        feature_channels=feature_channels,
+        use_correlation=args.use_correlation,
+        corr_radius=args.corr_radius,
         mask_method=args.mask_method,
         mask_flow_cond_channels=7,
         mask_flow_base_channels=args.mask_flow_base_channels,
@@ -129,6 +140,21 @@ def params_from_checkpoint(args: argparse.Namespace, ckpt: dict[str, Any] | None
     params.mask_flow_init = args.mask_flow_init
     params.mask_flow_sample_grad = False
     params.return_h_matrix = False
+    for name, value in {
+        "refine_iters": 1,
+        "refine_detach_between": True,
+        "refine_supervision": False,
+        "refine_gamma": 0.8,
+        "feature_channels": 1,
+        "use_correlation": False,
+        "corr_radius": 4,
+        "est_ref_channels": 1,
+    }.items():
+        if not hasattr(params, name):
+            setattr(params, name, value)
+    corr_channels = (2 * int(params.corr_radius) + 1) ** 2 if bool(params.use_correlation) else 0
+    params.in_chans = 2 * int(params.feature_channels) + corr_channels
+    params.est_ref_channels = int(params.feature_channels)
     return params
 
 
@@ -164,7 +190,11 @@ def transform_points(points: torch.Tensor, homography: torch.Tensor, eps: float 
     return warped[:, :2] / denom
 
 
-def compute_h_from_output(output: dict[str, Any], use_mask_weights: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_h_from_output(
+    output: dict[str, Any],
+    use_mask_weights: bool,
+    use_normalized_dlt: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     flow_f = output["flow_f"]
     flow_b = output["flow_b"]
     mask_f = None
@@ -173,8 +203,9 @@ def compute_h_from_output(output: dict[str, Any], use_mask_weights: bool) -> tup
         height, width = flow_f.shape[1:3]
         mask_f = F.interpolate(output["img1_patch_mask"], size=(height, width), mode="bilinear", align_corners=False)
         mask_b = F.interpolate(output["img2_patch_mask"], size=(height, width), mode="bilinear", align_corners=False)
-    h_f = flow_mask_to_homography(flow_f, mask_f)
-    h_b = flow_mask_to_homography(flow_b, mask_b)
+    dlt_fn = weighted_normalized_dlt if use_normalized_dlt else flow_mask_to_homography
+    h_f = dlt_fn(flow_f, mask_f)
+    h_b = dlt_fn(flow_b, mask_b)
     return h_f, h_b
 
 
@@ -220,7 +251,11 @@ def evaluate(model: torch.nn.Module, loader, args: argparse.Namespace, device: t
         for step, batch_cpu in enumerate(iterator, start=1):
             batch = batch_to_device(batch_cpu, device)
             output = model(batch)
-            h_f, h_b = compute_h_from_output(output, use_mask_weights=not args.no_mask_weighted_h)
+            h_f, h_b = compute_h_from_output(
+                output,
+                use_mask_weights=not args.no_mask_weighted_h,
+                use_normalized_dlt=args.normalized_dlt,
+            )
             batch_size = h_f.shape[0]
 
             for idx in range(batch_size):
@@ -279,6 +314,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shift", type=int, default=8)
     parser.add_argument("--num-matches", type=int, default=6)
     parser.add_argument("--no-mask-weighted-h", action="store_true")
+    parser.add_argument("--normalized-dlt", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--pretrain-phase", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mask-method", choices=["flow_matching", "homogan_cnn", "none"], default="flow_matching")
@@ -289,6 +325,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--window-size", type=int, default=8)
     parser.add_argument("--mlp-ratio", type=float, default=3.0)
+    parser.add_argument("--refine-iters", type=int, default=1)
+    parser.add_argument("--refine-detach-between", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--refine-gamma", type=float, default=0.8)
+    parser.add_argument("--feature-channels", type=int, default=1)
+    parser.add_argument("--use-correlation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--corr-radius", type=int, default=4)
     parser.add_argument("--mask-flow-base-channels", type=int, default=32)
     parser.add_argument("--mask-flow-channel-mults", type=parse_ints, default=(1, 2, 4, 4))
     parser.add_argument("--mask-flow-time-dim", type=int, default=128)

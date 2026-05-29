@@ -11,15 +11,19 @@ __all__ = ["FeatureExtractor", "feature_extractor"]
 class FeatureExtractor(nn.Module):
     """Multi-scale feature pyramid extractor used by HomoGAN's transformer."""
 
-    def __init__(self, embed_dim, num_layers, activation):
+    def __init__(self, embed_dim, num_layers, activation, in_channels: int = 1):
         super(FeatureExtractor, self).__init__()
         self.embed_dim = embed_dim
         self.num_layers = num_layers
         self.activation = activation
+        self.in_channels = int(in_channels)
         self.convs = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            in_channel = int(
-                (self.embed_dim * 2 ** (i_layer - 1)) ** np.heaviside(i_layer, 0))  # 1, embed_dim, 2*embed_dim ...
+            if i_layer == 0:
+                in_channel = self.in_channels
+            else:
+                in_channel = int(
+                    (self.embed_dim * 2 ** (i_layer - 1)) ** np.heaviside(i_layer, 0))  # embed_dim, 2*embed_dim ...
             out_channel = int((self.embed_dim * 2 ** i_layer) ** np.heaviside(i_layer + 1,
                                                                               0))  # embed_dim, 2*embed_dim, 4*embed_dim...
             layer = nn.Sequential(

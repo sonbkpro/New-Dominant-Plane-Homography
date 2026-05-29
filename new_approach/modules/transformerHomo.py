@@ -30,6 +30,7 @@ try:
     from ..geometry_homo import flow_mask_to_homography
     from .featureHomo import FeatureExtractor, feature_extractor
     from .maskFlowHomo import DominantMaskFlow, build_mask_condition
+    from .correlation import local_correlation
 except ImportError:
     try:
         from geometry_homo import flow_mask_to_homography
@@ -37,6 +38,7 @@ except ImportError:
         flow_mask_to_homography = None
     from featureHomo import FeatureExtractor, feature_extractor
     from maskFlowHomo import DominantMaskFlow, build_mask_condition
+    from correlation import local_correlation
 
 # Ported from megvii-research/HomoGAN:
 # https://github.com/megvii-research/HomoGAN
@@ -178,7 +180,7 @@ def gen_basis(h, w, is_qr=True, is_scale=True):
     flows = torch.cat([names["basis_" + str(i)] for i in range(1, basis_nb + 1)], dim=0)
     if is_qr:
         flows_ = flows.view(basis_nb, -1).permute(1, 0)  # N, h, w, c --> N, h*w*c --> h*w*c, N
-        flow_q, _ = torch.qr(flows_)
+        flow_q, _ = torch.linalg.qr(flows_, mode="reduced")
         flow_q = flow_q.permute(1, 0).reshape(basis_nb, h, w, 2)
         flows = flow_q
 
@@ -332,6 +334,20 @@ class SwinTransformer(nn.Module):
         self.mlp_ratio = param.mlp_ratio
         self.drop_path = 0
         self.activation = nn.GELU
+        self.est_ref_channels = int(_param(param, "est_ref_channels", 1))
+        total_in_chans = int(_param(param, "in_chans", 2))
+        if self.est_ref_channels < 1 or self.est_ref_channels >= total_in_chans:
+            raise ValueError(
+                f"est_ref_channels must be in [1, in_chans-1], got {self.est_ref_channels} for {total_in_chans}"
+            )
+        pyramid_in_channels = self.est_ref_channels
+        est_tgt_channels = total_in_chans - self.est_ref_channels
+        self.est_ref_proj = nn.Identity()
+        self.est_tgt_proj = (
+            nn.Identity()
+            if est_tgt_channels == pyramid_in_channels
+            else nn.Conv2d(est_tgt_channels, pyramid_in_channels, 1)
+        )
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -356,7 +372,7 @@ class SwinTransformer(nn.Module):
 
         # build feature extractors
         self.feature_pyramid_extractor = FeatureExtractor(self.embed_dim // 2, self.num_layers,
-                                                          self.activation)
+                                                          self.activation, in_channels=pyramid_in_channels)
 
         # build layers
         self.encoder_layers = nn.ModuleList()
@@ -402,12 +418,14 @@ class SwinTransformer(nn.Module):
 
     def forward(self, x):
         """
-            x shape: bs, 2, h, w
+            x shape: bs, C, h, w.  The first est_ref_channels are the reference
+            stream; all remaining channels are projected to the target stream.
         """
         # forward_features
         bs, _, h_patch, w_patch = x.shape
         query_token = self.query_token.repeat(bs, 1, 1)
-        x1_patch, x2_patch = x[:, :1], x[:, 1:]
+        x1_patch = self.est_ref_proj(x[:, :self.est_ref_channels])
+        x2_patch = self.est_tgt_proj(x[:, self.est_ref_channels:])
         x1_pyramid = self.feature_pyramid_extractor(x1_patch)  # + [x1_patch]
         x2_pyramid = self.feature_pyramid_extractor(x2_patch)  # + [x2_patch]
         weight_f = 0
@@ -561,7 +579,7 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -773,7 +791,7 @@ class WindowCrossAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing="ij"))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -1249,9 +1267,13 @@ class HomoNet(nn.Module):
 
         self.init_mode = init_mode
         self.params = params
-        self.fea_extra = feature_extractor(self.params.in_channels, 1)
+        self.feature_channels = int(_param(self.params, "feature_channels", 1))
+        self.use_correlation = _param_bool(self.params, "use_correlation", False)
+        self.corr_radius = int(_param(self.params, "corr_radius", 4))
+        self.fea_extra = feature_extractor(self.params.in_channels, self.feature_channels)
+        self.mask_fea_proj = nn.Identity() if self.feature_channels == 1 else nn.Conv2d(self.feature_channels, 1, 1)
         self.h_net = backbone(params, norm_layer=norm_layer)
-        self.basis = gen_basis(self.params.crop_size[0], self.params.crop_size[1]).unsqueeze(0).reshape(1, 8, -1)
+        self.basis = gen_basis(self.params.crop_size[0], self.params.crop_size[1]).unsqueeze(0).reshape(1, self.params.num_basis, -1)
         self.apply(self._init_weights)
         self.mask_method = str(_param(self.params, "mask_method", "flow_matching")).lower()
         self.mask_pred = None
@@ -1270,6 +1292,38 @@ class HomoNet(nn.Module):
             )
         elif self.mask_method not in {"none", "all_one", "all_ones"}:
             raise ValueError(f"Unsupported mask_method: {self.mask_method}")
+
+    def _mask_feature(self, feature):
+        return self.mask_fea_proj(feature)
+
+    def _estimator_input(self, fea_ref, fea_tgt):
+        if not self.use_correlation:
+            return torch.cat([fea_ref, fea_tgt], dim=1)
+        radius = max(int(self.corr_radius), 0)
+        ref_norm = F.normalize(fea_ref, dim=1, eps=1e-6)
+        tgt_norm = F.normalize(fea_tgt, dim=1, eps=1e-6)
+        corr = local_correlation(ref_norm, tgt_norm, radius=radius)
+        return torch.cat([fea_ref, fea_tgt, corr], dim=1)
+
+    def _estimate_flow_iter(self, fea_ref, fea_tgt, h_patch, w_patch):
+        bs = fea_ref.shape[0]
+        iters = max(int(_param(self.params, "refine_iters", 1)), 1)
+        detach_between = _param_bool(self.params, "refine_detach_between", True)
+        basis = self.basis.to(device=fea_ref.device, dtype=fea_ref.dtype)
+        flow = None
+        weight_total = None
+        inter_flows = []
+        for idx in range(iters):
+            if idx == 0:
+                tgt_warp = fea_tgt
+            else:
+                warp_flow = flow.detach() if detach_between else flow
+                tgt_warp = get_warp_flow(fea_tgt, warp_flow)
+            delta = self.h_net(self._estimator_input(fea_ref, tgt_warp))
+            weight_total = delta if weight_total is None else weight_total + delta
+            flow = (basis * weight_total).sum(1).reshape(bs, 2, h_patch, w_patch)
+            inter_flows.append(flow)
+        return flow, inter_flows
 
     def _init_weights(self, m):
         if "swin" in self.init_mode:
@@ -1334,14 +1388,10 @@ class HomoNet(nn.Module):
 
         # ========================forward ====================================
 
-        forward_fea = torch.cat([img1_patch_fea, img2_patch_fea], dim=1)
-        weight_f = self.h_net(forward_fea)
-        H_flow_f = (self.basis.to(forward_fea.device) * weight_f).sum(1).reshape(bs, 2, h_patch, w_patch)
+        H_flow_f, inter_flows_f = self._estimate_flow_iter(img1_patch_fea, img2_patch_fea, h_patch, w_patch)
 
         # ========================backward===================================
-        backward_fea = torch.cat([img2_patch_fea, img1_patch_fea], dim=1)
-        weight_b = self.h_net(backward_fea)
-        H_flow_b = (self.basis.to(backward_fea.device) * weight_b).sum(1).reshape(bs, 2, h_patch, w_patch)
+        H_flow_b, inter_flows_b = self._estimate_flow_iter(img2_patch_fea, img1_patch_fea, h_patch, w_patch)
 
         if self.training:
             warp_img1_patch, warp_img1_patch_fea = list(
@@ -1356,6 +1406,14 @@ class HomoNet(nn.Module):
 
         img1_patch_warp_fea, img2_patch_warp_fea = list(
             map(self.fea_extra, [warp_img1_patch, warp_img2_patch]))
+        output_extra = {}
+        if self.training and _param_bool(self.params, "refine_supervision", True):
+            output_extra["warp_img1_patch_fea_iters"] = [
+                get_warp_flow(img1_full_fea, flow, start) for flow in inter_flows_b
+            ]
+            output_extra["warp_img2_patch_fea_iters"] = [
+                get_warp_flow(img2_full_fea, flow, start) for flow in inter_flows_f
+            ]
         # ============================= mask==========================================
         img1_mask_cond, img2_mask_cond = None, None
         if _param_bool(self.params, "pretrain_phase", False):
@@ -1372,17 +1430,21 @@ class HomoNet(nn.Module):
             sample_solver = str(_param(self.params, "mask_flow_solver", "euler"))
             sample_init = str(_param(self.params, "mask_flow_init", "zero"))
 
+            img1_mask_fea = self._mask_feature(img1_patch_fea)
+            img2_mask_fea = self._mask_feature(img2_patch_fea)
+            warp_img1_mask_fea = self._mask_feature(warp_img1_patch_fea)
+            warp_img2_mask_fea = self._mask_feature(warp_img2_patch_fea)
             img1_mask_cond = build_mask_condition(
-                reference_feature=img1_patch_fea,
-                warped_feature=warp_img2_patch_fea,
+                reference_feature=img1_mask_fea,
+                warped_feature=warp_img2_mask_fea,
                 reference_image=img1_patch,
                 warped_image=warp_img2_patch,
                 flow=H_flow_f,
                 detach=detach_condition,
             )
             img2_mask_cond = build_mask_condition(
-                reference_feature=img2_patch_fea,
-                warped_feature=warp_img1_patch_fea,
+                reference_feature=img2_mask_fea,
+                warped_feature=warp_img1_mask_fea,
                 reference_image=img2_patch,
                 warped_image=warp_img1_patch,
                 flow=H_flow_b,
@@ -1407,9 +1469,9 @@ class HomoNet(nn.Module):
         else:
             if self.params.mask_use_fea:
                 img1_patch_mask = self.mask_pred(
-                    torch.cat((img1_patch_fea.detach(), warp_img2_patch_fea.detach()), dim=1))
+                    torch.cat((self._mask_feature(img1_patch_fea).detach(), self._mask_feature(warp_img2_patch_fea).detach()), dim=1))
                 img2_patch_mask = self.mask_pred(
-                    torch.cat((img2_patch_fea.detach(), warp_img1_patch_fea.detach()), dim=1))
+                    torch.cat((self._mask_feature(img2_patch_fea).detach(), self._mask_feature(warp_img1_patch_fea).detach()), dim=1))
 
             else:
                 img1_patch_mask = self.mask_pred(torch.cat((img1_patch, warp_img2_patch), dim=1))
@@ -1430,7 +1492,7 @@ class HomoNet(nn.Module):
             H_flow_b = upsample2d_flow_as(H_flow_b, img1_full, mode="bilinear", if_rate=True)
         H_flow_f, H_flow_b = H_flow_f.permute(0, 2, 3, 1), H_flow_b.permute(0, 2, 3, 1)
 
-        return {"warp_img1_patch_fea": warp_img1_patch_fea, "warp_img2_patch_fea": warp_img2_patch_fea,
+        output = {"warp_img1_patch_fea": warp_img1_patch_fea, "warp_img2_patch_fea": warp_img2_patch_fea,
                 "img1_patch_warp_fea": img1_patch_warp_fea, "img2_patch_warp_fea": img2_patch_warp_fea,
                 "warp_img1_patch": warp_img1_patch, "warp_img2_patch": warp_img2_patch,
                 "img1_patch_fea": img1_patch_fea, "img2_patch_fea": img2_patch_fea,
@@ -1439,6 +1501,8 @@ class HomoNet(nn.Module):
                 "warp_img1_patch_mask": warp_img1_patch_mask, "warp_img2_patch_mask": warp_img2_patch_mask,
                 "img1_mask_cond": img1_mask_cond, "img2_mask_cond": img2_mask_cond,
                 "mask_method": self.mask_method, "H_f": H_f, "H_b": H_b}
+        output.update(output_extra)
+        return output
 
 
 def Ms_Transformer(pretrained=False, **kwargs):

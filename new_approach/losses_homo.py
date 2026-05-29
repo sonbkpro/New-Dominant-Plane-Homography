@@ -54,6 +54,10 @@ def masked_triplet_alignment_loss(
     mask: torch.Tensor,
     margin: float = 1.0,
     eps: float = 1e-6,
+    robust: str = "none",
+    trunc_frac: float = 0.15,
+    charbonnier_eps: float = 1e-3,
+    tukey_c: float = 4.685,
 ) -> torch.Tensor:
     if mask.shape[-2:] != anchor.shape[-2:]:
         mask = F.interpolate(mask, size=anchor.shape[-2:], mode="bilinear", align_corners=False)
@@ -63,6 +67,25 @@ def masked_triplet_alignment_loss(
     ap = torch.abs(anchor - positive).mean(dim=1, keepdim=True)
     an = torch.abs(anchor - negative).mean(dim=1, keepdim=True)
     loss_map = F.relu(ap - an + float(margin))
+    robust = str(robust).lower()
+    if robust == "charbonnier":
+        # Charbonnier is a mild smoother here, not a strong foreground outlier rejector.
+        loss_map = torch.sqrt(loss_map.pow(2) + float(charbonnier_eps) ** 2) - float(charbonnier_eps)
+    elif robust == "truncated":
+        trunc_frac = min(max(float(trunc_frac), 0.0), 0.95)
+        if trunc_frac > 0.0:
+            flat = loss_map.flatten(1).float()
+            cutoff = torch.quantile(flat, 1.0 - trunc_frac, dim=1, keepdim=True)
+            cutoff = cutoff.to(dtype=loss_map.dtype).view(-1, 1, 1, 1)
+            mask = mask * (loss_map <= cutoff).to(mask.dtype)
+    elif robust == "tukey":
+        c = max(float(tukey_c), eps)
+        scaled = (loss_map / c).float()
+        tukey_weight = torch.square(1.0 - scaled.square()).clamp_min(0.0)
+        tukey_weight = torch.where(scaled < 1.0, tukey_weight, torch.zeros_like(tukey_weight))
+        mask = mask * tukey_weight.to(mask.dtype)
+    elif robust != "none":
+        raise ValueError(f"unsupported robust alignment loss: {robust}")
     weighted = loss_map * mask
     denom = mask.flatten(1).sum(dim=1).clamp_min(eps)
     return (weighted.flatten(1).sum(dim=1) / denom).mean()
