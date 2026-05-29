@@ -104,8 +104,15 @@ def save_checkpoint(
     )
 
 
+def torch_load_checkpoint(path: str | Path) -> Dict:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def load_checkpoint(path: str, model, optimizer=None, strict: bool = False) -> Dict:
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch_load_checkpoint(path)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state, strict=strict)
     print(f"loaded checkpoint {path}")
@@ -119,7 +126,7 @@ def load_checkpoint(path: str, model, optimizer=None, strict: bool = False) -> D
 
 
 def load_mask_flow_checkpoint(path: str, model) -> None:
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch_load_checkpoint(path)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.mask_flow.load_state_dict(state, strict=False)
     print(f"loaded mask_flow checkpoint {path}")
@@ -409,7 +416,7 @@ def run_synthetic_mask(args, device) -> Path:
         noise_sigma=args.mask_flow_noise_sigma,
     ).to(device)
     if args.mask_flow_checkpoint and Path(args.mask_flow_checkpoint).exists():
-        ckpt = torch.load(args.mask_flow_checkpoint, map_location="cpu")
+        ckpt = torch_load_checkpoint(args.mask_flow_checkpoint)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         mask_flow.load_state_dict(state, strict=False)
         print(f"loaded mask_flow checkpoint {args.mask_flow_checkpoint}")
