@@ -203,7 +203,7 @@ def compute_homography_loss(output: Dict, use_masks: bool, use_open: bool) -> Di
 def compute_pseudo_mask_flow_loss(model, output: Dict, data_batch: Dict, args) -> Dict[str, torch.Tensor]:
     if getattr(model, "mask_flow", None) is None:
         zero = output["img1_patch_fea"].new_tensor(0.0)
-        return {"fm": zero, "pseudo_conf": zero}
+        return {"fm": zero, "pseudo_bce": zero, "pseudo_dice": zero, "pseudo_conf": zero}
 
     img1_patch = data_batch["imgs_gray_patch"][:, :1]
     img2_patch = data_batch["imgs_gray_patch"][:, 1:]
@@ -239,10 +239,35 @@ def compute_pseudo_mask_flow_loss(model, output: Dict, data_batch: Dict, args) -
         noise_sigma=args.mask_flow_noise_sigma,
         confidence=conf_2,
     )
+    sample_1 = model.mask_flow.sample(
+        output["img1_mask_cond"],
+        steps=args.mask_flow_steps,
+        solver=args.mask_flow_solver,
+        init=args.mask_flow_init,
+        requires_grad=True,
+    )
+    sample_2 = model.mask_flow.sample(
+        output["img2_mask_cond"],
+        steps=args.mask_flow_steps,
+        solver=args.mask_flow_solver,
+        init=args.mask_flow_init,
+        requires_grad=True,
+    )
+    bce = 0.5 * (
+        weighted_bce_loss(sample_1, target_1, conf_1)
+        + weighted_bce_loss(sample_2, target_2, conf_2)
+    )
+    dice = 0.5 * (
+        soft_dice_loss(sample_1, target_1, conf_1)
+        + soft_dice_loss(sample_2, target_2, conf_2)
+    )
     return {
         "fm": 0.5 * (loss_1 + loss_2),
+        "pseudo_bce": bce,
+        "pseudo_dice": dice,
         "pseudo_conf": 0.5 * (conf_1.mean().detach() + conf_2.mean().detach()),
         "pseudo_area": 0.5 * (target_1.mean().detach() + target_2.mean().detach()),
+        "pseudo_sample_mean": 0.5 * (sample_1.mean().detach() + sample_2.mean().detach()),
     }
 
 
@@ -265,7 +290,31 @@ def compute_mask_regularizers(output: Dict, args) -> Dict[str, torch.Tensor]:
     }
 
 
-def soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def weighted_bce_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    confidence: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    loss = F.binary_cross_entropy(pred.clamp(1e-6, 1.0 - 1e-6), target, reduction="none")
+    if confidence is not None:
+        if confidence.shape[-2:] != loss.shape[-2:]:
+            confidence = F.interpolate(confidence, size=loss.shape[-2:], mode="bilinear", align_corners=False)
+        loss = loss * confidence.clamp_min(0.0)
+    return loss.mean()
+
+
+def soft_dice_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    confidence: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if confidence is not None:
+        if confidence.shape[-2:] != pred.shape[-2:]:
+            confidence = F.interpolate(confidence, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+        confidence = confidence.clamp_min(0.0)
+        pred = pred * confidence
+        target = target * confidence
     pred = pred.flatten(1)
     target = target.flatten(1)
     intersection = (pred * target).sum(dim=1)
@@ -322,6 +371,8 @@ def train_homography_epoch(model, loader, optimizer, device, args, epoch: int, j
         total = args.lambda_align * h_losses["align_total"]
         if joint:
             total = total + args.lambda_fm * pseudo_losses["fm"]
+            total = total + args.lambda_mask_bce * pseudo_losses["pseudo_bce"]
+            total = total + args.lambda_mask_dice * pseudo_losses["pseudo_dice"]
             total = total + args.lambda_area * mask_losses["mask_area"]
             total = total + args.lambda_tv * mask_losses["mask_tv"]
             if epoch >= args.entropy_warmup_epochs:
@@ -356,7 +407,7 @@ def train_synthetic_mask_epoch(mask_flow, optimizer, loader, device, args, epoch
         cond = build_mask_condition(img2, warped_img1, img2, warped_img1, flow, detach=False)
         fm = flow_matching_loss(mask_flow, cond, target, noise_sigma=args.mask_flow_noise_sigma)
         sampled = mask_flow.sample(cond, steps=args.mask_flow_steps, solver=args.mask_flow_solver, requires_grad=True)
-        bce = F.binary_cross_entropy(sampled.clamp(1e-6, 1.0 - 1e-6), target)
+        bce = weighted_bce_loss(sampled, target)
         dice = soft_dice_loss(sampled, target)
         area = mask_area_loss(sampled, args.mask_min_area, args.mask_max_area)
         tv = mask_total_variation_loss(sampled)
@@ -537,7 +588,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-flow-temperature", type=float, default=1.0)
     parser.add_argument("--mask-flow-noise-sigma", type=float, default=1.0)
     parser.add_argument("--mask-flow-detach-condition", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--mask-flow-sample-grad", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mask-flow-sample-grad", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--return-h-matrix", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--lr-homo", type=float, default=1e-4)
