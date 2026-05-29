@@ -1,0 +1,3405 @@
+# PLAN_TIP: Conditional Flow-Matching Dominant-Plane Support And Reliability For TIP-Level Homography Estimation
+
+Authoring goal:
+This file is a complete implementation blueprint for Claude or another coding agent.
+It upgrades the current `new_approach` implementation into a stronger IEEE TIP submission candidate.
+
+Important scope rule:
+Ignore the older `plan.txt`. This document is based on the current New Approach and on `plan_new.txt`,
+but it changes the scientific framing from "replace HomoGAN's GAN mask" to:
+
+    Learn dominant-plane support with a conditional flow model, validate whether its
+    samples form a real posterior or only a disagreement estimate, use the support
+    for robust homography projection, and estimate when the single-homography model
+    should be trusted or rejected.
+
+The implementation must keep the current codebase usable while adding TIP-level novelty.
+Do not delete the current flow-matching implementation immediately. Extend it.
+
+
+================================================================================
+0. Executive Summary
+================================================================================
+
+The existing New Approach already implements the engineering baseline:
+
+    image pair
+      -> featureHomo shallow features
+      -> transformerHomo dense homography-induced flow
+      -> conditional flow-matching mask module
+      -> masked homography alignment loss
+
+This is a good engineering replacement for HomoGAN's adversarial mask.
+However, for IEEE TIP, this alone is probably not novel enough because prior work already covers:
+
+1. content-aware masks for homography,
+2. dynamic object masks for homography,
+3. dominant-plane/coplanarity masks with GANs,
+4. pseudo plane masks and multi-homography estimation,
+5. transformer and recurrent refinement for homography.
+
+The upgraded TIP-level method should therefore be:
+
+    Conditional Flow-Matching Dominant-Plane Support And Reliability
+
+Short method name suggestion:
+
+    DPC-Homo
+
+or, if emphasizing the flow model:
+
+    FlowDPC-Homo
+
+Core idea:
+
+    Do not treat the flow-matching mask as a deterministic attention mask.
+    Treat it as a conditional support distribution over the dominant-plane
+    support, and call it a posterior only if the training objective supplies
+    genuine conditional ambiguity:
+
+        p_theta(M | I_a, I_b, H_0, R, C)
+
+    where:
+
+        M   = dominant-plane support mask,
+        I_a = first image,
+        I_b = second image,
+        H_0 = initial homography-induced flow or matrix,
+        R   = residual evidence after warping,
+        C   = bidirectional/cycle consistency evidence.
+
+Then use this support distribution or validated posterior to compute:
+
+1. mean support map,
+2. sample variance / ambiguity or disagreement map,
+3. entropy map,
+4. robust weighted DLT projection,
+5. pair-level reliability score,
+6. invalid single-homography detection.
+
+This changes the paper's claim from:
+
+    "We use flow matching to predict masks."
+
+to:
+
+    "We formulate unsupervised homography estimation as dominant-plane support
+    consensus with reliability estimation, where a conditional flow model represents
+    either a validated posterior or an empirically calibrated disagreement signal."
+
+
+0.1 Critical Corrections From Review
+------------------------------------
+
+This plan must not assume that noisy flow-matching sampling automatically creates
+calibrated posterior uncertainty.
+
+With one deterministic target mask per condition, rectified or conditional flow
+matching learns a field that transports every source sample toward the same target
+mask in the ideal limit. Under that training setup, K-sample variance is mostly
+finite-capacity, finite-step, or injected-noise disagreement. It is not a
+principled posterior by construction.
+
+Therefore:
+
+1. Use the word "posterior" only for the multimodal-target or latent-variable
+   version described below.
+2. If multimodal targets are not implemented, call K-sample variance "sample
+   disagreement" and calibrate it empirically against reprojection error.
+3. Run the K-sample variance/disagreement versus error experiment before using
+   "posterior" in the paper title, abstract, or contribution list.
+4. Treat weighted DLT as robust projection from one global basis-flow field, not
+   as multi-plane reasoning or a major standalone novelty.
+5. Center the paper on reliability, abstention, and invalid single-homography
+   detection. Support masks and robust DLT are mechanisms that make this possible.
+
+
+================================================================================
+1. What Must Be Novel
+================================================================================
+
+1.1 Novelty Target
+------------------
+
+The paper should claim novelty in the following combination:
+
+1. A conditional flow-matching support model that becomes a true posterior only
+   when trained with multimodal or latent-variable targets.
+2. A geometry-coupled source path from crude residual consensus to refined support,
+   instead of generic Gaussian-noise-to-mask generation.
+3. Mean support, entropy, and empirically validated variance/disagreement statistics.
+4. Uncertainty-aware robust DLT projection from dense flow using support weights
+   and diagnostics.
+5. Pair-level reliability prediction for detecting invalid single-homography cases.
+6. A TIP-grade evaluation protocol including accuracy, calibration, failure detection,
+   risk-coverage, runtime, and stress tests.
+
+The most important novelty is not the U-Net, the transformer, or the fact that the
+mask is learned. The novelty is reliability-aware dominant-plane support consensus
+with validated uncertainty or calibrated disagreement.
+
+
+1.2 Claims To Avoid
+-------------------
+
+Do not claim:
+
+1. "We are the first to use masks for homography."
+2. "We are the first to handle dynamic objects in homography."
+3. "We are the first to estimate the dominant plane."
+4. "We are the first to use transformers for homography."
+5. "We are the first to estimate multiple planes."
+6. "Flow matching itself is new."
+
+Instead claim:
+
+1. Flow matching is used to model conditional geometric support.
+2. Multimodal or latent training is required before calling sample variance a posterior.
+3. The method estimates not only a homography, but also where it is valid and
+   whether it is reliable.
+4. The method can abstain or down-rank image pairs where a single homography is
+   physically invalid.
+
+
+1.3 Reviewer-Facing One-Sentence Contribution
+---------------------------------------------
+
+Suggested one-sentence contribution:
+
+    We propose a conditional flow-matching dominant-plane support model that converts
+    residual geometric evidence into validated support distributions or calibrated
+    disagreement maps, enabling robust projection and reliability estimation for
+    unsupervised deep homography in multi-plane and dynamic scenes.
+
+
+================================================================================
+2. Current Codebase Anchors
+================================================================================
+
+The current implementation already contains the following useful pieces.
+
+2.1 Existing Model Files
+------------------------
+
+Use these files as anchors:
+
+1. `new_approach/modules/featureHomo.py`
+
+   Existing role:
+
+       image -> shallow feature map
+
+   Important classes/functions:
+
+       FeatureExtractor
+       feature_extractor
+
+2. `new_approach/modules/transformerHomo.py`
+
+   Existing role:
+
+       feature pair -> dense homography-induced flow
+       optional mask prediction
+
+   Important classes/functions:
+
+       SwinTransformer
+       HomoNet
+       Ms_Transformer
+       fetch_net
+       get_warp_flow
+       upsample2d_flow_as
+       gen_basis
+       Discriminator
+       ASPP
+
+   Current output keys include:
+
+       warp_img1_patch_fea
+       warp_img2_patch_fea
+       img1_patch_warp_fea
+       img2_patch_warp_fea
+       warp_img1_patch
+       warp_img2_patch
+       img1_patch_fea
+       img2_patch_fea
+       flow_f
+       flow_b
+       img1_patch_mask
+       img2_patch_mask
+       warp_img1_patch_mask
+       warp_img2_patch_mask
+       img1_mask_cond
+       img2_mask_cond
+       mask_method
+       H_f
+       H_b
+
+3. `new_approach/modules/maskFlowHomo.py`
+
+   Existing role:
+
+       conditional flow-matching mask generator
+
+   Important classes/functions:
+
+       DominantMaskFlow
+       MaskFlowUNet
+       build_mask_condition
+       logits_from_mask
+       mask_from_logits
+       make_flow_matching_batch
+
+4. `new_approach/losses_homo.py`
+
+   Existing role:
+
+       alignment loss, flow matching loss, mask regularizers, pseudo masks
+
+   Important functions:
+
+       masked_triplet_alignment_loss
+       feature_identity_loss
+       flow_matching_loss
+       mask_area_loss
+       mask_total_variation_loss
+       mask_entropy_loss
+       bidirectional_mask_intersection
+       pseudo_mask_from_residuals
+       morphology_close_soft
+
+5. `new_approach/geometry_homo.py`
+
+   Existing role:
+
+       convert dense homography-induced flow and optional mask weights to 3x3 H
+
+   Important function:
+
+       flow_mask_to_homography
+
+6. `new_approach/train_new.py`
+
+   Existing role:
+
+       synthetic mask flow pretraining,
+       homography pretraining,
+       joint training
+
+7. `new_approach/evaluate.py`
+
+   Existing role:
+
+       evaluate homography using dense flow converted to matrix,
+       optionally using mask-weighted DLT.
+
+
+2.2 Existing Data Keys
+----------------------
+
+The current model expects batches with keys such as:
+
+    imgs_gray_full:  [B, 2, H_full, W_full]
+    imgs_gray_patch: [B, 2, H_patch, W_patch]
+    start:           crop offset or warp start tensor
+    pts:             source patch points
+    pair_name:       optional for evaluation
+    video_names:     optional for evaluation
+    pt_set:          optional coordinate annotations
+
+Do not break these keys.
+
+
+2.3 Available Real Correspondence Labels
+----------------------------------------
+
+The local repository has enough real correspondence labels for meaningful
+reliability evaluation if they are split carefully:
+
+    Data/Coordinate-v2/Coordinate-v2: about 4200 .npy coordinate files
+    Data/Test_List.txt:              about 4199 image pairs
+
+Use these labels for real reprojection-error targets, risk-coverage curves,
+failure ROC-AUC, ECE, and reliability diagrams.
+
+Do not train and evaluate calibration on the same real pairs. Use:
+
+1. synthetic valid/invalid data for primary reliability training,
+2. a held-out real validation split for calibration and threshold selection,
+3. a separate real test split for final reliability and risk-coverage reporting.
+
+If a future checkout lacks these coordinate files, scope reliability calibration
+to synthetic stress tests plus whatever real labels are available, and state that
+limitation explicitly.
+
+
+2.4 Existing Flow Convention
+----------------------------
+
+The existing code computes:
+
+    H_flow_f from concat(img1_patch_fea, img2_patch_fea)
+    H_flow_b from concat(img2_patch_fea, img1_patch_fea)
+
+Then:
+
+    warp_img2_patch = get_warp_flow(img2, H_flow_f, start)
+    warp_img1_patch = get_warp_flow(img1, H_flow_b, start)
+
+The current naming is slightly confusing, so preserve it in code but document it.
+When adding new outputs, be explicit:
+
+    img1 frame = support/mask for image 1 after comparing img1 to warped image 2
+    img2 frame = support/mask for image 2 after comparing img2 to warped image 1
+
+
+================================================================================
+3. New Method Overview
+================================================================================
+
+3.1 High-Level Pipeline
+-----------------------
+
+The upgraded model should run:
+
+    Input pair:
+        I1, I2
+
+    Step 1: Initial homography flow
+        HNet predicts dense flows:
+            F_12 or H_flow_b depending on existing convention
+            F_21 or H_flow_f depending on existing convention
+
+    Step 2: Warp evidence
+        Warp images and features using initial flow.
+        Compute feature residuals, image residuals, flow magnitude, and cycle cues.
+
+    Step 3: Crude geometric consensus seed
+        Convert residuals into a seed support logit map:
+            z_seed = residual_consensus_logits(...)
+
+    Step 4: Conditional flow-matching support distribution
+        Sample N support masks:
+            M_k ~ p_theta(M | condition, z_seed)
+
+        Compute distribution statistics:
+            q_mean = mean_k M_k
+            q_var  = var_k M_k
+            q_ent  = entropy(q_mean)
+
+        Interpret q_var as posterior uncertainty only after multimodal or
+        latent-variable training and empirical calibration. Otherwise interpret
+        it as sample disagreement.
+
+    Step 5: Trusted support
+        Combine forward/backward posterior support:
+            trusted_img1 = q1_mean * warp(q2_mean)
+            trusted_img2 = q2_mean * warp(q1_mean)
+
+    Step 6: Robust homography projection
+        Fit a robust projected homography from the single global dense flow
+        using support weights:
+            H_projected = weighted_DLT(flow, support_weight)
+
+    Step 7: Reliability prediction
+        Predict scalar reliability:
+            s = P(single dominant homography is valid)
+
+    Step 8: Output
+        Return:
+            dense flows,
+            projected homographies,
+            mean support maps,
+            uncertainty or disagreement maps,
+            reliability score,
+            diagnostic statistics.
+
+
+3.2 Main Outputs
+----------------
+
+Add these output keys to `HomoNet.forward`.
+
+Keep existing keys:
+
+    img1_patch_mask
+    img2_patch_mask
+    warp_img1_patch_mask
+    warp_img2_patch_mask
+    img1_mask_cond
+    img2_mask_cond
+    flow_f
+    flow_b
+    H_f
+    H_b
+
+Add new keys:
+
+    img1_mask_samples
+    img2_mask_samples
+    img1_mask_logits_samples
+    img2_mask_logits_samples
+    img1_mask_mean
+    img2_mask_mean
+    img1_mask_var
+    img2_mask_var
+    img1_mask_entropy
+    img2_mask_entropy
+    warp_img1_mask_mean
+    warp_img2_mask_mean
+    trusted_f
+    trusted_b
+    support_weight_f
+    support_weight_b
+    H_f_initial
+    H_b_initial
+    H_f_refined
+    H_b_refined
+    reliability_logit
+    reliability
+    reliability_features
+    consensus_seed_img1
+    consensus_seed_img2
+    consensus_seed_logits_img1
+    consensus_seed_logits_img2
+    residual_stats
+    posterior_stats_or_disagreement_stats
+    dlt_stats
+
+Compatibility rule:
+
+    Set img1_patch_mask = img1_mask_mean
+    Set img2_patch_mask = img2_mask_mean
+
+This allows existing training and evaluation code to keep working.
+
+
+3.3 Posterior Or Disagreement Statistics
+----------------------------------------
+
+For sampled masks:
+
+    samples: [B, K, 1, H, W]
+
+Compute:
+
+    q_mean = samples.mean(dim=1)
+    q_var  = samples.var(dim=1, unbiased=False)
+    q_ent  = -q_mean * log(q_mean) - (1 - q_mean) * log(1 - q_mean)
+
+Expected behavior after the multimodal/latent posterior fix:
+
+1. the residual evidence is ambiguous,
+2. multiple planes explain different parts of the image,
+3. the mask boundary is unclear,
+4. dynamic foreground occupies large support,
+5. the initial homography is compromised.
+
+If the model is trained with one deterministic target per condition, these
+statistics are not a principled posterior. In that case:
+
+    q_mean = mean support
+    q_var  = sample disagreement
+    q_ent  = support entropy
+
+The manuscript may call q_var "uncertainty" only if it is empirically calibrated
+against reprojection error and the wording makes clear that it is calibrated
+disagreement, not a formal posterior.
+
+
+3.4 Reliability Definition
+--------------------------
+
+The reliability score should mean:
+
+    reliability = P(the pair admits a useful single dominant homography)
+
+It is not semantic correctness.
+It is not mask IoU.
+It is not inverse of loss only.
+
+A pair is reliable if:
+
+1. there is a sufficiently large dominant support region,
+2. residual inside support is low,
+3. forward/backward support is consistent,
+4. validated uncertainty or calibrated disagreement is not excessive,
+5. weighted DLT is numerically stable,
+6. estimated H has reasonable forward/backward agreement,
+7. point errors or synthetic known errors are expected to be below a threshold.
+
+
+================================================================================
+4. Files To Create
+================================================================================
+
+Create these files.
+
+4.1 `new_approach/modules/consensusHomo.py`
+-------------------------------------------
+
+Purpose:
+
+    Geometry-specific consensus utilities:
+    residual seed masks, posterior statistics, support weights, diagnostics.
+
+Required functions/classes:
+
+    robust_normalize_map
+    residual_to_seed_logits
+    residual_consensus_seed
+    posterior_mask_stats
+    entropy_from_probability
+    bidirectional_posterior_consensus
+    support_weight_from_posterior
+    residual_statistics
+    dlt_diagnostics
+    build_reliability_feature_vector
+
+
+4.2 `new_approach/modules/reliabilityHomo.py`
+---------------------------------------------
+
+Purpose:
+
+    Pair-level reliability prediction.
+
+Required classes:
+
+    ReliabilityHead
+    ReliabilityFeatureMLP
+
+Optional classes:
+
+    SpatialUncertaintyHead
+
+
+4.3 `new_approach/losses_tip.py`
+--------------------------------
+
+Purpose:
+
+    TIP-level losses separated from the existing baseline losses.
+
+Required functions:
+
+    support_flow_matching_loss
+    geometry_coupled_flow_matching_loss
+    uncertainty_weighted_alignment_loss
+    support_consistency_loss
+    support_diversity_loss
+    reliability_bce_loss
+    reliability_quality_regression_loss
+    brier_score_loss
+    soft_ece_loss
+    invalid_pair_margin_loss
+    robust_projection_loss
+
+
+4.4 `Data/synthetic_tip_dataset.py`
+-----------------------------------
+
+Purpose:
+
+    Generate synthetic valid and invalid homography pairs with known:
+
+        dominant masks,
+        valid/invalid labels,
+        reliability targets,
+        optional known homography,
+        known foreground/outlier regions.
+
+Required:
+
+    SyntheticTIPConfig
+    SyntheticTIPDataset
+    build_synthetic_tip_loader
+
+
+4.5 `new_approach/evaluate_tip.py`
+----------------------------------
+
+Purpose:
+
+    Full TIP evaluation:
+
+        accuracy,
+        runtime,
+        calibration,
+        reliability,
+        risk-coverage,
+        failure detection,
+        synthetic mask IoU,
+        uncertainty/disagreement diagnostics.
+
+Required:
+
+    evaluate_accuracy
+    evaluate_reliability
+    evaluate_calibration
+    evaluate_risk_coverage
+    evaluate_synthetic_masks
+    write_tip_outputs
+
+
+4.6 `new_approach/visualize_tip.py`
+-----------------------------------
+
+Purpose:
+
+    Save qualitative figures:
+
+        input pair,
+        warped image,
+        residual heatmap,
+        seed mask,
+        mean support,
+        variance/disagreement,
+        trusted support,
+        reliability score,
+        error overlay.
+
+
+4.7 `new_approach/configs/tip_flow_dpc.json`
+--------------------------------------------
+
+Purpose:
+
+    Store final default hyperparameters for paper experiments.
+
+
+================================================================================
+5. Files To Modify
+================================================================================
+
+5.1 Modify `new_approach/modules/maskFlowHomo.py`
+-------------------------------------------------
+
+Add support sampling or posterior sampling support without breaking the existing API.
+
+Current:
+
+    DominantMaskFlow.sample(cond, steps, solver, init, requires_grad)
+
+Add:
+
+    DominantMaskFlow.sample_logits(...)
+    DominantMaskFlow.sample_posterior(...)
+    make_geometry_coupled_flow_matching_batch(...)
+
+The old `sample` should still return one mask.
+
+
+5.2 Modify `new_approach/modules/transformerHomo.py`
+----------------------------------------------------
+
+Add new params and outputs:
+
+    mask_posterior_samples
+    mask_flow_source
+    use_consensus_seed
+    use_posterior_refinement
+    use_reliability_head
+    reliability_hidden_dim
+    return_posterior_stats
+
+In `HomoNet.__init__`:
+
+    import consensus functions
+    import ReliabilityHead
+    instantiate reliability head when enabled
+
+In `HomoNet.forward`:
+
+    build residual seed logits,
+    sample support masks,
+    compute posterior or disagreement stats,
+    compute trusted support,
+    compute robust projected homography,
+    compute reliability.
+
+
+5.3 Modify `new_approach/losses_homo.py`
+----------------------------------------
+
+Keep existing losses.
+Add imports or wrappers only if needed.
+Prefer putting new TIP-specific losses in `losses_tip.py`.
+
+
+5.4 Modify `new_approach/train_new.py`
+--------------------------------------
+
+Add new modes:
+
+    synthetic_tip
+    pretrain_homo
+    pretrain_posterior
+    real_pseudo_posterior
+    joint_tip
+    calibrate_reliability
+    all_tip
+
+Keep old modes working:
+
+    synthetic_mask
+    pretrain_homo
+    joint
+    all
+
+
+5.5 Modify `new_approach/evaluate.py`
+-------------------------------------
+
+Do not break it.
+Optionally add flags:
+
+    --use-refined-h
+    --posterior-samples
+    --save-reliability
+
+But the richer evaluation should live in `evaluate_tip.py`.
+
+
+5.6 Modify `new_approach/modules/__init__.py`
+---------------------------------------------
+
+Export:
+
+    DominantMaskFlow
+    build_mask_condition
+    ReliabilityHead
+    residual_consensus_seed
+    posterior_mask_stats
+
+
+================================================================================
+6. Detailed Method Components
+================================================================================
+
+6.1 Initial Homography Flow
+---------------------------
+
+Keep the existing transformer flow prediction.
+
+Inputs:
+
+    img1_patch_fea
+    img2_patch_fea
+
+Existing computation:
+
+    forward_fea = cat([img1_patch_fea, img2_patch_fea], dim=1)
+    weight_f = h_net(forward_fea)
+    H_flow_f = sum(basis * weight_f)
+
+    backward_fea = cat([img2_patch_fea, img1_patch_fea], dim=1)
+    weight_b = h_net(backward_fea)
+    H_flow_b = sum(basis * weight_b)
+
+Do not change this in the first implementation.
+All novelty should be added after the initial flow is predicted.
+
+
+6.2 Residual Evidence
+---------------------
+
+For image 1 frame:
+
+    feature_residual_1 = mean(abs(img1_patch_fea - warp_img2_patch_fea), dim=1, keepdim=True)
+    image_residual_1   = mean(abs(img1_patch     - warp_img2_patch),     dim=1, keepdim=True)
+
+For image 2 frame:
+
+    feature_residual_2 = mean(abs(img2_patch_fea - warp_img1_patch_fea), dim=1, keepdim=True)
+    image_residual_2   = mean(abs(img2_patch     - warp_img1_patch),     dim=1, keepdim=True)
+
+Robust normalization:
+
+    r_norm = (r - median(r)) / (MAD(r) + eps)
+
+Combine:
+
+    residual = w_feature * r_feature_norm + w_image * r_image_norm
+
+Default:
+
+    w_feature = 0.7
+    w_image   = 0.3
+
+
+6.3 Geometry-Coupled Consensus Seed
+-----------------------------------
+
+The current `plan_new.txt` uses:
+
+    x0 = Gaussian noise or zero logits
+    x1 = target mask logits
+
+For TIP novelty, add a geometry-coupled path:
+
+    x0 = z_seed + sigma * epsilon
+    x1 = target support mask logits
+
+where:
+
+    z_seed = residual_to_seed_logits(residual)
+
+Define:
+
+    seed_prob = sigmoid((tau - residual_norm) / temperature)
+    z_seed    = logit(clamp(seed_prob, eps, 1 - eps))
+
+The flow model therefore learns:
+
+    crude residual consensus -> refined support
+
+instead of:
+
+    noise -> mask
+
+This is a key scientific distinction, but it does not by itself create a
+posterior. With one target mask per condition, the learned flow should collapse
+toward that one target. A posterior interpretation requires the multimodal or
+latent-variable target mechanism in Section 8.6.
+
+
+6.4 `residual_to_seed_logits` API
+---------------------------------
+
+Implement in `new_approach/modules/consensusHomo.py`.
+
+Signature:
+
+    def residual_to_seed_logits(
+        feature_residual: torch.Tensor,
+        image_residual: torch.Tensor | None = None,
+        tau: float = 1.0,
+        temperature: float = 0.5,
+        feature_weight: float = 0.7,
+        image_weight: float = 0.3,
+        close_kernel: int = 0,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        ...
+
+Returns:
+
+    seed_logits: [B, 1, H, W]
+    seed_prob:   [B, 1, H, W]
+    stats:       dict
+
+Stats should include:
+
+    residual_mean
+    residual_median
+    residual_mad
+    seed_area
+    seed_entropy
+
+
+6.5 Condition Tensor V2
+-----------------------
+
+The existing `build_mask_condition` returns roughly:
+
+    reference_feature
+    warped_feature
+    feature_abs_residual
+    image_abs_residual
+    flow_x
+    flow_y
+    flow_mag
+
+For the TIP version, create:
+
+    build_mask_condition_v2
+
+or extend `build_mask_condition` with optional arguments while preserving the old output.
+
+Recommended condition channels:
+
+1. reference_feature
+2. warped_feature
+3. feature_abs_residual
+4. robust_feature_residual
+5. image_abs_residual
+6. robust_image_residual
+7. flow_x_norm
+8. flow_y_norm
+9. flow_mag_norm
+10. seed_prob
+11. seed_logits_tanh
+12. warped_opposite_seed_prob if available
+13. cycle_mask_consistency if available
+14. border_validity mask if available
+15. coordinate x normalized
+16. coordinate y normalized
+
+If feature channels are more than one, keep all feature channels for:
+
+    reference_feature
+    warped_feature
+    feature_abs_residual
+
+Then append scalar channels.
+
+Implementation warning:
+
+    The current `DominantMaskFlow` requires fixed `cond_channels`.
+    If V2 condition channels vary, either:
+
+    1. set the exact channel count in config, or
+    2. add a lazy 1x1 condition adapter.
+
+Recommended first implementation:
+
+    Use exact configured channel count.
+    Add an assertion with a helpful error.
+
+
+6.6 Flow-Matching Support Model
+-------------------------------
+
+Keep the existing class name:
+
+    DominantMaskFlow
+
+But add support-sampling methods. Name the methods `sample_posterior` for API
+continuity only if Section 8.6 is implemented; otherwise document their output
+as repeated support samples and sample disagreement.
+
+Required new method:
+
+    def sample_logits(
+        self,
+        cond: torch.Tensor,
+        steps: int = 1,
+        solver: str = "euler",
+        init: str = "seed_noise",
+        source_logits: torch.Tensor | None = None,
+        noise_scale: float = 1.0,
+        requires_grad: bool = False,
+    ) -> torch.Tensor:
+        ...
+
+Behavior:
+
+    init == "zero":
+        z = zeros
+
+    init == "noise":
+        z = noise_sigma * randn
+
+    init == "seed":
+        z = source_logits
+
+    init == "seed_noise":
+        z = source_logits + noise_scale * randn
+
+Return:
+
+    final logits z_1, not sigmoid mask.
+
+Then update old `sample`:
+
+    logits = sample_logits(...)
+    return sigmoid(logits / temperature)
+
+
+6.7 Support Sampling / Posterior API
+------------------------------------
+
+Add:
+
+    def sample_posterior(
+        self,
+        cond: torch.Tensor,
+        num_samples: int = 8,
+        steps: int = 1,
+        solver: str = "euler",
+        init: str = "seed_noise",
+        source_logits: torch.Tensor | None = None,
+        noise_scale: float = 1.0,
+        requires_grad: bool = False,
+        return_logits: bool = True,
+    ) -> dict:
+        ...
+
+Return dict:
+
+    {
+        "samples":        [B, K, 1, H, W],
+        "logits_samples": [B, K, 1, H, W],
+        "mean":           [B, 1, H, W],
+        "var":            [B, 1, H, W],
+        "entropy":        [B, 1, H, W],
+        "sample_entropy": scalar or [B],
+    }
+
+Implementation detail:
+
+    The simplest implementation loops over K samples.
+    Later optimize by expanding batch:
+
+        cond_rep = cond.repeat_interleave(K, dim=0)
+        source_rep = source_logits.repeat_interleave(K, dim=0)
+        logits_rep = sample_logits(cond_rep, ...)
+        logits = logits_rep.view(B, K, 1, H, W)
+
+Use batch expansion first if memory allows.
+
+Interpretation rule:
+
+    If `target_modes` or latent/dropout training is enabled, `var` may be treated
+    as posterior uncertainty after calibration.
+
+    If the model is trained with one deterministic target per condition, `var`
+    must be treated as sample disagreement and must not be the sole basis of a
+    posterior claim.
+
+
+6.8 Flow Matching Batch V2
+--------------------------
+
+Add:
+
+    def make_geometry_coupled_flow_matching_batch(
+        target_mask: torch.Tensor,
+        source_logits: torch.Tensor,
+        noise_sigma: float = 0.5,
+        t_min: float = 1e-4,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ...
+
+Pseudo-code:
+
+    x1 = logits_from_mask(target_mask)
+    x0 = source_logits + noise_sigma * torch.randn_like(source_logits)
+    t = Uniform(t_min, 1)
+    xt = (1 - t) * x0 + t * x1
+    target_velocity = x1 - x0
+
+Return:
+
+    xt, t, target_velocity
+
+This is the training path that should be emphasized in the paper.
+
+
+6.9 Support Weight From Mean And Validated Uncertainty
+------------------------------------------------------
+
+Use mean support and either validated uncertainty or calibrated disagreement to
+build robust DLT projection weights.
+
+Function:
+
+    support_weight_from_posterior(
+        mean: torch.Tensor,
+        var: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+        min_weight: float = 1e-4,
+        variance_weight: float = 1.0,
+        residual_weight: float = 0.0,
+    ) -> torch.Tensor
+
+Recommended:
+
+    weight = mean
+
+If variance is available:
+
+    weight = mean / (1 + variance_weight * var)
+
+If residual is available:
+
+    weight = weight * exp(-residual_weight * residual_norm)
+
+Clamp:
+
+    weight = weight.clamp(min_weight, 1.0)
+
+Use this for weighted DLT.
+
+
+6.10 Uncertainty-Aware Robust DLT Projection
+--------------------------------------------
+
+The current `flow_mask_to_homography` can already convert flow plus mask to H.
+For TIP, extend it or add a new function:
+
+    posterior_flow_to_homography(
+        flow,
+        support_weight,
+        uncertainty=None,
+        normalize_points=True,
+        return_diagnostics=True,
+    )
+
+Preferred implementation:
+
+    Put the robust implementation in `new_approach/geometry_homo.py`
+    or a new `new_approach/geometry_tip.py`.
+
+Important framing:
+
+    The current homography network predicts one global 8-basis flow field.
+    This module does not estimate multiple homographies and does not reason over
+    multiple planes explicitly. It selects/reweights the dominant support and
+    projects the single global flow into a numerically robust homography matrix.
+
+Important improvements over current `flow_mask_to_homography`:
+
+1. Normalize point coordinates before DLT.
+2. Return DLT condition diagnostics.
+3. Return number/effective number of support points.
+4. Return support area.
+5. Return fallback flag.
+6. Optionally use top-k support points for speed.
+7. Optionally remove very low weights.
+
+Weighted normalized DLT outline:
+
+    points src: (x, y)
+    points dst: (u, v) = (x + flow_x, y + flow_y)
+    weights w_i
+
+    Normalize src and dst:
+        src_norm, T_src = normalize_points(src)
+        dst_norm, T_dst = normalize_points(dst)
+
+    Build A:
+        [-x, -y, -1,  0,  0,  0, u*x, u*y, u]
+        [ 0,  0,  0, -x, -y, -1, v*x, v*y, v]
+
+    Multiply rows by sqrt(w_i).
+
+    Solve:
+        Ah = 0 by SVD.
+
+    Denormalize:
+        H = inv(T_dst) @ H_norm @ T_src
+
+    Normalize:
+        H = H / H[2, 2]
+
+
+6.11 Optional Iterative Robust Projection
+-----------------------------------------
+
+First implementation can do one refinement:
+
+    H_0 flow -> support mask -> weighted DLT -> H_projected
+
+Optional second-stage refinement:
+
+    H_projected -> re-warp -> recompute residual -> support mask -> H_projected_2
+
+Add params:
+
+    consensus_refine_iters: 1
+    detach_refined_h: true
+
+Start with:
+
+    consensus_refine_iters = 1
+
+Do not attempt full recurrent redesign initially.
+Do not present this as a major conceptual contribution unless it provides a clear
+accuracy gain in ablation. The paper contribution is reliability/failure detection;
+robust projection is a supporting mechanism.
+
+
+6.12 Reliability Head
+---------------------
+
+Add `ReliabilityHead`.
+
+Input should be a vector of diagnostics rather than raw image only.
+
+Recommended reliability features per pair:
+
+Mask/support:
+
+    mean_support_1
+    mean_support_2
+    trusted_support_mean_f
+    trusted_support_mean_b
+    support_area_min
+    support_area_max
+    support_area_ratio
+
+Posterior uncertainty or sample disagreement:
+
+    mean_var_1
+    mean_var_2
+    max_var_1
+    max_var_2
+    mean_entropy_1
+    mean_entropy_2
+    disagreement_area_1
+    disagreement_area_2
+
+Residual:
+
+    residual_inside_mean_f
+    residual_outside_mean_f
+    residual_gap_f = outside - inside
+    residual_inside_mean_b
+    residual_outside_mean_b
+    residual_gap_b
+
+Consistency:
+
+    forward_backward_mask_iou
+    cycle_flow_error_mean
+    cycle_flow_error_inside
+    H_inverse_consistency_error
+
+DLT:
+
+    dlt_effective_points_f
+    dlt_effective_points_b
+    dlt_condition_f
+    dlt_condition_b
+    dlt_fallback_flag_f
+    dlt_fallback_flag_b
+
+Geometry magnitude:
+
+    mean_flow_mag
+    max_flow_mag
+    homography_corner_motion_mean
+    homography_corner_motion_max
+
+Optional learned features:
+
+    global average pooled transformer features
+    global average pooled residual condition features
+
+Initial implementation:
+
+    Use diagnostic vector only.
+
+Class:
+
+    class ReliabilityHead(nn.Module):
+        def __init__(self, in_dim, hidden_dim=128, dropout=0.1):
+            ...
+
+        def forward(self, features):
+            logit = mlp(features)
+            score = sigmoid(logit)
+            return {"logit": logit, "score": score}
+
+
+================================================================================
+7. Losses
+================================================================================
+
+7.1 Existing Losses To Keep
+---------------------------
+
+Keep:
+
+    masked_triplet_alignment_loss
+    feature_identity_loss
+    flow_matching_loss
+    mask_area_loss
+    mask_total_variation_loss
+    mask_entropy_loss
+    bidirectional_mask_intersection
+
+But for the TIP method, prefer the new losses below.
+
+
+7.2 Geometry-Coupled Flow Matching Loss
+---------------------------------------
+
+File:
+
+    new_approach/losses_tip.py
+
+Function:
+
+    geometry_coupled_flow_matching_loss(
+        mask_flow,
+        cond,
+        target_mask,
+        source_logits,
+        confidence=None,
+        noise_sigma=0.5,
+        t_min=1e-4,
+    )
+
+Pseudo-code:
+
+    z_t, t, target_v = make_geometry_coupled_flow_matching_batch(
+        target_mask=target_mask,
+        source_logits=source_logits,
+        noise_sigma=noise_sigma,
+        t_min=t_min,
+    )
+
+    pred_v = mask_flow(z_t, t, cond)
+    loss = (pred_v - target_v)^2
+
+    if confidence is not None:
+        loss = loss * confidence
+
+    return loss.mean()
+
+This should become the main support-model training loss.
+
+
+7.3 Mean Support Supervision
+----------------------------
+
+Use when synthetic or pseudo target masks are available.
+
+Function:
+
+    posterior_mask_supervision_loss(support_samples_or_posterior, target_mask, confidence=None)
+
+Components:
+
+    BCE(mean, target)
+    Dice(mean, target)
+
+Recommended:
+
+    loss = 2.0 * BCE + 1.0 * Dice
+
+Apply confidence weighting for pseudo targets.
+
+
+7.4 Support Consistency Loss
+----------------------------
+
+Purpose:
+
+    Forward and backward mean supports should agree after warping.
+
+Given:
+
+    q1 = img1_mask_mean
+    q2 = img2_mask_mean
+    warp_q1_to_2 = warp_img1_mask_mean
+    warp_q2_to_1 = warp_img2_mask_mean
+
+Loss:
+
+    L_cons =
+        mean(abs(q2 - warp_q1_to_2) * valid_2)
+      + mean(abs(q1 - warp_q2_to_1) * valid_1)
+
+Optional uncertainty-aware weighting:
+
+    disagreement_weight = 1 / (1 + var1 + warped_var2)
+
+Then:
+
+    L_cons = mean(disagreement_weight * abs(...))
+
+
+7.5 Uncertainty-Weighted Alignment Loss
+---------------------------------------
+
+Upgrade the existing masked triplet alignment to use mean support and validated
+uncertainty or calibrated disagreement.
+
+For each pixel:
+
+    q_i     = support probability
+    sigma_i = spatial uncertainty, validated posterior std, or calibrated disagreement proxy
+    r_i     = feature residual
+
+Use:
+
+    weight_i = q_i / (sigma_i^2 + eps)
+
+If no learned sigma:
+
+    sigma_i^2 = variance_or_disagreement_i + sigma_floor
+
+Loss:
+
+    L_align = sum(weight_i * triplet_i) / (sum(weight_i) + eps)
+
+Optional likelihood form:
+
+    L = sum(q_i * (r_i / sigma_i + log(sigma_i))) / (sum(q_i) + eps)
+
+First implementation:
+
+    Use uncertainty/disagreement-weighted triplet loss only after the correlation
+    with reprojection error is validated. Otherwise use q_i as the weight and
+    keep variance/disagreement for reliability diagnostics.
+
+
+7.6 Support Area Prior
+----------------------
+
+Keep current area loss, but apply to mean support:
+
+    min_area = 0.10
+    max_area = 0.95
+
+Use dataset-specific values:
+
+    Real outdoor/indoor video:
+        min_area = 0.15
+        max_area = 0.95
+
+    Synthetic with large distractors:
+        min_area = 0.10
+        max_area = 0.90
+
+Do not make area too restrictive.
+The method should be allowed to say that a single homography is unreliable.
+If support is tiny, reliability should go down rather than forcing the mask larger.
+
+
+7.7 Support Sharpness And Diversity
+-----------------------------------
+
+Avoid forcing all samples to be identical too early.
+
+Use two separate ideas:
+
+1. Mean mask entropy:
+
+       entropy(q_mean)
+
+   Minimize only after warmup if masks are too soft.
+
+2. Sample diversity:
+
+       var(samples)
+
+   Do not always minimize. Variance is useful only if multimodal/latent training
+   makes it meaningful or if empirical calibration shows it tracks error.
+
+Recommended:
+
+    For synthetic valid pairs with known clean masks:
+        lightly minimize variance near confident target areas.
+
+    For invalid or ambiguous pairs:
+        allow high variance.
+
+Optional loss:
+
+    target_confidence = abs(target_mask - 0.5) * 2
+    L_var = mean(target_confidence * posterior_var)
+
+Use this only for synthetic/pseudo high-confidence labels.
+
+
+7.8 Reliability Loss
+--------------------
+
+Reliability target options:
+
+1. Binary valid/invalid label:
+
+       y_valid in {0, 1}
+       L_rel_bce = BCEWithLogits(reliability_logit, y_valid)
+
+2. Soft quality target from known or pseudo error:
+
+       y_quality = exp(-error / tau_error)
+       L_rel_reg = SmoothL1(reliability, y_quality)
+
+3. Brier score:
+
+       L_brier = mean((reliability - y_valid)^2)
+
+Recommended:
+
+    Synthetic invalid training:
+        BCE + Brier
+
+    Real validation/calibration:
+        quality regression if point error labels exist
+
+Combined:
+
+    L_rel = lambda_rel_bce * BCE + lambda_brier * Brier + lambda_quality * SmoothL1
+
+
+7.9 Invalid Pair Margin Loss
+----------------------------
+
+For invalid pairs:
+
+    reliability should be low,
+    support should not be overconfident,
+    residual inside support should not be falsely low.
+
+Loss:
+
+    L_invalid =
+        relu(reliability - invalid_max_score)^2
+      + relu(mean_support - invalid_max_support_if_no_dominant)^2 optional
+
+Do not always punish support on invalid pairs.
+Some invalid pairs still contain a dominant local plane, but the full single homography may be bad.
+The safer target is reliability, not mask area.
+
+
+7.10 Robust Projection Loss
+---------------------------
+
+If ground-truth or validation point correspondences are available in synthetic data:
+
+    H_projected should be better than H_initial.
+
+Loss:
+
+    L_project = corner_error(H_projected, H_gt)
+
+or:
+
+    L_project = reprojection_error(points, H_projected)
+
+For unsupervised real data:
+
+    Use residual after projected warp:
+
+    L_project_unsup =
+        uncertainty_weighted_alignment_loss(after projected warp)
+
+First implementation can skip differentiating through DLT if unstable:
+
+    detach H_projected for reliability diagnostics,
+    use mean support masks for loss weighting.
+
+
+7.11 Full Loss By Stage
+-----------------------
+
+Stage A: Homography pretraining
+
+    L = L_align_unmasked + L_FIL
+
+Stage B: Synthetic posterior pretraining
+
+    L =
+        lambda_fm      * L_geometry_coupled_fm
+      + lambda_bce     * L_posterior_bce
+      + lambda_dice    * L_posterior_dice
+      + lambda_area    * L_area
+      + lambda_tv      * L_tv
+      + lambda_var     * L_var_confident
+
+Stage C: Real pseudo posterior training
+
+    L =
+        lambda_fm      * L_geometry_coupled_fm_pseudo
+      + lambda_bce     * L_posterior_bce_pseudo
+      + lambda_dice    * L_posterior_dice_pseudo
+      + lambda_cons    * L_posterior_consistency
+      + lambda_area    * L_area
+      + lambda_tv      * L_tv
+
+Stage D: Joint posterior consensus fine-tuning
+
+    L =
+        lambda_align   * L_uncertainty_weighted_alignment
+      + lambda_fil     * L_FIL
+      + lambda_fm      * L_geometry_coupled_fm_if_targets_available
+      + lambda_cons    * L_posterior_consistency
+      + lambda_area    * L_area
+      + lambda_tv      * L_tv
+      + lambda_entropy * L_entropy_after_warmup
+
+Stage E: Reliability training/calibration
+
+    L =
+        lambda_rel_bce     * L_reliability_bce
+      + lambda_brier       * L_brier
+      + lambda_quality     * L_quality_regression
+      + lambda_invalid     * L_invalid_margin
+
+Stage F: End-to-end TIP fine-tune
+
+    L =
+        Stage D loss
+      + small Stage E reliability loss
+
+
+================================================================================
+8. Synthetic TIP Dataset
+================================================================================
+
+8.1 Purpose
+-----------
+
+The existing `Data/synthetic_flow_mask_dataset.py` creates synthetic masks.
+For TIP novelty, add `Data/synthetic_tip_dataset.py` with valid and invalid pair labels.
+
+The reliability head needs training data that includes cases where single homography
+is valid and cases where it is invalid.
+
+
+8.2 Dataset Outputs
+-------------------
+
+Each synthetic sample should return:
+
+    imgs_gray_patch:       [2, H, W]
+    imgs_gray_full:        [2, H, W] or same as patch
+    dominant_flow:         [2, H, W] or [H, W, 2]
+    img1_dominant_mask:    [1, H, W]
+    img2_dominant_mask:    [1, H, W]
+    H_gt:                  [3, 3] optional
+    is_valid_homography:   scalar 0/1
+    reliability_target:    scalar in [0, 1]
+    invalid_type:          string or integer id
+    dominant_area:         scalar
+    synthetic_error_gt:    optional scalar
+    start:                 compatible tensor
+    pts:                   compatible tensor
+
+
+8.3 Synthetic Case Types
+------------------------
+
+Generate at least these types.
+
+Type 0: Clean valid homography
+
+    One image patch warped by one known homography.
+    No outlier.
+
+    is_valid_homography = 1
+    reliability_target = 1
+
+Type 1: Valid dominant plane with small dynamic/outlier objects
+
+    Apply H_dom to the background.
+    Paste 1 to 3 small moving objects or CutMix regions.
+    Dominant area > 0.65.
+
+    is_valid_homography = 1
+    reliability_target around 0.8 to 1.0
+
+Type 2: Valid but difficult low texture
+
+    Apply blur, brightness shift, noise, low contrast.
+    Homography still valid if enough structure remains.
+
+    is_valid_homography = 1
+    reliability_target depends on texture score.
+
+Type 3: Multi-plane but dominant plane exists
+
+    Background uses H_dom.
+    One large region uses H_out.
+    Dominant area 0.45 to 0.70.
+
+    is_valid_homography = 1 if H_dom support remains large and well distributed.
+    reliability_target 0.5 to 0.8.
+
+Type 4: Ambiguous multi-plane
+
+    Two or three planes with similar support area.
+    No clear dominant plane.
+
+    is_valid_homography = 0
+    reliability_target 0.0 to 0.4.
+
+Type 5: Dominant foreground motion false support
+
+    Large moving foreground occupies central region.
+    Background is small or split.
+
+    is_valid_homography = 0 or low reliability.
+
+Type 6: Non-homographic deformation
+
+    Apply elastic deformation, rolling-shutter-like skew, or piecewise local warp.
+
+    is_valid_homography = 0
+    reliability_target 0.0 to 0.3.
+
+Type 7: Repeated texture / correspondence ambiguity
+
+    Use repeated patterns, grid textures, or tiled crops.
+
+    is_valid_homography can be 1 geometrically but reliability should be lower
+    if evidence is ambiguous.
+
+Type 8: No overlap or severe occlusion
+
+    Very small overlap or large pasted occluders.
+
+    is_valid_homography = 0
+    reliability_target 0.0.
+
+
+8.4 Reliability Target Design
+-----------------------------
+
+For synthetic data:
+
+    If H_gt exists, compute expected corner or grid error after the estimated or
+    initial homography.
+
+But before model prediction, define target from generation metadata:
+
+    base_valid = 1 for clear dominant H, 0 otherwise
+    area_score = clamp((dominant_area - min_area) / (good_area - min_area), 0, 1)
+    texture_score = normalized gradient magnitude
+    ambiguity_penalty = 1 - plane_area_margin_score
+    occlusion_penalty = outlier_area
+
+Example:
+
+    reliability_target =
+        base_valid
+      * area_score
+      * texture_score
+      * plane_margin_score
+      * overlap_score
+
+Clamp to [0, 1].
+
+Important:
+
+    This synthetic reliability target is a training signal, not proof of physical
+    calibration. Final reliability claims must be validated against real
+    coordinate-label reprojection error on held-out Coordinate-v2 pairs.
+
+
+8.5 Synthetic Mask Targets
+--------------------------
+
+For valid dominant plane cases:
+
+    target mask = dominant plane support.
+
+For invalid ambiguous cases:
+
+    target mask can still identify the largest support plane,
+    but reliability target should be low.
+
+This distinction is important:
+
+    Mask answers "where is the best dominant support?"
+    Reliability answers "is a single homography trustworthy?"
+
+
+8.6 Multimodal Targets For A Real Posterior
+-------------------------------------------
+
+This section is mandatory if the paper uses the word "posterior" as a headline
+claim.
+
+Problem:
+
+    If each condition has exactly one target mask, conditional flow matching
+    learns a deterministic transport to that target. Sampling different x0 values
+    does not create a real posterior in the ideal training limit.
+
+Required multimodal solution:
+
+1. For ambiguous synthetic Type 3 and Type 4 pairs, generate two or three planar
+   regions with similar support area and plausible residual evidence.
+2. Store every plausible support mask:
+
+       target_masks: [K_modes, 1, H, W]
+       target_flows: [K_modes, 2, H, W] optional
+       mode_validity: [K_modes]
+
+3. During training, sample one mode index per item:
+
+       mode_idx ~ Categorical(mode_weights)
+       target_mask = target_masks[mode_idx]
+
+4. Keep the visible image pair and condition as similar as possible across modes.
+   The ambiguity should come from multiple plausible dominant supports, not from
+   changing the image so much that each mode is a different condition.
+5. Train the flow model so different latent/noise samples can map to different
+   plausible support masks.
+6. Evaluate whether generated samples recover multiple modes:
+
+       mode coverage,
+       best-of-K IoU,
+       sample diversity,
+       variance/error correlation,
+       reliability on ambiguous pairs.
+
+Alternative latent-variable solution:
+
+    If true same-condition multimodal data is too hard to generate, concatenate
+    a low-dimensional latent code z or use MC-dropout/ensembles. Then call the
+    output a latent support distribution or ensemble disagreement, not a pure
+    flow-matching posterior, unless calibration experiments justify the stronger
+    wording.
+
+Fallback:
+
+    If neither multimodal targets nor latent/dropout/ensemble uncertainty is
+    implemented, remove "posterior" from the method name and contribution claims.
+    Use "conditional support model" and "calibrated sample disagreement" instead.
+
+
+================================================================================
+9. Real Pseudo-Label Generation
+================================================================================
+
+9.1 Basic Pseudo Mask
+---------------------
+
+Use current `pseudo_mask_from_residuals` as baseline.
+Replace or augment with the new residual seed:
+
+    seed_logits, seed_prob, stats = residual_to_seed_logits(...)
+
+Then build pseudo target:
+
+    pseudo_mask = seed_prob
+
+Refine with bidirectional consistency:
+
+    pseudo_1_raw = seed_prob_1
+    pseudo_2_raw = seed_prob_2
+
+    pseudo_1_warped_from_2 = warp(pseudo_2_raw)
+    pseudo_2_warped_from_1 = warp(pseudo_1_raw)
+
+    pseudo_1 = pseudo_1_raw * pseudo_1_warped_from_2
+    pseudo_2 = pseudo_2_raw * pseudo_2_warped_from_1
+
+
+9.2 Pseudo Confidence
+---------------------
+
+Confidence should be high when:
+
+1. pseudo mask is far from 0.5,
+2. forward/backward pseudo masks agree,
+3. residual inside support is lower than outside,
+4. support area is not degenerate,
+5. validated uncertainty or calibrated disagreement from the current model is low.
+
+Compute:
+
+    confidence_pixel = abs(pseudo - 0.5) * 2
+
+Then multiply by:
+
+    bidirectional_agreement
+
+Optional:
+
+    confidence_pixel *= exp(-posterior_var)
+
+
+9.3 Reject Bad Pseudo Labels
+----------------------------
+
+Reject a pseudo mask pair if:
+
+    mean_support < pseudo_min_area
+    mean_support > pseudo_max_area
+    confidence.mean < pseudo_min_confidence
+    residual_gap < pseudo_min_residual_gap
+
+Where:
+
+    residual_gap = residual_outside_mean - residual_inside_mean
+
+Default:
+
+    pseudo_min_area = 0.10
+    pseudo_max_area = 0.95
+    pseudo_min_confidence = 0.25
+    pseudo_min_residual_gap = 0.05
+
+
+9.4 Real Reliability Pseudo Targets
+-----------------------------------
+
+If point annotations are available for validation/training:
+
+    error = point matching error or corner error
+    reliability_target = exp(-error / tau_error)
+
+If not:
+
+    reliability_pseudo =
+        support_score
+      * residual_gap_score
+      * bidirectional_score
+      * dlt_condition_score
+      * low_uncertainty_score
+
+Do not over-trust real pseudo reliability.
+Use lower loss weight than synthetic reliability.
+
+
+================================================================================
+10. Training Schedule
+================================================================================
+
+10.1 Stage 0: Compile And Baseline Smoke Tests
+----------------------------------------------
+
+Goal:
+
+    Verify the existing code still works before adding TIP modules.
+
+Run:
+
+    python -m py_compile new_approach/modules/maskFlowHomo.py
+    python -m py_compile new_approach/modules/transformerHomo.py
+    python -m py_compile new_approach/losses_homo.py
+    python new_approach/smoke_test_flow_mask.py
+
+
+10.2 Stage 1: Add Consensus Utilities
+-------------------------------------
+
+Implement:
+
+    new_approach/modules/consensusHomo.py
+
+Test:
+
+    random residual maps,
+    seed logits shape,
+    seed prob in [0, 1],
+    entropy finite,
+    posterior stats finite,
+    support weights finite.
+
+Command:
+
+    python -m py_compile new_approach/modules/consensusHomo.py
+
+
+10.3 Stage 2: Extend DominantMaskFlow
+-------------------------------------
+
+Add:
+
+    sample_logits
+    sample_posterior
+    make_geometry_coupled_flow_matching_batch
+
+Backward compatibility:
+
+    Existing `sample` calls must still work.
+
+Test:
+
+    K = 1, 4, 8 posterior samples.
+    sample mean/var shapes correct.
+    `init=zero`, `init=noise`, `init=seed`, `init=seed_noise`.
+
+
+10.4 Stage 3: Add Synthetic TIP Dataset
+---------------------------------------
+
+Implement:
+
+    Data/synthetic_tip_dataset.py
+
+Test:
+
+    Data loader returns all expected keys.
+    Valid/invalid class distribution is balanced enough.
+    Dominant masks match synthetic generation.
+    `imgs_gray_patch` is compatible with `HomoNet`.
+
+
+10.5 Stage 4: Synthetic Support / Posterior Pretraining
+-------------------------------------------------------
+
+Add `train_new.py --mode synthetic_tip`.
+
+Train only:
+
+    DominantMaskFlow
+    optional condition adapter if added
+
+Freeze:
+
+    HNet
+
+Use known synthetic flow and known mask target.
+
+Loss:
+
+    geometry-coupled FM
+    BCE
+    Dice
+    area
+    TV
+    confident variance loss
+
+Metrics:
+
+    mask IoU
+    Dice
+    BCE
+    mean support area
+    variance/disagreement valid vs invalid
+    runtime for K samples
+
+
+10.6 Stage 5: Homography Pretraining
+------------------------------------
+
+Use existing `pretrain_homo`.
+
+Settings:
+
+    mask_method = none
+    pretrain_phase = true
+
+Loss:
+
+    unmasked triplet
+    FIL
+
+Goal:
+
+    Reasonable initial H for pseudo residuals.
+
+
+10.7 Stage 6: Real Pseudo Support Training
+------------------------------------------
+
+Add:
+
+    --mode real_pseudo_posterior
+
+Procedure:
+
+1. Load pretrained HNet.
+2. Load synthetic-pretrained mask flow.
+3. Freeze HNet.
+4. Run real pairs.
+5. Build residual seed and pseudo masks.
+6. Train mask flow with geometry-coupled FM and pseudo supervision.
+
+Loss:
+
+    geometry-coupled FM weighted by pseudo confidence
+    support BCE/Dice weighted by pseudo confidence
+    support consistency
+    area
+    TV
+
+
+10.8 Stage 7: Joint Support Consensus Fine-Tuning
+-------------------------------------------------
+
+Add:
+
+    --mode joint_tip
+
+Train:
+
+    HNet
+    mask_flow
+    optional reliability head if enabled
+
+Use smaller LR for HNet:
+
+    lr_homo = 1e-5
+    lr_mask = 5e-5
+    lr_reliability = 1e-4
+
+Two optimizer groups recommended:
+
+    optimizer = AdamW([
+        {"params": HNet params, "lr": lr_homo},
+        {"params": mask_flow params, "lr": lr_mask},
+        {"params": reliability params, "lr": lr_reliability},
+    ])
+
+Default:
+
+    mask_flow_detach_condition = true for first joint stage.
+
+Later:
+
+    allow gradients through condition if stable.
+
+
+10.9 Stage 8: Reliability Calibration
+-------------------------------------
+
+Add:
+
+    --mode calibrate_reliability
+
+Freeze:
+
+    HNet
+    mask_flow
+
+Train:
+
+    ReliabilityHead only
+
+Use:
+
+    synthetic valid/invalid data,
+    the held-out real calibration split from Coordinate-v2 point labels,
+    pseudo reliability targets on real unlabeled data only with low weight.
+
+Calibration metrics:
+
+    ECE
+    Brier
+    ROC-AUC
+    AUROC for failure detection
+    AURC risk-coverage
+
+
+10.10 Stage 9: One-Step Distillation
+------------------------------------
+
+If K samples or 4-step sampling is too slow:
+
+Teacher:
+
+    support/posterior samples with K=8, steps=4
+
+Student:
+
+    support/posterior samples with K=1 or K=4, steps=1
+
+Distillation target:
+
+    teacher mean mask
+    teacher variance map optional
+    teacher reliability score
+
+Loss:
+
+    L1/BCE(student_mean, teacher_mean)
+    L1(student_var, teacher_var) optional
+    SmoothL1(student_reliability, teacher_reliability)
+
+This makes the final method practical.
+
+
+================================================================================
+11. Detailed `HomoNet.forward` Integration
+================================================================================
+
+11.1 New Parameters
+-------------------
+
+Add to params:
+
+    mask_method: "flow_matching"
+    use_consensus_seed: true
+    mask_flow_source: "seed_noise"
+    mask_posterior_samples: 8
+    mask_posterior_train_samples: 4
+    mask_posterior_eval_samples: 8
+    mask_flow_steps: 1
+    mask_flow_solver: "euler"
+    mask_flow_noise_scale: 0.5
+    return_posterior_stats: true
+    use_posterior_refinement: true
+    consensus_refine_iters: 1
+    use_reliability_head: true
+    reliability_hidden_dim: 128
+    reliability_dropout: 0.1
+    detach_reliability_features: true
+    detach_dlt_refinement: true
+    mask_seed_tau: 1.0
+    mask_seed_temperature: 0.5
+    mask_seed_close_kernel: 5
+
+
+11.2 Forward Path Pseudo-Code
+-----------------------------
+
+Inside `HomoNet.forward`, after existing warps:
+
+    # Existing:
+    img1_patch_fea, img2_patch_fea
+    warp_img1_patch_fea, warp_img2_patch_fea
+    warp_img1_patch, warp_img2_patch
+    H_flow_f, H_flow_b
+
+    if self.mask_method == "flow_matching":
+
+        # 1. Build residual seeds.
+        seed_logits_1, seed_prob_1, seed_stats_1 = residual_consensus_seed(
+            reference_feature=img1_patch_fea,
+            warped_feature=warp_img2_patch_fea,
+            reference_image=img1_patch,
+            warped_image=warp_img2_patch,
+            tau=params.mask_seed_tau,
+            temperature=params.mask_seed_temperature,
+            close_kernel=params.mask_seed_close_kernel,
+        )
+
+        seed_logits_2, seed_prob_2, seed_stats_2 = residual_consensus_seed(
+            reference_feature=img2_patch_fea,
+            warped_feature=warp_img1_patch_fea,
+            reference_image=img2_patch,
+            warped_image=warp_img1_patch,
+            tau=params.mask_seed_tau,
+            temperature=params.mask_seed_temperature,
+            close_kernel=params.mask_seed_close_kernel,
+        )
+
+        # 2. Build condition tensors.
+        img1_mask_cond = build_mask_condition_v2(..., seed_prob=seed_prob_1, seed_logits=seed_logits_1)
+        img2_mask_cond = build_mask_condition_v2(..., seed_prob=seed_prob_2, seed_logits=seed_logits_2)
+
+        # 3. Support sample count.
+        K = params.mask_posterior_train_samples if self.training else params.mask_posterior_eval_samples
+
+        # 4. Sample support masks.
+        #    These are posterior samples only when multimodal/latent training is enabled.
+        post1 = self.mask_flow.sample_posterior(
+            img1_mask_cond,
+            num_samples=K,
+            steps=params.mask_flow_steps,
+            solver=params.mask_flow_solver,
+            init=params.mask_flow_source,
+            source_logits=seed_logits_1,
+            noise_scale=params.mask_flow_noise_scale,
+            requires_grad=params.mask_flow_sample_grad,
+        )
+
+        post2 = self.mask_flow.sample_posterior(
+            img2_mask_cond,
+            num_samples=K,
+            steps=params.mask_flow_steps,
+            solver=params.mask_flow_solver,
+            init=params.mask_flow_source,
+            source_logits=seed_logits_2,
+            noise_scale=params.mask_flow_noise_scale,
+            requires_grad=params.mask_flow_sample_grad,
+        )
+
+        # 5. Mean masks keep existing output semantics.
+        img1_patch_mask = post1["mean"]
+        img2_patch_mask = post2["mean"]
+
+        # 6. Warp mean supports.
+        warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
+        warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
+
+        # 7. Trusted support.
+        trusted_f, trusted_b = bidirectional_posterior_consensus(...)
+
+        # 8. Support weights for DLT.
+        support_weight_f = support_weight_from_posterior(...)
+        support_weight_b = support_weight_from_posterior(...)
+
+        # 9. Initial and robust projected H.
+        H_f_initial = flow_mask_to_homography(H_flow_f, None)
+        H_b_initial = flow_mask_to_homography(H_flow_b, None)
+
+        if params.use_posterior_refinement:
+            H_f_refined, dlt_stats_f = posterior_flow_to_homography(H_flow_f, support_weight_f)
+            H_b_refined, dlt_stats_b = posterior_flow_to_homography(H_flow_b, support_weight_b)
+        else:
+            H_f_refined = H_f_initial
+            H_b_refined = H_b_initial
+
+        # 10. Reliability.
+        reliability_features = build_reliability_feature_vector(...)
+        rel = self.reliability_head(reliability_features)
+
+        reliability_logit = rel["logit"]
+        reliability = rel["score"]
+
+
+11.3 Output Compatibility
+-------------------------
+
+Set:
+
+    "img1_patch_mask": img1_patch_mask
+    "img2_patch_mask": img2_patch_mask
+    "warp_img1_patch_mask": warp_img1_patch_mask
+    "warp_img2_patch_mask": warp_img2_patch_mask
+
+Also set:
+
+    "H_f": H_f_refined if return_h_matrix else None
+    "H_b": H_b_refined if return_h_matrix else None
+
+But also return:
+
+    "H_f_initial": H_f_initial
+    "H_b_initial": H_b_initial
+    "H_f_refined": H_f_refined
+    "H_b_refined": H_b_refined
+
+Evaluation can choose initial vs refined.
+
+
+================================================================================
+12. Training Script Changes
+================================================================================
+
+12.1 New CLI Arguments
+----------------------
+
+Add to `train_new.py`:
+
+    parser.add_argument("--tip-mode", action=argparse.BooleanOptionalAction, default=False)
+
+Posterior:
+
+    --use-consensus-seed / --no-use-consensus-seed
+    --mask-flow-source choices ["zero", "noise", "seed", "seed_noise"]
+    --mask-posterior-samples int default 8
+    --mask-posterior-train-samples int default 4
+    --mask-posterior-eval-samples int default 8
+    --mask-flow-noise-scale float default 0.5
+    --mask-seed-tau float default 1.0
+    --mask-seed-temperature float default 0.5
+    --mask-seed-close-kernel int default 5
+
+Refinement:
+
+    --use-posterior-refinement / --no-use-posterior-refinement
+    --consensus-refine-iters int default 1
+    --detach-dlt-refinement / --no-detach-dlt-refinement
+
+Reliability:
+
+    --use-reliability-head / --no-use-reliability-head
+    --reliability-hidden-dim int default 128
+    --reliability-dropout float default 0.1
+    --detach-reliability-features / --no-detach-reliability-features
+
+Loss weights:
+
+    --lambda-posterior-bce float default 2.0
+    --lambda-posterior-dice float default 1.0
+    --lambda-posterior-consistency float default 0.1
+    --lambda-posterior-var float default 0.01
+    --lambda-reliability-bce float default 1.0
+    --lambda-brier float default 0.1
+    --lambda-quality float default 0.5
+    --lambda-invalid float default 0.5
+    --lambda-consensus-refine float default 0.0
+
+Pseudo filters:
+
+    --pseudo-min-residual-gap float default 0.05
+    --pseudo-min-support-area float default 0.10
+    --pseudo-max-support-area float default 0.95
+
+
+12.2 Parameter Builder Changes
+------------------------------
+
+Update:
+
+    default_homo_params(args, mode)
+
+Add all new params with defaults.
+
+Ensure:
+
+    mask_flow_cond_channels matches V2 condition channels.
+
+If V2 channels are not implemented yet:
+
+    Keep cond_channels=7 for backward compatibility.
+    Add a feature flag:
+
+        condition_version = "v1" or "v2"
+
+
+12.3 New Training Functions
+---------------------------
+
+Add:
+
+    train_synthetic_tip_epoch
+    train_real_pseudo_posterior_epoch
+    train_joint_tip_epoch
+    train_reliability_epoch
+    validate_tip_epoch
+
+
+12.4 `train_synthetic_tip_epoch`
+--------------------------------
+
+Input:
+
+    SyntheticTIPDataset batch
+
+If using known synthetic flow without HNet:
+
+    Build warped image with known flow.
+    Build residual seed from known warp.
+    Build condition.
+    Train mask_flow and reliability head.
+
+If using HNet:
+
+    Run model forward and use output conditions.
+
+Recommended first implementation:
+
+    Use known synthetic flow to train mask_flow.
+    Train reliability head on diagnostics computed from known generated metadata.
+
+
+12.5 `train_joint_tip_epoch`
+----------------------------
+
+Procedure:
+
+    output = model(data_batch)
+
+    h_losses = uncertainty weighted alignment
+    posterior losses = pseudo FM if pseudo targets available
+    consistency losses = posterior forward/backward
+    regularizers = area, TV, entropy
+    reliability losses = if targets available
+
+Compute:
+
+    total = weighted sum
+
+Important:
+
+    If no reliability target exists for real data, do not invent a strong target.
+    Either skip reliability loss or use weak pseudo target with small weight.
+
+
+================================================================================
+13. Evaluation For TIP
+================================================================================
+
+13.1 Accuracy Metrics
+---------------------
+
+Report:
+
+1. Mean corner error.
+2. Median corner error.
+3. AUC under error thresholds.
+4. Matching point error.
+5. RealSH group averages if using this dataset:
+
+       RE
+       LT
+       LL
+       SF
+       LF
+
+6. Runtime:
+
+       HNet only
+       HNet + one mask
+       HNet + K support samples
+       HNet + robust DLT projection
+
+
+13.1.1 Real Reliability Splits
+------------------------------
+
+Use the local correspondence annotations for real reliability metrics:
+
+    Data/Coordinate-v2/Coordinate-v2 contains about 4200 .npy files.
+    Data/Test_List.txt contains about 4199 labeled pairs.
+
+Create deterministic splits by pair name or video name:
+
+    real_calibration_val: 20 percent
+    real_final_test:      80 percent
+
+If any training uses real coordinate-derived reliability targets, create a third
+held-out split and keep the final test untouched. Report the split protocol in
+the paper.
+
+
+13.2 Mask Metrics
+-----------------
+
+On synthetic data:
+
+    IoU
+    Dice
+    precision
+    recall
+    boundary F-score optional
+
+On real data without mask GT:
+
+    residual_inside
+    residual_outside
+    residual_gap = outside - inside
+    support_area
+    forward/backward support IoU
+
+
+13.3 Posterior Or Disagreement Metrics
+--------------------------------------
+
+Report:
+
+1. Mean posterior variance or sample disagreement for valid vs invalid pairs.
+2. Mean entropy for valid vs invalid pairs.
+3. Correlation between variance/disagreement and homography error.
+4. Error vs uncertainty/disagreement bins.
+5. Visual uncertainty or disagreement maps.
+
+Expected behavior:
+
+    Invalid or ambiguous pairs should have higher validated uncertainty or
+    disagreement and lower reliability.
+
+Manuscript rule:
+
+    If the K-sample statistic is not trained with multimodal/latent targets or
+    does not correlate with error, do not call it posterior uncertainty.
+
+
+13.4 Reliability Metrics
+------------------------
+
+Use reliability score:
+
+    s in [0, 1]
+
+Define failure:
+
+    failure = error > threshold
+
+Use several thresholds:
+
+    3 px
+    5 px
+    10 px
+
+Report:
+
+1. ROC-AUC for detecting success/failure.
+2. PR-AUC for detecting failure if failure class is rare.
+3. Brier score.
+4. Expected calibration error.
+5. Reliability diagrams.
+6. Risk-coverage curve.
+7. Area under risk-coverage curve.
+
+
+13.5 Risk-Coverage
+------------------
+
+Sort pairs by reliability descending.
+
+For coverage c:
+
+    keep top c fraction
+    compute mean error on kept pairs
+
+Plot:
+
+    coverage vs risk/error
+
+A good method should have:
+
+    low error at low coverage,
+    graceful degradation as coverage increases.
+
+This is a strong TIP-style "trustworthy estimation" evaluation.
+
+
+13.6 Failure Detection
+----------------------
+
+Create synthetic and real stress sets:
+
+    clean homography
+    small outlier
+    large foreground
+    multi-plane ambiguous
+    low texture
+    repeated texture
+    no overlap
+    illumination shift
+
+Report:
+
+    accuracy per type
+    reliability per type
+    failure AUC per type
+
+
+13.7 Evaluation Script API
+--------------------------
+
+`evaluate_tip.py` arguments:
+
+    --checkpoint
+    --dataset realsh|synthetic_tip|custom
+    --mask-method flow_matching|homogan_cnn|none
+    --posterior-samples 8
+    --posterior-steps 1
+    --use-refined-h
+    --no-use-refined-h
+    --save-csv
+    --save-json
+    --save-figures
+    --failure-thresholds 3,5,10
+    --coverage-points 0.1,0.2,0.3,0.5,0.7,0.9,1.0
+
+Outputs:
+
+    eval_tip_summary.json
+    eval_tip_pairs.csv
+    risk_coverage.csv
+    calibration_bins.csv
+    reliability_histogram.csv
+    figures/
+
+
+================================================================================
+14. Ablation Plan
+================================================================================
+
+14.0 Mandatory Killer Ablations
+-------------------------------
+
+Run these before building the full paper story. They decide whether the method
+can honestly claim posterior consensus or must be reframed as calibrated support
+disagreement.
+
+1. Residual seed only vs full flow model:
+
+       If seed-only is nearly equal to the full model, the flow module is not
+       earning its complexity. The paper must then emphasize reliability and
+       abstention, not mask-generation novelty.
+
+2. Noise-to-mask vs seed-to-mask:
+
+       Compare generic x0 ~ noise against geometry-coupled x0 = seed + noise.
+       The geometry-coupled path must improve mask quality, homography error, or
+       reliability metrics.
+
+3. K=1 vs K=8 with variance/disagreement correlation to reprojection error:
+
+       Compute Spearman/Pearson correlation, error bins, ROC-AUC for failure, and
+       risk-coverage. If K-sample variance does not track error, call it sample
+       disagreement only and remove posterior claims.
+
+
+14.1 Baselines
+--------------
+
+Run:
+
+1. Identity homography.
+2. SIFT + RANSAC.
+3. ORB + RANSAC.
+4. SuperPoint/LoFTR + RANSAC or MAGSAC if available.
+5. Existing content-aware homography baseline if reproducible.
+6. Original HomoGAN or current `homogan_cnn` path.
+7. New Approach no mask.
+8. New Approach deterministic flow mask.
+
+
+14.2 Internal Ablations
+-----------------------
+
+Mask/support distribution:
+
+1. residual threshold seed only.
+2. CNN/U-Net deterministic mask.
+3. flow matching from zero/noise to mask.
+4. geometry-coupled flow matching from seed to mask.
+5. support samples K=1.
+6. support samples K=4.
+7. support samples K=8.
+8. support samples K=16.
+9. multimodal-target posterior vs deterministic-target disagreement.
+
+Robust DLT projection:
+
+1. no robust DLT projection.
+2. mean mask weighted DLT.
+3. mean plus validated-variance/disagreement weighted DLT.
+4. optional iterative projection with 2 iterations.
+
+Reliability:
+
+1. no reliability head.
+2. reliability from hand-crafted diagnostics only.
+3. reliability from learned pooled features only.
+4. reliability from diagnostics + learned features.
+5. reliability with synthetic labels only.
+6. reliability with synthetic + real calibration.
+
+Loss:
+
+1. no posterior consistency.
+2. no geometry-coupled source path.
+3. no pseudo real adaptation.
+4. no uncertainty weighting in alignment.
+5. no invalid-pair training.
+
+
+14.3 Required Table For TIP
+---------------------------
+
+A strong ablation table should include:
+
+    Method
+    Error
+    Failure AUC
+    ECE
+    AURC
+    Runtime
+
+Example rows:
+
+    Baseline HNet
+    HNet + residual mask
+    HNet + deterministic FM mask
+    HNet + geometry-coupled FM mean
+    HNet + K=8 support mean
+    HNet + robust DLT projection
+    HNet + robust DLT + reliability
+    HNet + multimodal posterior + reliability
+
+
+================================================================================
+15. Configuration Defaults
+================================================================================
+
+Create:
+
+    new_approach/configs/tip_flow_dpc.json
+
+Recommended content:
+
+    {
+      "mask_method": "flow_matching",
+      "condition_version": "v2",
+      "use_consensus_seed": true,
+      "mask_flow_source": "seed_noise",
+      "mask_flow_steps": 1,
+      "mask_flow_solver": "euler",
+      "mask_flow_init": "seed_noise",
+      "mask_flow_noise_sigma": 1.0,
+      "mask_flow_noise_scale": 0.5,
+      "mask_flow_temperature": 1.0,
+      "mask_posterior_train_samples": 4,
+      "mask_posterior_eval_samples": 8,
+      "mask_flow_base_channels": 32,
+      "mask_flow_channel_mults": [1, 2, 4, 4],
+      "mask_flow_time_dim": 128,
+      "mask_flow_detach_condition": true,
+      "mask_flow_sample_grad": true,
+      "mask_seed_tau": 1.0,
+      "mask_seed_temperature": 0.5,
+      "mask_seed_close_kernel": 5,
+      "use_posterior_refinement": true,
+      "consensus_refine_iters": 1,
+      "detach_dlt_refinement": true,
+      "use_reliability_head": true,
+      "reliability_hidden_dim": 128,
+      "reliability_dropout": 0.1,
+      "detach_reliability_features": true,
+      "mask_min_area": 0.10,
+      "mask_max_area": 0.95,
+      "lambda_align": 1.0,
+      "lambda_fil": 1.0,
+      "lambda_fm": 0.5,
+      "lambda_posterior_bce": 2.0,
+      "lambda_posterior_dice": 1.0,
+      "lambda_posterior_consistency": 0.1,
+      "lambda_posterior_var": 0.01,
+      "lambda_area": 0.02,
+      "lambda_tv": 0.01,
+      "lambda_entropy": 0.0005,
+      "entropy_warmup_epochs": 2,
+      "lambda_reliability_bce": 1.0,
+      "lambda_brier": 0.1,
+      "lambda_quality": 0.5,
+      "lambda_invalid": 0.5,
+      "pseudo_tau": 1.0,
+      "pseudo_temperature": 0.5,
+      "pseudo_close_kernel": 5,
+      "pseudo_min_area": 0.10,
+      "pseudo_max_area": 0.95,
+      "pseudo_min_confidence": 0.25,
+      "pseudo_min_residual_gap": 0.05
+    }
+
+
+================================================================================
+16. Implementation Order For Claude
+================================================================================
+
+Follow this exact order.
+
+Step 1: Add `consensusHomo.py`
+
+Implement:
+
+    robust_normalize_map
+    entropy_from_probability
+    residual_to_seed_logits
+    residual_consensus_seed
+    posterior_mask_stats
+    bidirectional_posterior_consensus
+    support_weight_from_posterior
+    residual_statistics
+    build_reliability_feature_vector
+
+Run:
+
+    python -m py_compile new_approach/modules/consensusHomo.py
+
+
+Step 2: Extend `maskFlowHomo.py`
+
+Add:
+
+    sample_logits
+    sample_posterior
+    make_geometry_coupled_flow_matching_batch
+
+Keep:
+
+    sample
+    make_flow_matching_batch
+
+Run:
+
+    python -m py_compile new_approach/modules/maskFlowHomo.py
+    python new_approach/smoke_test_flow_mask.py
+
+
+Step 3: Add `reliabilityHomo.py`
+
+Implement:
+
+    ReliabilityHead
+
+Run:
+
+    python -m py_compile new_approach/modules/reliabilityHomo.py
+
+
+Step 4: Add `losses_tip.py`
+
+Implement:
+
+    geometry_coupled_flow_matching_loss
+    posterior_mask_supervision_loss
+    posterior_consistency_loss
+    uncertainty_weighted_alignment_loss
+    reliability_bce_loss
+    brier_score_loss
+    reliability_quality_regression_loss
+    invalid_pair_margin_loss
+
+Run:
+
+    python -m py_compile new_approach/losses_tip.py
+
+
+Step 5: Extend geometry utilities
+
+Modify or create:
+
+    new_approach/geometry_tip.py
+
+Implement:
+
+    normalize_points_2d
+    weighted_normalized_dlt
+    posterior_flow_to_homography
+    homography_inverse_consistency_error
+    homography_corner_motion
+
+Run:
+
+    python -m py_compile new_approach/geometry_tip.py
+
+
+Step 6: Modify `transformerHomo.py`
+
+Add:
+
+    consensus seed path
+    support/posterior sampling path
+    posterior or disagreement stats outputs
+    support weights
+    robust projected H output
+    reliability head output
+
+Keep:
+
+    old `homogan_cnn` branch
+    old `none` branch
+    old output keys
+
+Run:
+
+    python -m py_compile new_approach/modules/transformerHomo.py
+
+
+Step 7: Add smoke test
+
+Create:
+
+    new_approach/smoke_test_tip.py
+
+Test:
+
+    random model forward with support samples K=2
+    output keys present
+    mean support in [0, 1]
+    variance nonnegative
+    reliability in [0, 1]
+    projected H shape [B, 3, 3]
+    backward pass on a tiny loss
+
+Run:
+
+    python new_approach/smoke_test_tip.py
+
+
+Step 8: Add synthetic TIP dataset
+
+Create:
+
+    Data/synthetic_tip_dataset.py
+
+Run a mini loader test.
+
+
+Step 9: Update `train_new.py`
+
+Add modes:
+
+    synthetic_tip
+    pretrain_posterior
+    real_pseudo_posterior
+    joint_tip
+    calibrate_reliability
+    all_tip
+
+Keep old modes.
+
+Run:
+
+    python -m py_compile new_approach/train_new.py
+
+
+Step 10: Add `evaluate_tip.py`
+
+Implement full metrics.
+
+Run:
+
+    python -m py_compile new_approach/evaluate_tip.py
+
+
+Step 11: Add visualization
+
+Create:
+
+    new_approach/visualize_tip.py
+
+Run on one checkpoint/sample.
+
+
+Step 12: Run minimal end-to-end debug
+
+Recommended debug commands:
+
+    python new_approach/train_new.py --mode synthetic_tip --epochs 1 --max-steps-per-epoch 2 --batch-size 1
+    python new_approach/train_new.py --mode pretrain_homo --epochs 1 --max-steps-per-epoch 2 --batch-size 1 --skip-val
+    python new_approach/train_new.py --mode joint_tip --epochs 1 --max-steps-per-epoch 2 --batch-size 1 --skip-val
+
+
+================================================================================
+17. Expected Failure Modes And Fixes
+================================================================================
+
+17.1 Support Samples Collapse To Same Mask
+------------------------------------------
+
+Cause:
+
+    source noise too small,
+    loss over-penalizes variance,
+    deterministic seed dominates.
+
+Fix:
+
+    increase mask_flow_noise_scale,
+    reduce lambda_posterior_var,
+    use K>1 during training,
+    add ambiguous synthetic cases,
+    add true multimodal targets if a posterior claim is needed.
+
+
+17.2 Variance Or Disagreement High Everywhere
+---------------------------------------------
+
+Cause:
+
+    flow model undertrained,
+    source seed too noisy,
+    pseudo labels inconsistent.
+
+Fix:
+
+    train longer on synthetic_tip,
+    reduce source noise,
+    filter pseudo labels more aggressively,
+    increase support BCE/Dice weights.
+
+
+17.3 Reliability Always High
+----------------------------
+
+Cause:
+
+    invalid synthetic pairs too easy or underrepresented,
+    reliability loss too weak,
+    reliability features missing validated uncertainty/disagreement.
+
+Fix:
+
+    balance valid/invalid batches,
+    increase lambda_reliability_bce,
+    include error-based soft targets,
+    add ambiguous multi-plane cases.
+
+
+17.4 Reliability Always Low
+---------------------------
+
+Cause:
+
+    invalid cases dominate,
+    pseudo targets too pessimistic,
+    support area priors too strict.
+
+Fix:
+
+    balance dataset,
+    use known valid clean homographies,
+    reduce invalid margin weight,
+    recalibrate with validation set.
+
+
+17.5 Homography Worsens After Refined DLT
+-----------------------------------------
+
+Cause:
+
+    mask weights select wrong region,
+    weighted DLT unstable,
+    support too concentrated spatially.
+
+Fix:
+
+    require support spatial spread,
+    fallback to initial H if DLT condition is poor,
+    blend weights with uniform:
+
+        weight = alpha * posterior_weight + (1 - alpha) * uniform
+
+    start alpha at 0.5.
+
+
+17.6 Area Loss Fights Reliability
+---------------------------------
+
+Cause:
+
+    invalid pairs may naturally have small support.
+
+Fix:
+
+    do not force large masks on invalid pairs,
+    condition area loss on valid pairs or high pseudo confidence,
+    rely on reliability score for invalidity.
+
+
+================================================================================
+18. Paper Positioning
+================================================================================
+
+18.1 Proposed Title
+-------------------
+
+Possible titles:
+
+1. Conditional Flow-Matching Dominant-Plane Support for Trustworthy Homography Estimation
+2. Reliability-Aware Dominant-Plane Consensus for Unsupervised Deep Homography Estimation
+3. FlowDPC-Homo: Flow-Matching Support Consensus for Reliable Homography Estimation
+
+Use a title containing "posterior" only if the multimodal-target or latent
+posterior path passes the required K-sample uncertainty experiments.
+
+
+18.2 Abstract Skeleton
+----------------------
+
+Problem:
+
+    Deep homography estimators often force an image pair into a single projective
+    transform even when parallax, dynamic objects, occlusion, or multiple planes
+    violate the model assumption.
+
+Gap:
+
+    Existing mask-based methods suppress outliers, but usually produce a single
+    deterministic support map and do not quantify support ambiguity or pair-level
+    reliability.
+
+Method:
+
+    Propose a conditional flow-matching model that transports crude residual
+    consensus into a dominant-plane support distribution. If multimodal targets
+    are used, this distribution is treated as a posterior; otherwise its sample
+    variance is calibrated as disagreement. Use mean support and validated
+    uncertainty/disagreement for robust DLT projection. Predict reliability for
+    single-homography validity.
+
+Results:
+
+    Improve homography accuracy, failure detection, calibration, and risk-coverage
+    under multi-plane/dynamic stress tests.
+
+
+18.3 Contribution Bullets
+-------------------------
+
+Suggested paper contributions:
+
+1. We formulate unsupervised deep homography estimation as reliability-aware
+   dominant-plane support consensus rather than deterministic mask prediction.
+
+2. We introduce a geometry-coupled conditional flow-matching model that maps
+   residual consensus seeds to a support distribution, with a multimodal-target
+   option for a true posterior interpretation.
+
+3. We use mean support and validated uncertainty/disagreement statistics for
+   robust DLT projection and bidirectional consensus.
+
+4. We predict pair-level reliability for detecting invalid single-homography cases
+   and evaluate calibration through risk-coverage and failure-detection metrics.
+
+5. We provide extensive ablations and stress tests covering parallax, dynamic
+   objects, low texture, repeated patterns, and ambiguous multi-plane scenes.
+
+
+18.4 Strongest Reviewer Defense
+-------------------------------
+
+If a reviewer says:
+
+    "This is just another mask."
+
+Answer:
+
+    The method does not only output a deterministic mask. It models a conditional
+    support distribution, validates whether its samples behave as posterior
+    uncertainty or calibrated disagreement, uses the resulting support in robust
+    projection, and predicts pair-level validity. The evaluation includes
+    calibration and failure detection, which deterministic mask baselines cannot
+    provide without additional modeling.
+
+If a reviewer says:
+
+    "Flow matching is not new."
+
+Answer:
+
+    The novelty is not generic flow matching. The novelty is a geometry-coupled
+    path from residual consensus to dominant-plane support, integrated with robust
+    projection and reliability estimation. Posterior language is used only when
+    multimodal or latent training makes it defensible.
+
+If a reviewer says:
+
+    "Multi-homography methods already handle multiple planes."
+
+Answer:
+
+    This work targets reliable single dominant homography estimation with explicit
+    validity and calibrated uncertainty/disagreement. It is complementary to
+    multi-homography methods and addresses when a single homography should be
+    trusted or rejected. It does not claim multi-plane estimation.
+
+
+================================================================================
+19. Minimum Viable TIP Upgrade
+================================================================================
+
+If time is limited, implement the following minimum:
+
+1. Geometry-coupled source logits:
+
+       x0 = seed_logits + noise
+
+2. Support sampling:
+
+       K samples, mean, variance, entropy
+
+3. Use mean support as existing mask:
+
+       img1_patch_mask = mean
+       img2_patch_mask = mean
+
+4. Use validated uncertainty or calibrated disagreement in support weights:
+
+       weight = mean / (1 + var)
+
+5. Robust weighted DLT projection:
+
+       H_projected from dense flow and support weights
+
+6. Reliability head from diagnostic vector:
+
+       reliability score
+
+7. Synthetic valid/invalid training:
+
+       reliability labels and mask labels
+
+8. Evaluation:
+
+       accuracy,
+       reliability ROC-AUC,
+       ECE,
+       risk-coverage,
+       runtime.
+
+This minimum is enough to distinguish the work from a simple flow-matching mask.
+It is enough for a posterior claim only if multimodal/latent training and the
+K-sample validation experiment succeed.
+
+
+================================================================================
+20. Checklist Before Manuscript Writing
+================================================================================
+
+Do not start writing the TIP manuscript until these are true:
+
+1. Deterministic flow mask beats no-mask baseline.
+2. Geometry-coupled flow matching beats noise-to-mask flow matching.
+3. K>1 variance/disagreement correlates with error; otherwise posterior wording is removed.
+4. Robust weighted DLT projection improves or at least does not degrade average accuracy.
+5. Reliability score separates successful and failed homographies.
+6. Risk-coverage curve is clearly better than confidence baselines.
+7. Runtime overhead is acceptable or one-step distillation is shown.
+8. Ablations prove each novelty component.
+9. Qualitative figures show meaningful uncertainty/disagreement on ambiguous regions.
+10. The paper does not claim novelty in masks alone or multi-plane estimation.
+
+
+================================================================================
+21. References For Conceptual Boundaries
+================================================================================
+
+Use these references in the paper and in implementation comments only when helpful.
+Do not overclaim against them.
+
+1. Content-Aware Unsupervised Deep Homography Estimation, ECCV 2020.
+   Learned features, learned outlier/content-aware mask, triplet loss.
+   https://www.ecva.net/papers/eccv_2020/papers_ECCV/papers/123460630.pdf
+
+2. Deep Homography Estimation for Dynamic Scenes, CVPR 2020.
+   Dynamic object masks for homography.
+   https://openaccess.thecvf.com/content_CVPR_2020/papers/Le_Deep_Homography_Estimation_for_Dynamic_Scenes_CVPR_2020_paper.pdf
+
+3. Motion Basis Learning for Unsupervised Deep Homography Estimation with Subspace Projection, ICCV 2021.
+   Homography flow bases and low-rank motion representation.
+   https://openaccess.thecvf.com/content/ICCV2021/html/Ye_Motion_Basis_Learning_for_Unsupervised_Deep_Homography_Estimation_With_Subspace_ICCV_2021_paper.html
+
+4. Unsupervised Homography Estimation with Coplanarity-Aware GAN, CVPR 2022.
+   Dominant-plane mask with adversarial coplanarity constraint.
+   https://openaccess.thecvf.com/content/CVPR2022/html/Hong_Unsupervised_Homography_Estimation_With_Coplanarity-Aware_GAN_CVPR_2022_paper.html
+
+5. Recurrent Homography Estimation Using Homography-Guided Image Warping and Focus Transformer, CVPR 2023.
+   Recurrent refinement and focus transformer.
+   https://openaccess.thecvf.com/content/CVPR2023/papers/Cao_Recurrent_Homography_Estimation_Using_Homography-Guided_Image_Warping_and_Focus_Transformer_CVPR_2023_paper.pdf
+
+6. GeoFormer: Geometrized Transformer for Self-Supervised Homography Estimation, ICCV 2023.
+   Geometry/RANSAC-guided transformer attention.
+   https://github.com/ruc-aimc-lab/GeoFormer
+
+7. Mask-Homo: Pseudo Plane Mask-Guided Unsupervised Multi-Homography Estimation, AAAI 2024.
+   Pseudo plane masks and multi-homography estimation.
+   https://ojs.aaai.org/index.php/AAAI/article/view/28379
+
+8. Flow Matching for Generative Modeling.
+   General flow matching formulation.
+   https://openreview.net/forum?id=PqvMRDCJT9t
+
+9. Conditional Flow Matching.
+   Simulation-free conditional flow matching and OT paths.
+   https://openreview.net/forum?id=CD9Snc73AW
+
+10. Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow.
+    Rectified flow and fast deterministic sampling.
+    https://arxiv.org/abs/2209.03003
+
+11. FlowSDF: Flow Matching for Medical Image Segmentation Using Distance Transforms.
+    Example of conditional flow matching for mask-like segmentation distributions and uncertainty.
+    https://arxiv.org/abs/2405.18087
+
+
+================================================================================
+22. Final Implementation Philosophy
+================================================================================
+
+The engineering principle:
+
+    Add support sampling, validated uncertainty/disagreement, and reliability
+    around the existing New Approach.
+    Do not rewrite the homography transformer unless necessary.
+
+The scientific principle:
+
+    Every new module must support the TIP claim:
+
+        dominant-plane support,
+        validated uncertainty or calibrated disagreement,
+        robust DLT projection,
+        reliability,
+        failure detection.
+
+If a proposed component does not help one of those five claims, defer it.
+
+The first successful milestone is not a perfect paper result.
+The first successful milestone is:
+
+	    current model forward pass
+	      -> residual seed
+	      -> K support samples
+	      -> mean support and variance/disagreement
+	      -> robust projected H
+	      -> reliability score
+      -> all shapes correct
+      -> no NaNs
+      -> one backward step works.
+
+After that, train and evaluate the components stage by stage.

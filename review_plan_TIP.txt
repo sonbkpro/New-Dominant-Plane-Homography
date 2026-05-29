@@ -1,0 +1,370 @@
+================================================================================
+REVIEW OF plan_TIP.txt
+Feasibility and Non-Feasibility Evaluation for an IEEE TIP Submission
+(Grounded in the actual new_approach/ code and Data/ contents)
+================================================================================
+
+Reviewer stance: assessed as if seeing both the manuscript and the repository.
+Every load-bearing claim below was verified against the real code and data, not
+inferred from the plan text. Verified anchors:
+
+    new_approach/modules/transformerHomo.py   gen_basis, head2, HomoNet.forward
+    new_approach/modules/maskFlowHomo.py       DominantMaskFlow, make_flow_matching_batch
+    new_approach/geometry_homo.py              flow_mask_to_homography
+    new_approach/losses_homo.py                pseudo_mask_from_residuals, FM loss
+    Data/Coordinate-v2/Coordinate-v2/          real correspondence labels
+    Data/Test_List.txt                         labeled pair list
+
+
+================================================================================
+0. VERDICT UP FRONT
+================================================================================
+
+plan_TIP.txt is ENGINEERING-FEASIBLE in nearly its entirety (~95%) and is
+well-sequenced. The integration discipline (keep output keys, set
+img1_patch_mask = mean, staged compile/smoke tests, fallback flags, condition
+channel-count guard) is genuinely good and de-risks the build.
+
+The risk is NOT engineering. It is scientific framing. Of the three novelty
+pillars:
+
+  A. Flow-matching "posterior" over masks  -> NON-FEASIBLE as a literal headline
+                                              claim; feasible only when reframed.
+  B. Consensus DLT refinement / multi-plane -> buildable but near-no-op; sound
+                                              only as numerical robustness +
+                                              dominant-plane selection.
+  C. Reliability / abstention / calibration -> the strongest and MOST feasible
+                                              pillar. Should be the paper center.
+
+Crucially, the plan itself already concedes A and B (sections 0.1, 6.7, 8.6,
+18.4) and hedges correctly. That self-awareness is its single biggest strength
+over a naive version.
+
+TIP novelty bar: CLEARED CONDITIONALLY -- after (1) reframing or fixing the
+posterior (Issue A), (2) right-sizing the refinement/multi-plane claims (Issue
+B), and (3) running three go/no-go experiments early (Section 7). Left as-is on
+A and B, a knowledgeable reviewer reduces the work to "a deterministic mask
+predictor with a noise-injection trick plus a reliability MLP."
+
+IMPORTANT CORRECTION TO THE PRIOR DRAFT OF THIS REVIEW: the earlier version of
+this file claimed the repository holds "only 2 .npy files locally" and treated
+real-data scarcity as the single biggest practical risk. THAT IS FACTUALLY
+WRONG for this checkout. See Section 4. The real-data calibration pillar is far
+stronger and more feasible than previously stated.
+
+
+================================================================================
+1. VERIFIED CODE FACTS (the load-bearing ground truth)
+================================================================================
+
+  1. Single global flow field, NOT per-pixel / multi-plane.
+     transformerHomo.py:397  head2 = nn.Linear(num_features, 1)
+     transformerHomo.py:1339 H_flow_f = (basis * weight_f).sum(1)
+     num_basis = 8 (train_new.py:42).
+     => H_flow is one global 8-basis polynomial flow field (6 affine + 2
+        quadratic terms), driven by 8 GLOBAL scalar weights. The network cannot
+        represent two planes at once.
+
+  2. Mask-weighted DLT ALREADY exists in the forward pass.
+     transformerHomo.py:1425 H_f = flow_mask_to_homography(H_flow_f, img1_patch_mask)
+     => "weighted DLT" is not new. Only normalized DLT + diagnostics is new.
+
+  3. DLT does NO coordinate normalization before SVD.
+     geometry_homo.py:64-79  raw pixel coords -> A -> torch.linalg.svd.
+     => A real, fixable numerical-accuracy bug. Worth fixing, but plumbing.
+
+  4. Flow matching trains with ONE deterministic target per condition.
+     maskFlowHomo.py:344  x1 = logits_from_mask(target_mask)  (single mask)
+     => the posterior collapses to a point by construction (Issue A).
+
+  5. sample_posterior, reliability head, consensus seed DO NOT EXIST yet.
+     => all net-new modules; pure additions, no API breakage.
+
+  6. REAL GROUND TRUTH IS ABUNDANT.
+     find Data/Coordinate-v2/Coordinate-v2 -name "*.npy" | wc -l  -> 4200
+     wc -l Data/Test_List.txt                                     -> 4199
+     => ~4200 real correspondence-labeled pairs are present locally.
+
+
+================================================================================
+A. PILLAR A -- THE "POSTERIOR" COLLAPSES TO A POINT BY CONSTRUCTION
+   (NON-FEASIBLE as a literal claim; feasible only when reframed)
+================================================================================
+
+This is the deepest issue, and plan_TIP.txt sections 0.1, 6.7, and 8.6 already
+acknowledge it. Confirmation grounded in code:
+
+geometry_coupled_flow_matching_loss regresses v_theta to (x1 - x0), where
+x1 = logit(target_mask) is a SINGLE deterministic target per condition
+(maskFlowHomo.py:344). For rectified / conditional flow matching the optimal
+field is:
+
+    v(x_t, t, cond) = E[x1 - x0 | x_t, cond]
+
+With x1 deterministic given cond, and x_t = (1-t) x0 + t x1, one recovers x0
+from x_t, so the velocity is exact and EVERY initial sample is transported to
+the SAME x1. In the well-trained continuous-time limit the spread across K
+samples at t = 1 is EXACTLY ZERO.
+
+Therefore q_var / q_entropy are NOT epistemic uncertainty. They are residual
+ODE-integration error plus finite-capacity / undertraining error -- large when
+the model is BAD, not when the scene is AMBIGUOUS, with no built-in link to
+homography error. Section 7.7 ("allow high variance on ambiguous pairs") names
+the goal but supplies no mechanism while the target stays unimodal.
+
+Consequence: the uncertainty maps, the variance-weighted DLT (6.9), and the
+variance-based reliability features (6.12) are all built on a quantity that is
+mostly sampling noise -- UNLESS one of the fixes below is implemented.
+
+Feasibility of the three fixes the plan itself proposes (8.6):
+
+  1. Multimodal targets (randomize WHICH plane is "dominant" per draw of the
+     same condition). Scientifically correct -- the only fix that makes
+     "posterior" literally true. Feasibility MODERATE-TO-HARD: works only on
+     SYNTHETIC Type-3/4 data where the planes are controllable. Real data cannot
+     be made genuinely multimodal at fixed condition, so the posterior
+     interpretation lives almost entirely in synthetic experiments.
+
+  2. Latent code / MC-dropout / ensemble. Feasibility EASY (dropout already in
+     ResBlock/MaskFlowUNet). But then it is a latent-variable / ensemble
+     disagreement model, NOT a flow-matching posterior -- the wording must
+     change accordingly. The plan says this correctly.
+
+  3. Drop "posterior"; calibrate q_var empirically against error. Fully
+     feasible, honest, weaker.
+
+VERDICT: the headline "flow-matching posterior" is NON-FEASIBLE unless the
+synthetic multimodal scheme actually delivers variance<->error correlation. The
+honest path (latent/dropout + empirical calibration, "posterior" only after the
+experiment passes) IS feasible. Run the variance<->error experiment FIRST
+(Section 7, checklist #3). It decides whether "posterior" survives in the title.
+
+
+================================================================================
+B. PILLAR B -- CONSENSUS DLT REFINEMENT IS NEAR A NO-OP; MULTI-PLANE IS A
+   MISFRAME (buildable, but not a novelty pillar)
+================================================================================
+
+Two verified facts (Section 1, items 1-2) drive this:
+
+  - The flow is ONE global 8-basis polynomial field that already approximately
+    IS a homography.
+  - Mask-weighted DLT ALREADY runs in the forward pass.
+
+Implications:
+
+  1. Refitting H with different mask weights changes the result only to the
+     extent the polynomial flow deviates from an exact homography across
+     regions. Expect MARGINAL accuracy change. The plan's own checklist #4 says
+     "improves OR at least does not degrade" -- you cannot headline a
+     contribution whose realistic outcome is "does not degrade."
+
+  2. The model CANNOT represent two planes (one global field). "Multi-plane" can
+     only ever mean DOMINANT-PLANE SELECTION, never multi-plane estimation.
+     Section 18.4's reviewer-defense gets this right ("does not claim multi-plane
+     estimation"), but Sections 8 / 13.6 lean on multi-plane stress tests and
+     must be framed as DOWN-WEIGHTING the non-dominant region, not reasoning over
+     planes -- else it reads as overclaiming.
+
+  3. The genuinely NEW and feasible part is small: normalized DLT + diagnostics
+     (geometry_homo.py does no point normalization -- a real accuracy bug). Worth
+     doing, but it is numerical robustness, not a conceptual contribution.
+
+Well-handled: backprop-through-SVD instability is mitigated by
+detach_dlt_refinement = true plus routing the refinement loss through the
+re-warp residual (7.10). Sound.
+
+VERDICT: trivially buildable, but NON-FEASIBLE as a "novelty pillar." Right-size
+to "normalized robust DLT + region selection; matches or modestly improves
+accuracy while enabling reliability."
+
+
+================================================================================
+C. SEED-COUPLED + 1-STEP RISKS MAKING THE FLOW MODEL VACUOUS
+================================================================================
+
+With init = "seed_noise", z0 = logit(seed_prob) + noise, and the default
+steps = 1, one Euler step from an already-decent residual-threshold seed yields:
+
+    mask ~= sigmoid(seed + v_theta(seed + noise))
+
+If the seed is good, the network has almost nothing to do, and ablation 14.2.1
+("residual-threshold seed only") may come out NEARLY TIED with the full model --
+which would gut the mask-generation novelty. This is the "1-step collapses to a
+CNN/threshold" critique relocated to the seed. It is testable and the plan
+includes the ablation (good); the plausible result is dangerous.
+
+MITIGATION: report cases where the seed is WRONG (low texture, repeated texture,
+dynamic foreground) and show the flow model corrects them. That is where the
+flow module must earn its place.
+
+
+================================================================================
+D. RESIDUAL PSEUDO-LABEL CIRCULARITY -- MITIGATED, NOT RESOLVED
+================================================================================
+
+Real-data targets are residual-derived (pseudo_mask_from_residuals,
+losses_homo.py:133; residual_to_seed_logits), then used to weight the alignment
+loss that produced those residuals. Bidirectional consistency (9.1) and
+confidence filtering (9.3) reduce but do not remove the self-reference. A
+reviewer can still object that the mask learns "what the current H already
+aligns," not "the dominant plane." Not fatal. Address it explicitly -- e.g., an
+inverse-consistency-based target that does not reduce to current-residual.
+
+
+================================================================================
+E. REAL GROUND TRUTH IS ABUNDANT -- THE CALIBRATION PILLAR IS STRONG
+   (This REVERSES the prior draft of this review.)
+================================================================================
+
+The prior version of this review treated real-label scarcity as the single
+biggest practical risk, claiming "only 2 .npy files locally" and concluding that
+calibration / risk-coverage / failure-detection numbers would be statistically
+noisy and "largely synthetic."
+
+THAT IS WRONG for this checkout. Verified:
+
+    Data/Coordinate-v2/Coordinate-v2/  contains 4200 .npy correspondence files.
+    Data/Test_List.txt                 contains 4199 labeled pairs.
+
+Consequences:
+
+  - ECE, reliability diagrams, ROC-AUC, PR-AUC, and AURC computed over ~3000+
+    real pairs are STATISTICALLY MEANINGFUL, not noise.
+  - The 20/80 calibration/test split (13.1.1) is feasible and correct.
+  - REQUIREMENT: split by VIDEO ID, not by pair, because adjacent frames of one
+    video are near-duplicates and a pair-level split leaks. The plan says "by
+    pair name or video name" -- insist on video-id splitting.
+
+The reliability / abstention / invalid-single-homography pillar is therefore the
+strongest, freshest, least-contested, AND most feasible part of the work, and
+should be the CENTER of the paper (consistent with plan sections 1.1, 18).
+
+
+================================================================================
+F. THE RELIABILITY TARGET IS A HAND-CRAFTED SYNTHETIC CONSTRUCT
+   (real weakness, but now ADDRESSABLE because the labels exist)
+================================================================================
+
+reliability_target = base_valid * area_score * texture_score * plane_margin *
+overlap (8.4) is an arbitrary product of heuristics. Calibrating a network to
+THIS is calibrating to a synthetic label generator, not to physical homography
+validity.
+
+Because ~4200 real labels exist (Section E), this is now ADDRESSABLE rather than
+soft: you MUST show the reliability score correlates with REAL Coordinate-v2
+reprojection error on the held-out split (reliability_target = exp(-error/tau),
+sections 9.4 / 13.4). Report both the synthetic-label fit and the real-error
+correlation. Without the real-error correlation, "calibrated reliability" means
+only "calibrated to our own generator."
+
+
+================================================================================
+G. ENGINEERING FEASIBILITY LEDGER (the parts that are simply fine)
+================================================================================
+
+Low-risk, buildable as written:
+
+  - consensusHomo.py, reliabilityHomo.py, losses_tip.py, geometry_tip.py: pure
+    additions, no API breakage.
+  - sample_logits / sample_posterior / make_geometry_coupled_flow_matching_batch:
+    clean extensions; old sample() stays (maskFlowHomo.py:219).
+  - K-sample cost: small base-32 U-Net; batch-expansion via repeat_interleave
+    (6.7) is correct; one-step distillation (10.10) is sensible insurance.
+  - Output-key compatibility (img1_patch_mask = mean) preserves evaluate.py and
+    existing training paths.
+  - Staged build order (Section 16) + smoke tests are realistic.
+
+ONE CONCRETE TRAP:
+
+  - Condition-channel mismatch. DominantMaskFlow hard-asserts
+    cond.shape[1] == self.cond_channels (maskFlowHomo.py:210). The V2 condition
+    (6.5, up to 16 channels) WILL CRASH unless mask_flow_cond_channels is set
+    exactly or a lazy 1x1 adapter is added. The plan flags this (6.5, 12.2); do
+    not skip it.
+
+
+================================================================================
+H. DOES IT CLEAR THE TIP NOVELTY BAR?
+================================================================================
+
+CONDITIONALLY -- after reframing A and right-sizing B.
+
+The combination -- generative dominant-plane support + uncertainty/disagreement-
+aware consensus + calibrated pair-level reliability/abstention for unsupervised
+homography, evaluated on ~4200 real labeled pairs -- is a legitimately
+journal-shaped contribution that no prior cited work (Content-Aware, HomoGAN,
+BasesHomo, Mask-Homo, RHWF, GeoFormer) delivers as a package. The "abstain /
+detect invalid single-homography" angle is the freshest and least contested
+piece, and is the one to center the paper on.
+
+If A is reframed honestly (latent/ensemble disagreement, empirically calibrated;
+"posterior" only if the multimodal experiment passes) and the paper is explicit
+that the flow is a single global field (dominant-plane SELECTION, not multi-plane
+estimation), it is TIP-viable. If A and B are left as-is, a knowledgeable
+reviewer reduces the whole thing to "a deterministic mask with a noise-injection
+trick + a reliability MLP," a conference paper at best.
+
+
+================================================================================
+I. RECOMMENDATIONS TO CONVERT NON-FEASIBLE PARTS INTO FEASIBLE ONES
+================================================================================
+
+  1. FIX OR REFRAME THE POSTERIOR (A) BEFORE ANYTHING ELSE. Adopt multimodal
+     targets on ambiguous synthetic pairs, OR use a latent-code/dropout model,
+     OR drop "posterior" and calibrate disagreement. Verify variance<->error
+     correlation on held-out data first.
+
+  2. REFRAME CONSENSUS REFINEMENT (B) as normalized robust DLT + region
+     selection. Claim only "matches or modestly improves accuracy while enabling
+     uncertainty/reliability." Do NOT claim multi-plane reasoning.
+
+  3. EXPLOIT THE REAL LABELS (E). Use the ~4200 Coordinate-v2 pairs with a
+     video-id-based 20/80 calibration/test split for ECE, ROC-AUC, AURC, and
+     reliability diagrams. Tie reliability to real reprojection error (F).
+
+  4. CENTER THE PAPER ON ABSTENTION / FAILURE-DETECTION, with posterior-or-
+     disagreement uncertainty and consensus as SUPPORTING mechanisms.
+
+  5. RUN THE THREE KILLER EXPERIMENTS EARLY (Section 7) and treat the plan's
+     Section 20 checklist as a go/no-go gate, not a formality.
+
+
+================================================================================
+J. BOTTOM LINE
+================================================================================
+
+The plan is buildable almost as written, the EVALUATION PROTOCOL is genuinely
+TIP-grade, and -- contrary to the prior draft of this review -- the real-data
+calibration story is well-supported by ~4200 local correspondence labels.
+
+The remaining risk is purely scientific framing: two of the three novelty
+pillars (posterior, consensus refinement) are soft given how the flow model is
+trained (one deterministic target per condition) and how the flow field is
+constructed (one global 8-basis field). Reframe the posterior, right-size the
+refinement/multi-plane claims, lead with reliability/abstention on the abundant
+real labels, and this becomes a credible TIP submission. Leave A and B as-is and
+it reads as a sophisticated mask predictor dressed in generative-modeling
+vocabulary.
+
+
+================================================================================
+7. THREE GO/NO-GO EXPERIMENTS TO RUN BEFORE WRITING ANY MODULE BEYOND SMOKE TESTS
+================================================================================
+
+These are cheap, run on the current checkpoint, and decide the paper's shape.
+
+  1. VARIANCE <-> ERROR CORRELATION (decides Issue A / posterior wording).
+     Over real Coordinate-v2 pairs, compute K-sample q_var and Spearman/Pearson
+     correlation with reprojection error, plus failure ROC-AUC and risk-coverage.
+     If the correlation is weak, "posterior" must be removed and the work
+     reframed as calibrated disagreement (plan 14.0 #3).
+
+  2. SEED-ONLY vs FULL FLOW MODEL (decides Issue C / whether the flow earns its
+     complexity). If residual-threshold seed-only is nearly tied with the full
+     model, emphasize reliability/abstention, not mask generation (plan 14.2.1).
+
+  3. RELIABILITY vs REAL REPROJECTION ERROR (decides Issue F / the core pillar).
+     On a held-out video-id split, test whether the reliability score correlates
+     with real Coordinate-v2 error. This determines whether the central pillar is
+     real rather than self-referential.
