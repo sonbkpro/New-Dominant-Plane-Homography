@@ -6,14 +6,24 @@ Because the human annotator did not fix a left/right point ordering, the
 per-point error takes min(forward, swapped) using the same predicted H.
 """
 import argparse
+import json
 import os
+import sys
 
 import numpy as np
 import torch
 
-from .dataset_baseline import TestDataset, move_batch
-from .geometry import flow_to_homography, geometric_distance
-from .model_baseline import build_baseline
+if __package__ in (None, ""):
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    from new_approach.dataset_baseline import TestDataset, move_batch
+    from new_approach.geometry import flow_to_homography, geometric_distance
+    from new_approach.model_baseline import build_baseline
+else:
+    from .dataset_baseline import TestDataset, move_batch
+    from .geometry import flow_to_homography, geometric_distance
+    from .model_baseline import build_baseline
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 
@@ -62,6 +72,35 @@ def _pair_error(npy_path, H, num_points=6):
     return float(np.mean(errs)) if errs else None
 
 
+def _load_checkpoint_state(path, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, torch.nn.Module):
+        checkpoint = checkpoint.state_dict()
+    elif isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "model_state_dict"):
+            if key in checkpoint:
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint format: {type(checkpoint)}")
+    return {
+        (key[7:] if key.startswith("module.") else key): value
+        for key, value in checkpoint.items()
+    }
+
+
+def _write_report(report, output_dir):
+    if output_dir is None:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    json_report = {
+        key: (None if isinstance(value, float) and np.isnan(value) else value)
+        for key, value in report.items()
+    }
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+        json.dump(json_report, f, indent=2)
+
+
 @torch.no_grad()
 def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
              verbose=False, num_points=6):
@@ -102,12 +141,15 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", "--checkpoint", dest="ckpt", required=True)
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--list", default=os.path.join(ROOT, "Data/Test_List.txt"))
     ap.add_argument("--img_dir", default=os.path.join(ROOT, "Data/Test"))
     ap.add_argument("--coord_dir", default=os.path.join(ROOT, "Data/Coordinate-v2/Coordinate-v2"))
     ap.add_argument("--max_items", type=int, default=None)
+    ap.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=1,
+                    help="Accepted for CLI compatibility; this evaluator currently processes one pair at a time.")
+    ap.add_argument("--output_dir", "--output-dir", dest="output_dir", default=None)
     ap.add_argument("--num_points", type=_parse_num_points, default=6,
                     help="PME points per pair: 6 matches Oneline-DLTv1/test.py; use 'all' for every labelled point.")
     ap.add_argument("--verbose", action="store_true")
@@ -115,14 +157,20 @@ def main():
 
     device = torch.device(args.device)
     net = build_baseline().to(device)
-    state = torch.load(args.ckpt, map_location=device, weights_only=False)
-    if isinstance(state, dict) and "model" in state:
-        state = state["model"]
-    net.load_state_dict(state)
+    state = _load_checkpoint_state(args.ckpt, device)
+    try:
+        net.load_state_dict(state)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint is not compatible with new_approach.model_baseline.build_baseline(). "
+            "Use a checkpoint produced by new_approach.train_baseline, for example "
+            "baseline_epoch_001.pth or baseline_final.pth."
+        ) from exc
 
     report = evaluate(net, device, args.list, args.img_dir, args.coord_dir,
                       max_items=args.max_items, verbose=args.verbose,
                       num_points=args.num_points)
+    _write_report(report, args.output_dir)
     print("\n=== PME by category ===")
     for k in ("RE", "LT", "LL", "SF", "LF", "AVG"):
         print(f"  {k}: {report[k]:.4f}")
