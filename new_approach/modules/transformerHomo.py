@@ -89,19 +89,15 @@ def tensor_dilation(bin_img, ksize=5):
     return dilation
 
 
-def get_grid(batch_size, H, W, start=0):
-    if torch.cuda.is_available():
-        xx = torch.arange(0, W).cuda()
-        yy = torch.arange(0, H).cuda()
-    else:
-        xx = torch.arange(0, W)
-        yy = torch.arange(0, H)
+def get_grid(batch_size, H, W, start=0, device=None, dtype=torch.float32):
+    xx = torch.arange(0, W, device=device, dtype=dtype)
+    yy = torch.arange(0, H, device=device, dtype=dtype)
     xx = xx.view(1, -1).repeat(H, 1)
     yy = yy.view(-1, 1).repeat(1, W)
     xx = xx.view(1, 1, H, W).repeat(batch_size, 1, 1, 1)
     yy = yy.view(1, 1, H, W).repeat(batch_size, 1, 1, 1)
-    ones = torch.ones_like(xx).cuda() if torch.cuda.is_available() else torch.ones_like(xx)
-    grid = torch.cat((xx, yy, ones), 1).float()
+    ones = torch.ones_like(xx)
+    grid = torch.cat((xx, yy, ones), 1)
 
     grid[:, :2, :, :] = grid[:, :2, :, :] + start
     return grid
@@ -130,7 +126,7 @@ def gen_basis(h, w, is_qr=True, is_scale=True):
     flows = torch.cat([names["basis_" + str(i)] for i in range(1, basis_nb + 1)], dim=0)
     if is_qr:
         flows_ = flows.view(basis_nb, -1).permute(1, 0)  # N, h, w, c --> N, h*w*c --> h*w*c, N
-        flow_q, _ = torch.qr(flows_)
+        flow_q, _ = torch.linalg.qr(flows_, mode="reduced")
         flow_q = flow_q.permute(1, 0).reshape(basis_nb, h, w, 2)
         flows = flow_q
 
@@ -166,10 +162,7 @@ def transformer(I, vgrid, train=True):
         dim1 = width * height
         dim2 = width
 
-        if torch.cuda.is_available():
-            base = torch.arange(0, num_batch).int().cuda()
-        else:
-            base = torch.arange(0, num_batch).int()
+        base = torch.arange(0, num_batch, device=im.device, dtype=torch.int32)
 
         base = base * dim1
         base = base.repeat_interleave(out_height * out_width, axis=0)
@@ -232,7 +225,16 @@ def transformer(I, vgrid, train=True):
 
 def get_warp_flow(img, flow, start=0):
     batch_size, _, patch_size_h, patch_size_w = flow.shape
-    grid_warp = get_grid(batch_size, patch_size_h, patch_size_w, start)[:, :2, :, :] + flow
+    if torch.is_tensor(start):
+        start = start.to(device=flow.device, dtype=flow.dtype)
+    grid_warp = get_grid(
+        batch_size,
+        patch_size_h,
+        patch_size_w,
+        start=start,
+        device=flow.device,
+        dtype=flow.dtype,
+    )[:, :2, :, :] + flow
     img_warp = transformer(img, grid_warp)
     return img_warp
 
@@ -509,7 +511,7 @@ class WindowAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -721,7 +723,7 @@ class WindowCrossAttention(nn.Module):
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -1305,16 +1307,21 @@ class HomoNet(nn.Module):
             warp_img1_patch_mask = get_warp_flow(img1_patch_mask, H_flow_b, start)
             warp_img2_patch_mask = get_warp_flow(img2_patch_mask, H_flow_f, start)
 
+        H_flow_f_patch = H_flow_f
+        H_flow_b_patch = H_flow_b
         if not self.training:
-            H_flow_f = upsample2d_flow_as(H_flow_f, img1_full, mode="bilinear", if_rate=True)
-            H_flow_b = upsample2d_flow_as(H_flow_b, img1_full, mode="bilinear", if_rate=True)
+            H_flow_f = upsample2d_flow_as(H_flow_f.clone(), img1_full, mode="bilinear", if_rate=True)
+            H_flow_b = upsample2d_flow_as(H_flow_b.clone(), img1_full, mode="bilinear", if_rate=True)
         H_flow_f, H_flow_b = H_flow_f.permute(0, 2, 3, 1), H_flow_b.permute(0, 2, 3, 1)
+        H_flow_f_patch = H_flow_f_patch.permute(0, 2, 3, 1)
+        H_flow_b_patch = H_flow_b_patch.permute(0, 2, 3, 1)
 
         return {"warp_img1_patch_fea": warp_img1_patch_fea, "warp_img2_patch_fea": warp_img2_patch_fea,
                 "img1_patch_warp_fea": img1_patch_warp_fea, "img2_patch_warp_fea": img2_patch_warp_fea,
                 "warp_img1_patch": warp_img1_patch, "warp_img2_patch": warp_img2_patch,
                 "img1_patch_fea": img1_patch_fea, "img2_patch_fea": img2_patch_fea,
                 "flow_f": H_flow_f, "flow_b": H_flow_b,
+                "flow_f_patch": H_flow_f_patch, "flow_b_patch": H_flow_b_patch,
                 "img1_patch_mask": img1_patch_mask, "img2_patch_mask": img2_patch_mask,
                 "warp_img1_patch_mask": warp_img1_patch_mask, "warp_img2_patch_mask": warp_img2_patch_mask}
 

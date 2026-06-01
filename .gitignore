@@ -1,2 +1,15 @@
 Data/Test/
 Data/Train/
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Experiment artifacts
+*.pth
+new_approach/checkpoints/
+train_log_Oneline-FastDLT/
+exp_result_Oneline-FastDLT/
+runs/
+wandb/
