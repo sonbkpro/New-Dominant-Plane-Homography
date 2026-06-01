@@ -1,0 +1,4 @@
+# Install PyTorch separately for the target machine's CUDA/CPU runtime.
+opencv-python
+numpy
+timm

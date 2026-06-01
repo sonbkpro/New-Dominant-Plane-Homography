@@ -15,7 +15,10 @@ from types import SimpleNamespace
 
 try:
     from .modules.transformerHomo import Ms_Transformer
-except ImportError:  # allow running as a flat script
+except ImportError as exc:
+    if __package__:
+        raise
+    # Allow direct execution from inside new_approach/ as a flat script.
     from modules.transformerHomo import Ms_Transformer
 
 # Full frame / patch geometry (matches the stageA_* checkpoint args.json).
