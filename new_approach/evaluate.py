@@ -13,6 +13,11 @@ import sys
 import numpy as np
 import torch
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 if __package__ in (None, ""):
     PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
     if PROJECT_ROOT not in sys.path:
@@ -101,16 +106,33 @@ def _write_report(report, output_dir):
         json.dump(json_report, f, indent=2)
 
 
+def _progress_indices(total, enabled=True, desc="Evaluating", fallback_every=100):
+    indices = range(total)
+    if not enabled:
+        return indices
+    if tqdm is not None:
+        return tqdm(indices, total=total, desc=desc, unit="pair")
+
+    def _fallback():
+        for i in indices:
+            yield i
+            done = i + 1
+            if done == 1 or done % fallback_every == 0 or done == total:
+                print(f"{desc}: {done}/{total} pairs", flush=True)
+
+    return _fallback()
+
+
 @torch.no_grad()
 def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
-             verbose=False, num_points=6):
+             verbose=False, num_points=6, progress=True):
     net.eval()
     ds = TestDataset(list_path, img_dir, coord_dir, max_items=max_items)
     buckets = {k: [] for k in CATEGORIES}
     all_errs = []
     skipped = 0
 
-    for i in range(len(ds)):
+    for i in _progress_indices(len(ds), enabled=progress, desc="Evaluating"):
         sample = ds[i]
         if not os.path.exists(sample["npy_path"]):
             skipped += 1
@@ -152,7 +174,10 @@ def main():
     ap.add_argument("--output_dir", "--output-dir", dest="output_dir", default=None)
     ap.add_argument("--num_points", type=_parse_num_points, default=6,
                     help="PME points per pair: 6 matches Oneline-DLTv1/test.py; use 'all' for every labelled point.")
+    ap.add_argument("--no_progress", "--no-progress", dest="progress", action="store_false",
+                    help="Disable the evaluation progress bar.")
     ap.add_argument("--verbose", action="store_true")
+    ap.set_defaults(progress=True)
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -169,7 +194,7 @@ def main():
 
     report = evaluate(net, device, args.list, args.img_dir, args.coord_dir,
                       max_items=args.max_items, verbose=args.verbose,
-                      num_points=args.num_points)
+                      num_points=args.num_points, progress=args.progress)
     _write_report(report, args.output_dir)
     print("\n=== PME by category ===")
     for k in ("RE", "LT", "LL", "SF", "LF", "AVG"):
