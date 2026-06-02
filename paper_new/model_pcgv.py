@@ -129,6 +129,8 @@ def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
         pcgv_use_leverage=True,
         pcgv_damped_update=True,
         pcgv_update_alpha=0.7,
+        pcgv_refine_blend_init=0.05,
+        pcgv_learn_refine_blend=True,
         pcgv_freeze_coarse=False,
         pcgv_init_mode="coarse_flow_corners",
         pcgv_override_baseline_keys=True,
@@ -174,6 +176,8 @@ class PCGVHomoNet(nn.Module):
             use_leverage=_getattr(params, "pcgv_use_leverage", True),
             damped_update=_getattr(params, "pcgv_damped_update", True),
             update_alpha=_getattr(params, "pcgv_update_alpha", 0.7),
+            refine_blend_init=_getattr(params, "pcgv_refine_blend_init", 0.05),
+            learn_refine_blend=_getattr(params, "pcgv_learn_refine_blend", True),
         )
         self.mask_upsampler = MaskUpsampler()
         if _getattr(params, "pcgv_freeze_coarse", False):
@@ -293,6 +297,8 @@ class PCGVHomoNet(nn.Module):
             "pcgv_uncertainty_tokens_b": pcgv_b["uncertainty_tokens"],
             "pcgv_corr_stats_f": pcgv_f["stats"],
             "pcgv_corr_stats_b": pcgv_b["stats"],
+            "pcgv_refine_blend_f": pcgv_f["refine_blend"],
+            "pcgv_refine_blend_b": pcgv_b["refine_blend"],
             "pcgv_residuals_f": pcgv_f["residuals"],
             "pcgv_residuals_b": pcgv_b["residuals"],
             "pcgv_votes_f": pcgv_f["votes"],

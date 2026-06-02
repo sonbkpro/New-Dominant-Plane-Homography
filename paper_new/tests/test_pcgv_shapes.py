@@ -24,6 +24,7 @@ def test_pcgv_forward_shape():
     assert out["matches"].shape == (2, 80, 2)
     assert out["grid"].shape == (2, 80, 2)
     assert out["uncertainty"].shape == (2, 1, 8, 10)
+    assert out["refine_blend"].ndim == 0
 
 
 def test_no_nan_forward():
@@ -31,7 +32,7 @@ def test_no_nan_forward():
     feat_b = torch.randn(1, 8, 6, 6)
     pcgv = PCGVModule(feat_dim=8, hidden_dim=16, num_iters=2, radius=1)
     out = pcgv(feat_a, feat_b)
-    for key in ("H", "mask", "votes", "matches", "residuals", "uncertainty"):
+    for key in ("H", "mask", "votes", "matches", "residuals", "uncertainty", "refine_blend"):
         assert torch.isfinite(out[key]).all(), key
 
 

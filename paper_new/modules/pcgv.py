@@ -43,7 +43,9 @@ class PCGVModule(nn.Module):
                  use_uncertainty: bool = True,
                  use_leverage: bool = True,
                  damped_update: bool = True,
-                 update_alpha: float = 0.7):
+                 update_alpha: float = 0.7,
+                 refine_blend_init: float = 0.05,
+                 learn_refine_blend: bool = True):
         super().__init__()
         self.feat_dim = feat_dim
         self.hidden_dim = hidden_dim
@@ -57,6 +59,12 @@ class PCGVModule(nn.Module):
         self.use_leverage = use_leverage
         self.damped_update = damped_update
         self.update_alpha = update_alpha
+        blend = min(max(float(refine_blend_init), 1e-4), 1.0 - 1e-4)
+        blend_logit = math.log(blend / (1.0 - blend))
+        self.refine_blend_logit = nn.Parameter(
+            torch.tensor(blend_logit, dtype=torch.float32),
+            requires_grad=learn_refine_blend,
+        )
 
         evidence_dim = feat_dim * 2 + 10
         self.encoder = EvidenceEncoder(evidence_dim, hidden_dim)
@@ -96,6 +104,7 @@ class PCGVModule(nn.Module):
         H_t = H_init.to(device=feat_a.device, dtype=feat_a.dtype) if H_init is not None else self._identity(
             batch, feat_a.device, feat_a.dtype)
         H_t = torch_normalize_homography(H_t)
+        H_start = H_t.clone()
 
         feat_a_n = F.normalize(feat_a, dim=1)
         feat_b_n = F.normalize(feat_b, dim=1)
@@ -180,6 +189,9 @@ class PCGVModule(nn.Module):
                 "mean_residual": residuals.detach().mean(dim=1),
             })
 
+        refine_blend = torch.sigmoid(self.refine_blend_logit).to(device=feat_a.device, dtype=feat_a.dtype)
+        H_t = torch_normalize_homography((1.0 - refine_blend) * H_start + refine_blend * H_t)
+
         mask = votes.transpose(1, 2).reshape(batch, 1, height, width)
         if self.uncertainty_head is not None:
             uncertainty = self.uncertainty_head(h_state)
@@ -198,4 +210,5 @@ class PCGVModule(nn.Module):
             "uncertainty_tokens": uncertainty,
             "stats": stats,
             "solver_cond": solver_cond,
+            "refine_blend": refine_blend.detach(),
         }

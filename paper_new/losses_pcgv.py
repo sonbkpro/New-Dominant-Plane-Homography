@@ -256,6 +256,10 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
         value = out.get(key)
         if torch.is_tensor(value):
             logs[key.replace("pcgv_", "mean_")] = _scalar(value)
+    for key in ("pcgv_refine_blend_f", "pcgv_refine_blend_b"):
+        value = out.get(key)
+        if torch.is_tensor(value):
+            logs[key.replace("pcgv_", "")] = _scalar(value)
     for key in ("solver_cond_f", "solver_cond_b"):
         value = out.get(key)
         if torch.is_tensor(value):

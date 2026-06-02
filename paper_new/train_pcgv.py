@@ -7,7 +7,7 @@ Recommended first PCGV stage:
         --freeze_coarse \
         --epochs 2 --batch_size 16 --lr_pcgv 1e-4 --lr_features 2e-5 \
         --lambda_align 1.0 --lambda_fil 0.5 --lambda_coarse_flow 0.0 \
-        --lambda_reproj 0 --lambda_cycle 0 --lambda_vote 0
+        --refine_blend_init 0.05 --lambda_reproj 0 --lambda_cycle 0 --lambda_vote 0
 
 This starts from the loaded coarse baseline, initializes the PCGV feature stack
 from that baseline, then trains the PCGV voting/refinement path with the
@@ -110,6 +110,10 @@ def parse_args():
     ap.add_argument("--use_leverage", type=_str2bool, default=True)
     ap.add_argument("--use_uncertainty", type=_str2bool, default=True)
     ap.add_argument("--update_alpha", type=float, default=0.7)
+    ap.add_argument("--refine_blend_init", type=float, default=0.05,
+                    help="Initial final blend from coarse H to PCGV-refined H; small values preserve the baseline early.")
+    ap.add_argument("--learn_refine_blend", type=_str2bool, default=True,
+                    help="Learn the final PCGV refinement blend during training.")
 
     ap.add_argument("--lambda_align", type=float, default=1.0)
     ap.add_argument("--lambda_fil", type=float, default=0.5)
@@ -272,6 +276,8 @@ def main():
         pcgv_use_uncertainty=args.use_uncertainty,
         pcgv_use_leverage=args.use_leverage,
         pcgv_update_alpha=args.update_alpha,
+        pcgv_refine_blend_init=args.refine_blend_init,
+        pcgv_learn_refine_blend=args.learn_refine_blend,
         pcgv_freeze_coarse=args.freeze_coarse,
         pcgv_init_mode=args.init_mode,
         pcgv_override_baseline_keys=args.override_baseline_keys,
@@ -396,6 +402,8 @@ def main():
                     msg += f" mean_vote_f={logs['mean_votes_f']:.3f}"
                 if "mean_residuals_f" in logs:
                     msg += f" residual_f={logs['mean_residuals_f']:.3f}"
+                if "refine_blend_f" in logs:
+                    msg += f" blend_f={logs['refine_blend_f']:.3f}"
                 print(msg)
             if args.max_steps and step + 1 >= args.max_steps:
                 break

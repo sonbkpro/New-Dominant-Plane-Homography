@@ -19,7 +19,9 @@
     "init_pcgv_features_from_coarse": true,
     "freeze_pcgv_shallow": false,
     "override_baseline_keys": true,
-    "update_alpha": 0.7
+    "update_alpha": 0.7,
+    "refine_blend_init": 0.05,
+    "learn_refine_blend": true
   },
   "loss": {
     "lambda_align": 1.0,
