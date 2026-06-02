@@ -67,6 +67,8 @@ def parse_args():
 
     ap.add_argument("--coarse_ckpt", default=None,
                     help="Optional baseline checkpoint to load into the coarse HomoGAN initializer.")
+    ap.add_argument("--resume", default=None,
+                    help="Optional full PCGV checkpoint to resume for staged loss activation.")
     ap.add_argument("--freeze_coarse", action="store_true",
                     help="Freeze the coarse baseline while training PCGV.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
@@ -131,6 +133,15 @@ def _load_coarse(model, path: str, device):
         print(f"[warn] coarse checkpoint has {len(unexpected)} unexpected keys")
 
 
+def _load_full_model(model, path: str, device):
+    state = _load_state(path, device)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[warn] resume checkpoint missing {len(missing)} keys")
+    if unexpected:
+        print(f"[warn] resume checkpoint has {len(unexpected)} unexpected keys")
+
+
 def _build_optimizer(model, args):
     groups = []
     pcgv_params = [p for p in model.pcgv.parameters() if p.requires_grad]
@@ -172,7 +183,9 @@ def main():
         pcgv_level=args.pcgv_level,
     )
     net = build_pcgv(params).to(device)
-    if args.coarse_ckpt:
+    if args.resume:
+        _load_full_model(net, args.resume, device)
+    elif args.coarse_ckpt:
         _load_coarse(net, args.coarse_ckpt, device)
     if args.freeze_coarse:
         net.freeze_coarse()
