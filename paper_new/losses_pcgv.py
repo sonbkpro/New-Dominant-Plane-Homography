@@ -93,6 +93,18 @@ def weighted_reprojection_loss(out: Dict[str, torch.Tensor], robust: str = "char
     return sum(losses) / len(losses) if losses else _zero_like_loss(out)
 
 
+def coarse_flow_anchor_loss(out: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Keep early PCGV flows close to the strong frozen coarse baseline."""
+    losses = []
+    for suffix in ("f", "b"):
+        flow = out.get(f"flow_{suffix}_patch")
+        coarse = out.get(f"coarse_flow_{suffix}_patch")
+        if flow is None or coarse is None:
+            continue
+        losses.append(F.smooth_l1_loss(flow.float(), coarse.detach().float(), beta=1.0))
+    return sum(losses) / len(losses) if losses else _zero_like_loss(out)
+
+
 def cycle_consistency_loss(out: Dict[str, torch.Tensor]) -> torch.Tensor:
     H_f = out.get("H_f")
     H_b = out.get("H_b")
@@ -171,6 +183,7 @@ def uncertainty_nll_loss(out: Dict[str, torch.Tensor], eps: float = 1e-6) -> tor
 def pcgv_loss(out: Dict[str, torch.Tensor],
               lambda_align: float = 1.0,
               lambda_fil: float = 0.5,
+              lambda_coarse_flow: float = 0.0,
               lambda_reproj: float = 0.0,
               lambda_cycle: float = 0.0,
               lambda_vote: float = 0.0,
@@ -197,6 +210,7 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
                                     lambda_fil=lambda_fil, margin=margin)
 
     zero = _zero_like_loss(out)
+    coarse_flow = coarse_flow_anchor_loss(out) if lambda_coarse_flow else zero
     reproj = weighted_reprojection_loss(out) if lambda_reproj else zero
     cycle = cycle_consistency_loss(out) if lambda_cycle else zero
     vote = vote_pseudo_label_loss(out, tau=vote_tau) if lambda_vote else zero
@@ -215,6 +229,7 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
 
     total = (
         total
+        + lambda_coarse_flow * coarse_flow
         + lambda_reproj * reproj
         + lambda_cycle * cycle
         + lambda_vote * vote
@@ -227,6 +242,7 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
 
     logs.update({
         "total": _scalar(total),
+        "coarse_flow": _scalar(coarse_flow),
         "reproj": _scalar(reproj),
         "cycle": _scalar(cycle),
         "vote": _scalar(vote),

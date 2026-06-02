@@ -20,6 +20,7 @@
   "loss": {
     "lambda_align": 1.0,
     "lambda_fil": 0.5,
+    "lambda_coarse_flow": 0.0,
     "lambda_reproj": 0.0,
     "lambda_cycle": 0.0,
     "lambda_vote": 0.0,
@@ -40,4 +41,3 @@
     "amp": true
   }
 }
-

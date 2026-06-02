@@ -96,6 +96,8 @@ def parse_args():
 
     ap.add_argument("--lambda_align", type=float, default=1.0)
     ap.add_argument("--lambda_fil", type=float, default=0.5)
+    ap.add_argument("--lambda_coarse_flow", type=float, default=0.0,
+                    help="Anchor PCGV final patch flow to the coarse baseline patch flow.")
     ap.add_argument("--lambda_reproj", type=float, default=0.0)
     ap.add_argument("--lambda_cycle", type=float, default=0.0)
     ap.add_argument("--lambda_vote", type=float, default=0.0)
@@ -222,6 +224,7 @@ def main():
                     out,
                     lambda_align=args.lambda_align,
                     lambda_fil=args.lambda_fil,
+                    lambda_coarse_flow=args.lambda_coarse_flow,
                     lambda_reproj=args.lambda_reproj,
                     lambda_cycle=args.lambda_cycle,
                     lambda_vote=args.lambda_vote,
@@ -245,7 +248,8 @@ def main():
                 msg = (
                     f"ep{epoch} [{step}/{len(loader)}] "
                     f"total={logs['total']:.4f} align={logs['align']:.4f} "
-                    f"fil={logs['fil']:.4f} reproj={logs['reproj']:.4f} "
+                    f"fil={logs['fil']:.4f} coarse={logs['coarse_flow']:.4f} "
+                    f"reproj={logs['reproj']:.4f} "
                     f"vote={logs['vote']:.4f}"
                 )
                 if "mean_votes_f" in logs:
