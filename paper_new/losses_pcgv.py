@@ -112,7 +112,9 @@ def vote_pseudo_label_loss(out: Dict[str, torch.Tensor], tau: float = 2.0) -> to
         if votes is None or residuals is None:
             continue
         pseudo = torch.exp(-residuals.detach().square() / max(tau, 1e-6)).clamp(0.0, 1.0)
-        losses.append(F.binary_cross_entropy(votes.clamp(1e-6, 1.0 - 1e-6), pseudo))
+        v = votes.float().clamp(1e-6, 1.0 - 1e-6)
+        p = pseudo.float()
+        losses.append(-(p * v.log() + (1.0 - p) * (1.0 - v).log()).mean())
     return sum(losses) / len(losses) if losses else _zero_like_loss(out)
 
 
@@ -194,18 +196,22 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
         total, logs = baseline_loss(out, lambda_align=lambda_align,
                                     lambda_fil=lambda_fil, margin=margin)
 
-    reproj = weighted_reprojection_loss(out)
-    cycle = cycle_consistency_loss(out)
-    vote = vote_pseudo_label_loss(out, tau=vote_tau)
-    tv_terms = [v for v in (
-        mask_tv_loss(out.get("pcgv_mask_f_patch")),
-        mask_tv_loss(out.get("pcgv_mask_b_patch")),
-    ) if torch.is_tensor(v)]
-    tv = sum(tv_terms) if tv_terms else _zero_like_loss(out)
-    area = area_prior_loss(out, target_area=target_area)
-    entropy = entropy_regularization(out)
-    cond = conditioning_loss(out)
-    uncertainty = uncertainty_nll_loss(out)
+    zero = _zero_like_loss(out)
+    reproj = weighted_reprojection_loss(out) if lambda_reproj else zero
+    cycle = cycle_consistency_loss(out) if lambda_cycle else zero
+    vote = vote_pseudo_label_loss(out, tau=vote_tau) if lambda_vote else zero
+    if lambda_tv:
+        tv_terms = [v for v in (
+            mask_tv_loss(out.get("pcgv_mask_f_patch")),
+            mask_tv_loss(out.get("pcgv_mask_b_patch")),
+        ) if torch.is_tensor(v)]
+        tv = sum(tv_terms) if tv_terms else zero
+    else:
+        tv = zero
+    area = area_prior_loss(out, target_area=target_area) if lambda_area else zero
+    entropy = entropy_regularization(out) if lambda_entropy else zero
+    cond = conditioning_loss(out) if lambda_cond else zero
+    uncertainty = uncertainty_nll_loss(out) if lambda_uncertainty else zero
 
     total = (
         total
