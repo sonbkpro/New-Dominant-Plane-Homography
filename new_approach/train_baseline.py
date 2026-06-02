@@ -14,6 +14,7 @@ Smoke test (a handful of items / steps, fast end-to-end check):
 import argparse
 import json
 import os
+import re
 import time
 
 import torch
@@ -52,7 +53,54 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=230)
     ap.add_argument("--eval_every", type=int, default=1, help="eval every N epochs; 0 = never")
     ap.add_argument("--eval_max_items", type=int, default=None)
+    ap.add_argument("--resume", default=None,
+                    help="resume from baseline_epoch_XXX.pth, baseline_latest.pth, or baseline_final.pth")
     return ap.parse_args()
+
+
+def _infer_epoch_from_path(path):
+    match = re.search(r"epoch_(\d+)\.pth$", os.path.basename(path))
+    return int(match.group(1)) if match else 0
+
+
+def _clean_state_dict(state):
+    return {
+        (key[7:] if key.startswith("module.") else key): value
+        for key, value in state.items()
+    }
+
+
+def load_resume(path, net, opt, scaler, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    start_epoch = _infer_epoch_from_path(path) + 1
+
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        net.load_state_dict(_clean_state_dict(ckpt["model"]))
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt and ckpt["scaler"] is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = int(ckpt.get("epoch", start_epoch - 1)) + 1
+        print(f"Resumed full checkpoint from {path} at next epoch {start_epoch}")
+        return start_epoch
+
+    net.load_state_dict(_clean_state_dict(ckpt))
+    print(
+        f"Resumed model weights from {path} at next epoch {start_epoch}; "
+        "optimizer/scaler state was not present, so they were reinitialized."
+    )
+    return start_epoch
+
+
+def save_checkpoint(path, net, opt, scaler, epoch, args):
+    payload = {
+        "model": net.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+        "epoch": epoch,
+        "args": vars(args),
+    }
+    torch.save(payload, path)
 
 
 def main():
@@ -78,8 +126,14 @@ def main():
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    start_epoch = 1
+    if args.resume:
+        start_epoch = load_resume(args.resume, net, opt, scaler, device)
+        if start_epoch > args.epochs:
+            print(f"Checkpoint already reached epoch {start_epoch - 1}; nothing to train for --epochs {args.epochs}.")
+            return
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         net.train()
         t0 = time.time()
         for step, batch in enumerate(loader):
@@ -104,7 +158,8 @@ def main():
         print(f"epoch {epoch} done in {time.time()-t0:.1f}s")
 
         ckpt = os.path.join(args.out_dir, f"baseline_epoch_{epoch:03d}.pth")
-        torch.save(net.state_dict(), ckpt)
+        save_checkpoint(ckpt, net, opt, scaler, epoch, args)
+        save_checkpoint(os.path.join(args.out_dir, "baseline_latest.pth"), net, opt, scaler, epoch, args)
 
         if args.eval_every and epoch % args.eval_every == 0:
             report = evaluate(net, device, args.test_list, args.test_img_dir,
@@ -113,7 +168,7 @@ def main():
             print("  PME " + "  ".join(
                 f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
 
-    torch.save(net.state_dict(), os.path.join(args.out_dir, "baseline_final.pth"))
+    save_checkpoint(os.path.join(args.out_dir, "baseline_final.pth"), net, opt, scaler, args.epochs, args)
     print("saved final checkpoint")
 
 
