@@ -1,0 +1,1226 @@
+PCGV INTEGRATION PLAN FOR new_approach
+Progressive Correlation-Guided Voting for Dominant-Plane Homography
+Version: 1.0
+Target repository: New-Dominant-Plane-Homography/new_approach
+
+===============================================================================
+0. PURPOSE OF THIS DOCUMENT
+===============================================================================
+
+This document is a detailed implementation plan for integrating a new
+Progressive Correlation-Guided Voting (PCGV) dominant-plane masking module into
+new_approach.
+
+The required design constraints are:
+
+1. Keep featureHomo.py as the feature extraction backbone for the two input
+   images.
+2. Keep transformerHomo.py as the existing homography-estimation / transform
+   backend. Do not replace it immediately.
+3. Insert a new correlation-guided iterative voting module between feature
+   extraction and final homography refinement.
+4. Preserve the current baseline path so all new results can be compared against
+   the current model without breaking training or evaluation.
+5. Make the new module suitable for implementation by Codex or Claude in a
+   professional, staged way.
+
+The main research idea is:
+
+    Instead of predicting a dominant-plane mask only through loss refinement,
+    learn a feature-level iterative voting process. Each feature location forms
+    pairwise matching evidence, checks agreement with the current homography,
+    votes for or against the dominant plane, and directly controls a weighted
+    homography solver.
+
+The resulting mask is no longer only an attention map. It becomes an explicit
+explanation of which correspondences supported the estimated homography.
+
+===============================================================================
+1. REPOSITORY AUDIT
+===============================================================================
+
+The inspected new_approach directory contains:
+
+    new_approach/
+        __init__.py
+        WORKFLOW.md
+        _diag_bn.py
+        dataset_baseline.py
+        evaluate.py
+        geometry.py
+        losses.py
+        model_baseline.py
+        requirements.txt
+        train_baseline.py
+        modules/
+            __init__.py
+            featureHomo.py
+            transformerHomo.py
+
+Important findings:
+
+1. There is no file literally named transformHomo.py in the inspected tree.
+   The actual transformation / homography backend is:
+
+        new_approach/modules/transformerHomo.py
+
+   Therefore, throughout this plan, "transformHomo.py" should be interpreted as
+   the existing transformerHomo.py backend unless you later rename or wrap it.
+
+2. featureHomo.py currently contains:
+
+   - FeatureExtractor:
+       A multi-scale pyramid extractor used by HomoGAN-style transformer blocks.
+
+   - feature_extractor:
+       A shallow feature extractor used by HomoNet before homography regression.
+
+   This file is small and clean. It should be extended, not replaced.
+
+3. transformerHomo.py currently contains the main HomoGAN-derived machinery:
+
+   - SwinTransformer-style multi-scale backbone.
+   - HomoNet class.
+   - basis-flow homography representation.
+   - get_warp_flow and related warp helpers.
+   - Ms_Transformer factory.
+
+   HomoNet.forward currently performs:
+
+       imgs_gray_patch / imgs_gray_full
+           -> featureHomo.feature_extractor
+           -> h_net / SwinTransformer
+           -> 8 basis-flow coefficients
+           -> dense forward and backward homography flow
+           -> image/feature warps
+           -> optional mask predictor when pretrain_phase=False
+           -> output dict used by losses.py
+
+4. model_baseline.py currently builds the no-mask baseline:
+
+       build_baseline(params) -> Ms_Transformer(pretrained=False, params=params)
+
+   The baseline uses pretrain_phase=True, which disables the mask branch and
+   keeps the model in a no-mask unsupervised baseline mode.
+
+5. losses.py currently provides:
+
+   - triplet_align
+   - baseline_loss
+
+   The existing loss uses:
+
+       L_align = relu(margin + |target - warped_source| - |target - source|)
+       L_fil   = | warp(f(I)) - f(warp(I)) |
+
+   This should remain as a baseline and also be reused in the PCGV path.
+
+6. geometry.py currently has only NumPy/OpenCV utilities:
+
+   - flow_to_homography
+   - geometric_distance
+
+   It should be extended with PyTorch differentiable geometry functions, but the
+   old functions should remain untouched for evaluation compatibility.
+
+7. train_baseline.py and evaluate.py are stable control scripts. Do not modify
+   them heavily. Create train_pcgv.py and evaluate_pcgv.py first.
+
+8. There is currently no tests/ directory. Because PCGV introduces explicit
+   differentiable geometry and weighted DLT, tests must be added before long
+   training runs.
+
+===============================================================================
+2. HIGH-LEVEL ARCHITECTURAL DECISION
+===============================================================================
+
+Do NOT directly rewrite HomoNet.forward as the first implementation step.
+
+Instead, create a parallel PCGV model path:
+
+    new_approach/model_pcgv.py
+    new_approach/modules/pcgv.py
+    new_approach/modules/pcgv_blocks.py
+    new_approach/modules/correlation.py
+    new_approach/losses_pcgv.py
+    new_approach/train_pcgv.py
+    new_approach/evaluate_pcgv.py
+
+Reason:
+
+- The current baseline is the scientific control.
+- Directly modifying transformerHomo.py would make it difficult to know whether
+  improvement comes from PCGV or from accidental architecture changes.
+- A parallel path allows A/B testing:
+
+      baseline: model_baseline.py + train_baseline.py
+      new:      model_pcgv.py     + train_pcgv.py
+
+- Once PCGV is stable, selected pieces can be folded back into transformerHomo.py
+  if desired.
+
+Recommended final architecture:
+
+    img1_patch, img2_patch, img1_full, img2_full
+        |
+        v
+    featureHomo.py
+        - shallow features for compatibility
+        - optional pyramid features for PCGV
+        |
+        v
+    transformerHomo.py
+        - coarse bidirectional basis-flow estimation
+        - initial H0 or initial flow0
+        |
+        v
+    PCGVModule
+        - H-aware correlation
+        - soft correspondence extraction
+        - feature evidence encoding
+        - iterative voting
+        - weighted differentiable DLT
+        - dominant-plane mask generation
+        - uncertainty prediction
+        |
+        v
+    final outputs:
+        H_f, H_b
+        flow_f, flow_b
+        mask_f, mask_b
+        confidence / uncertainty
+        warps and feature warps for existing losses
+
+===============================================================================
+3. DATA FLOW CONTRACT
+===============================================================================
+
+The existing dataset batch should remain unchanged.
+
+Expected input batch keys:
+
+    data_batch["imgs_gray_full"]   shape [B, 2, H_full, W_full]
+    data_batch["imgs_gray_patch"]  shape [B, 2, H_patch, W_patch]
+    data_batch["start"]            crop origin, typically [B, 2]
+    data_batch["pts"]              evaluation points / crop points if present
+
+Split convention:
+
+    img1_full  = imgs_gray_full[:, :1]
+    img2_full  = imgs_gray_full[:, 1:]
+    img1_patch = imgs_gray_patch[:, :1]
+    img2_patch = imgs_gray_patch[:, 1:]
+
+PCGV model output dictionary should be backward-compatible with baseline_loss:
+
+Required baseline-compatible keys:
+
+    warp_img1_patch_fea
+    warp_img2_patch_fea
+    img1_patch_warp_fea
+    img2_patch_warp_fea
+    warp_img1_patch
+    warp_img2_patch
+    img1_patch_fea
+    img2_patch_fea
+    flow_f
+    flow_b
+    flow_f_patch
+    flow_b_patch
+    img1_patch_mask
+    img2_patch_mask
+    warp_img1_patch_mask
+    warp_img2_patch_mask
+
+New PCGV-specific keys:
+
+    H_f                       [B, 3, 3]
+    H_b                       [B, 3, 3]
+    H0_f                      [B, 3, 3] or None
+    H0_b                      [B, 3, 3] or None
+    pcgv_mask_f               [B, 1, h_feat, w_feat] or upsampled patch size
+    pcgv_mask_b               [B, 1, h_feat, w_feat] or upsampled patch size
+    pcgv_uncertainty_f        [B, 1, h_feat, w_feat]
+    pcgv_uncertainty_b        [B, 1, h_feat, w_feat]
+    pcgv_corr_stats_f         dict/list of per-iteration stats
+    pcgv_corr_stats_b         dict/list of per-iteration stats
+    pcgv_residuals_f          [B, N, 1]
+    pcgv_residuals_b          [B, N, 1]
+    pcgv_votes_f              [B, N, 1]
+    pcgv_votes_b              [B, N, 1]
+    pcgv_matches_f            [B, N, 2]
+    pcgv_matches_b            [B, N, 2]
+    pcgv_grid                 [B, N, 2]
+    solver_cond_f             scalar or [B]
+    solver_cond_b             scalar or [B]
+
+Coordinate convention:
+
+- Internally, use pixel coordinates for DLT:
+
+      x in [0, W_patch - 1]
+      y in [0, H_patch - 1]
+
+- For grid_sample, use normalized coordinates:
+
+      x_norm in [-1, 1]
+      y_norm in [-1, 1]
+
+- Provide explicit conversion helpers:
+
+      pixel_to_norm(points, H, W)
+      norm_to_pixel(points, H, W)
+
+- Do not mix pixel and normalized coordinates inside weighted_dlt.
+
+===============================================================================
+4. FEATUREHOMO.PY EXTENSION PLAN
+===============================================================================
+
+Do not remove existing classes/functions.
+
+Current file:
+
+    FeatureExtractor
+    feature_extractor
+
+Add:
+
+    class PCGVFeatureBackbone(nn.Module):
+        """Feature extractor wrapper for PCGV.
+
+        Uses the existing featureHomo components but returns a richer dict:
+            shallow: baseline-compatible 1-channel learned feature
+            pyramid: multi-scale feature list
+            pcgv: common-dimension feature map for correlation/voting
+        """
+
+Recommended skeleton:
+
+    class PCGVFeatureBackbone(nn.Module):
+        def __init__(self,
+                     input_channels=1,
+                     shallow_out=1,
+                     pyramid_embed_dim=32,
+                     pyramid_layers=3,
+                     pcgv_dim=64,
+                     activation=nn.GELU):
+            super().__init__()
+            self.shallow = feature_extractor(input_channels * 2, shallow_out)
+            self.pyramid = FeatureExtractor(
+                embed_dim=pyramid_embed_dim,
+                num_layers=pyramid_layers,
+                activation=activation,
+            )
+            self.proj = nn.ModuleList([...])
+
+        def forward_one(self, img):
+            shallow = self.shallow(img)
+            pyramid = self.pyramid(img)
+            pcgv_pyramid = [proj(f) for proj, f in zip(self.proj, pyramid)]
+            return {
+                "shallow": shallow,
+                "pyramid": pyramid,
+                "pcgv_pyramid": pcgv_pyramid,
+                "pcgv": pcgv_pyramid[-1],
+            }
+
+        def forward(self, img1, img2):
+            return self.forward_one(img1), self.forward_one(img2)
+
+Important note:
+
+The existing feature_extractor function expects input_channels=2 in current
+HomoNet because it internally uses input_channels // 2 as the first channel.
+That quirk should not be broken. If adding a cleaner PCGV extractor, keep the
+old function untouched and create the new wrapper explicitly.
+
+===============================================================================
+5. TRANSFORMERHOMO.PY INTEGRATION PLAN
+===============================================================================
+
+Do not immediately rewrite transformerHomo.py.
+
+Use it in three ways:
+
+1. As the baseline model through model_baseline.py.
+2. As the coarse initializer inside model_pcgv.py.
+3. As the source of existing warp helper functions where practical.
+
+Recommended in model_pcgv.py:
+
+    from .model_baseline import make_params
+    from .modules.transformerHomo import Ms_Transformer, get_warp_flow
+
+    class PCGVHomoNet(nn.Module):
+        def __init__(self, params):
+            super().__init__()
+            self.params = params
+            self.coarse_net = Ms_Transformer(pretrained=False, params=params)
+            self.feature_backbone = PCGVFeatureBackbone(...)
+            self.pcgv = PCGVModule(...)
+
+        def forward(self, data_batch):
+            coarse_out = self.coarse_net(data_batch)
+            H0_f = flow_or_coeff_to_initial_homography(coarse_out["flow_f_patch"])
+            H0_b = flow_or_coeff_to_initial_homography(coarse_out["flow_b_patch"])
+            features = self.feature_backbone(img1_patch, img2_patch)
+            pcgv_out_f = self.pcgv(features1, features2, H0_f)
+            pcgv_out_b = self.pcgv(features2, features1, H0_b)
+            return merged_output_dict
+
+Important detail:
+
+The current coarse model outputs dense flow, not directly a 3x3 matrix. You have
+three options:
+
+Option A, easiest:
+    Use flow_to_homography-like four-corner conversion, implemented in PyTorch.
+    This creates H0 from the predicted flow at the crop corners.
+
+Option B, more faithful:
+    Recover H0 from the eight basis coefficients if the relation is exposed.
+    This requires more inspection of gen_basis and coefficient semantics.
+
+Option C, safest first version:
+    Initialize PCGV with identity H and use the coarse flow only to define local
+    search centers or as an auxiliary loss.
+
+Recommended sequence:
+
+    v1: identity H0 + local/global correlation smoke test.
+    v2: PyTorch flow-corner-to-H conversion from coarse flow.
+    v3: optional coefficient-aware conversion.
+
+===============================================================================
+6. NEW MODULE: modules/correlation.py
+===============================================================================
+
+Purpose:
+
+Compute H-aware local correlation around the projected position of each feature
+location.
+
+Core functions/classes:
+
+    make_pixel_grid(batch, height, width, device, dtype)
+    warp_points_h(points, H)
+    extract_local_windows(feat_b, center_points, radius)
+    local_correlation(feat_a, feat_b, center_points, radius)
+    soft_argmax_corr(corr_volume, radius, temperature)
+
+Expected shapes:
+
+    feat_a:        [B, C, Hf, Wf]
+    feat_b:        [B, C, Hf, Wf]
+    grid_a:        [B, N, 2] pixel coordinates at feature scale
+    center_b:      [B, N, 2] projected pixel coordinates at feature scale
+    corr_volume:   [B, N, K] where K=(2r+1)^2
+    delta:         [B, N, 2]
+    corr_peak:     [B, N, 1]
+    corr_gap:      [B, N, 1]
+    corr_entropy:  [B, N, 1]
+
+Recommended implementation:
+
+1. L2-normalize feat_a and feat_b along channel dimension.
+2. For each center point in B, sample a local window using grid_sample.
+3. Dot product sampled B window with A token.
+4. Softmax correlation logits over the window.
+5. Soft-argmax gives expected delta.
+6. Return matched point:
+
+       y_i = center_b + delta_i
+
+Correlation statistics:
+
+- corr_peak: max probability or max raw score.
+- corr_gap: best minus second-best probability/score.
+- corr_entropy: -sum(p log p), high means ambiguous.
+
+===============================================================================
+7. NEW MODULE: modules/pcgv_blocks.py
+===============================================================================
+
+Purpose:
+
+Reusable neural blocks for the voting process.
+
+Add:
+
+    class EvidenceEncoder(nn.Module)
+    class VoteGRU(nn.Module)
+    class GeometryAwareTransformer(nn.Module)
+    class PlaneTokenConsensus(nn.Module)
+    class VoteHead(nn.Module)
+    class UncertaintyHead(nn.Module)
+    class MaskUpsampler(nn.Module)
+
+Evidence vector per feature:
+
+    e_i = concat([
+        feat_a_i,                    C dims
+        feat_b_match_i,              C dims
+        delta_i,                     2
+        residual_i,                  1
+        corr_peak_i,                 1
+        corr_gap_i,                  1
+        corr_entropy_i,              1
+        previous_vote_i,             1
+        leverage_i,                  1
+        xy_i_normalized,             2
+    ])
+
+If C=64, evidence dimension = 64*2 + 11 = 139.
+
+Vote update:
+
+    z_i^t = EvidenceEncoder(e_i^t)
+    h_i^t = VoteGRU(z_i^t, h_i^{t-1})
+    h_i^t = GeometryAwareTransformer(h_i^t, xy_i, delta_i, residual_i)
+    p^t   = PlaneTokenConsensus(h_i^t)
+    w_i^t = sigmoid(VoteHead([h_i^t, p^t]))
+
+Recommended first implementation:
+
+- Use EvidenceEncoder + GRU + VoteHead first.
+- Add GeometryAwareTransformer and PlaneTokenConsensus only after basic tests pass.
+
+===============================================================================
+8. NEW MODULE: modules/pcgv.py
+===============================================================================
+
+Purpose:
+
+Main PCGV iterative loop.
+
+Recommended class:
+
+    class PCGVModule(nn.Module):
+        def __init__(self,
+                     feat_dim=64,
+                     hidden_dim=128,
+                     num_iters=4,
+                     radius=4,
+                     min_vote=1e-4,
+                     use_transformer=False,
+                     use_plane_token=True,
+                     use_uncertainty=True,
+                     use_leverage=True,
+                     damped_update=True,
+                     update_alpha=0.7):
+            ...
+
+        def forward(self, feat_a, feat_b, H_init=None, grid=None):
+            ...
+            return {
+                "H": H_t,
+                "mask": mask,
+                "votes": votes,
+                "matches": matches,
+                "grid": grid,
+                "residuals": residuals,
+                "uncertainty": uncertainty,
+                "stats": stats,
+                "solver_cond": solver_cond,
+            }
+
+Per-iteration loop:
+
+    1. Build feature-grid points x_i.
+    2. Project x_i using current H_t:
+
+           center_i = pi(H_t x_i)
+
+    3. Compute local correlation around center_i.
+    4. Soft-argmax to obtain delta_i and matched point y_i.
+    5. Compute residual:
+
+           r_i = || y_i - pi(H_t x_i) ||_2
+
+    6. Compute optional solver leverage q_i.
+    7. Encode evidence.
+    8. Update vote score w_i.
+    9. Solve weighted DLT from x_i -> y_i with weights w_i.
+   10. Damped update:
+
+           H_t = normalize_H( alpha * H_new + (1-alpha) * H_t )
+
+       Or better residual form if implemented:
+
+           H_t = DeltaH_t @ H_t
+
+Recommended v1:
+
+- Use absolute weighted DLT at each iteration.
+- Normalize H so H[:,2,2] = 1.
+- Clamp votes to [min_vote, 1].
+
+Potential issue:
+
+If all votes collapse, weighted DLT becomes unstable. Use:
+
+    weights = min_vote + (1 - min_vote) * sigmoid(logits)
+
+Also enforce at least top-k support during training:
+
+    weights = soft_topk_floor(weights, k=16 or k=32)
+
+===============================================================================
+9. GEOMETRY.PY EXTENSION PLAN
+===============================================================================
+
+Keep existing NumPy functions. Add PyTorch functions below them.
+
+Required functions:
+
+    torch_make_pixel_grid(B, H, W, device, dtype)
+    torch_pixel_to_norm(points, H, W)
+    torch_norm_to_pixel(points, H, W)
+    torch_warp_points_h(points, H)
+    torch_normalize_homography(H)
+    torch_weighted_dlt(src_pts, dst_pts, weights, eps=1e-6)
+    torch_homography_to_flow(H, H_img, W_img)
+    torch_flow_to_homography_from_corners(flow, start_xy=None)
+    torch_symmetric_transfer_error(H, src_pts, dst_pts)
+    torch_dlt_condition_number(src_pts, dst_pts, weights)
+
+Weighted DLT contract:
+
+    src_pts: [B, N, 2] pixel coordinates
+    dst_pts: [B, N, 2] pixel coordinates
+    weights: [B, N, 1] or [B, N]
+    output:  H [B, 3, 3]
+
+DLT construction per correspondence:
+
+    x, y   = src
+    xp, yp = dst
+
+    row1 = [-x, -y, -1,  0,  0,  0,  xp*x, xp*y, xp]
+    row2 = [ 0,  0,  0, -x, -y, -1,  yp*x, yp*y, yp]
+
+Apply weights:
+
+    A_weighted = sqrt(w_i) * A_i
+
+Solve:
+
+    _, _, Vh = torch.linalg.svd(A_weighted)
+    h = Vh[:, -1]
+    H = h.reshape(B, 3, 3)
+    H = H / (H[:, 2:3, 2:3] + eps)
+
+Important stability details:
+
+1. Normalize coordinates before DLT using Hartley normalization.
+2. Denormalize H afterward.
+3. Add eps to weights.
+4. Fallback to previous H if SVD returns NaN.
+5. In mixed precision, force weighted_dlt to float32:
+
+       with torch.cuda.amp.autocast(enabled=False):
+           H = torch_weighted_dlt(... float())
+
+===============================================================================
+10. MODEL_PCGV.PY PLAN
+===============================================================================
+
+New file:
+
+    new_approach/model_pcgv.py
+
+Responsibilities:
+
+1. Build baseline coarse transformer.
+2. Build PCGV feature backbone.
+3. Run coarse model to get initial warp/flow.
+4. Run PCGV forward and backward.
+5. Convert final H to dense flow for compatibility.
+6. Generate warps and features needed by existing and new losses.
+7. Return a merged output dictionary.
+
+Recommended factories:
+
+    def make_pcgv_params(...):
+        base = make_params(...)
+        base.pcgv_num_iters = 4
+        base.pcgv_radius = 4
+        base.pcgv_feat_dim = 64
+        base.pcgv_hidden_dim = 128
+        base.pcgv_use_transformer = False
+        base.pcgv_use_plane_token = True
+        base.pcgv_use_uncertainty = True
+        base.pcgv_use_leverage = True
+        base.pcgv_freeze_coarse = False
+        base.pcgv_init_mode = "coarse_flow_corners"  # identity | coarse_flow_corners
+        return base
+
+    def build_pcgv(params=None):
+        if params is None:
+            params = make_pcgv_params()
+        return PCGVHomoNet(params)
+
+Recommended class skeleton:
+
+    class PCGVHomoNet(nn.Module):
+        def __init__(self, params):
+            super().__init__()
+            self.params = params
+            self.coarse = build_baseline(params)
+            self.features = PCGVFeatureBackbone(...)
+            self.pcgv = PCGVModule(...)
+
+        def forward(self, data_batch):
+            coarse_out = self.coarse(data_batch)
+
+            img1_patch, img2_patch = split patches
+            feat1, feat2 = self.features(img1_patch, img2_patch)
+
+            H0_f = build_initial_H(coarse_out["flow_f_patch"])
+            H0_b = build_initial_H(coarse_out["flow_b_patch"])
+
+            pcgv_f = self.pcgv(feat1["pcgv"], feat2["pcgv"], H0_f)
+            pcgv_b = self.pcgv(feat2["pcgv"], feat1["pcgv"], H0_b)
+
+            flow_f_patch = torch_homography_to_flow(pcgv_f["H"], h_patch, w_patch)
+            flow_b_patch = torch_homography_to_flow(pcgv_b["H"], h_patch, w_patch)
+
+            warp image/features using existing get_warp_flow or new grid_sample H warp
+
+            out = dict(coarse_out)
+            out.update(new PCGV outputs)
+            override out["flow_f_patch"], out["flow_b_patch"], out["flow_f"], out["flow_b"]
+            override warps if using final H
+            return out
+
+Important compatibility decision:
+
+For v1, keep coarse_out warps and add PCGV warps under new names:
+
+    pcgv_warp_img1_patch
+    pcgv_warp_img2_patch
+    pcgv_warp_img1_patch_fea
+    pcgv_warp_img2_patch_fea
+
+After verifying correctness, switch baseline-compatible keys to PCGV final H.
+
+===============================================================================
+11. LOSSES_PCGV.PY PLAN
+===============================================================================
+
+New file:
+
+    new_approach/losses_pcgv.py
+
+Reuse baseline loss:
+
+    from .losses import baseline_loss, triplet_align
+
+Add:
+
+1. masked_triplet_align
+2. weighted_reprojection_loss
+3. cycle_consistency_loss
+4. vote_pseudo_label_loss
+5. mask_tv_loss
+6. area_prior_loss
+7. entropy_regularization
+8. conditioning_loss
+9. uncertainty_nll_loss
+10. pcgv_loss
+
+Recommended loss formula:
+
+    L_total =
+        lambda_align       * L_masked_align
+      + lambda_fil         * L_fil
+      + lambda_reproj      * L_reproj
+      + lambda_cycle       * L_cycle
+      + lambda_vote        * L_vote
+      + lambda_tv          * L_tv
+      + lambda_area        * L_area
+      + lambda_entropy     * L_entropy
+      + lambda_cond        * L_cond
+      + lambda_uncertainty * L_uncertainty
+
+Suggested default weights:
+
+    lambda_align       = 1.0
+    lambda_fil         = 0.5
+    lambda_reproj      = 1.0
+    lambda_cycle       = 0.2
+    lambda_vote        = 0.2
+    lambda_tv          = 0.02
+    lambda_area        = 0.02
+    lambda_entropy     = 0.005
+    lambda_cond        = 0.01
+    lambda_uncertainty = 0.05
+
+Important loss details:
+
+1. Weighted reprojection:
+
+       L_reproj = sum_i w_i * robust(|| y_i - H x_i ||) / (sum_i w_i + eps)
+
+2. Vote pseudo-label:
+
+       pseudo_w_i = stopgrad(exp(-r_i^2 / tau))
+       L_vote = BCE(w_i, pseudo_w_i)
+
+3. Area prior:
+
+       L_area = (mean(w) - target_area)^2
+
+   Start with target_area = 0.35.
+
+4. Entropy:
+
+       L_entropy = -mean(w log w + (1-w) log(1-w))
+
+   Use carefully. Too much entropy pressure can cause early hard masks.
+
+5. Conditioning:
+
+       L_cond = log(condition_number(A^T W A + eps I))
+
+   If this is unstable, log it only first, then enable as a loss later.
+
+===============================================================================
+12. TRAIN_PCGV.PY PLAN
+===============================================================================
+
+New file:
+
+    new_approach/train_pcgv.py
+
+Start by copying train_baseline.py and changing:
+
+    from .model_pcgv import build_pcgv, make_pcgv_params
+    from .losses_pcgv import pcgv_loss
+
+Add CLI args:
+
+    --device cuda:0
+    --epochs 50
+    --batch-size 8
+    --lr 1e-4
+    --num-iters 4
+    --radius 4
+    --freeze-coarse 0/1
+    --use-transformer 0/1
+    --use-plane-token 0/1
+    --use-leverage 0/1
+    --use-uncertainty 0/1
+    --lambda-reproj ...
+    --lambda-cycle ...
+    --lambda-vote ...
+    --debug-vis 0/1
+    --output-dir runs/pcgv_v1
+
+Training curriculum:
+
+Phase 0: geometry tests only
+    - No training.
+    - Verify weighted DLT and H-to-flow functions.
+
+Phase 1: baseline compatibility smoke test
+    - build_pcgv but use PCGV disabled / identity pass-through.
+    - Confirm batch forward works.
+
+Phase 2: PCGV with frozen coarse model
+    - freeze coarse transformer.
+    - train PCGV voting and DLT only.
+    - lower risk.
+
+Phase 3: unfreeze coarse model
+    - fine-tune full pipeline.
+    - smaller LR for coarse model, larger LR for PCGV.
+
+Suggested optimizer setup:
+
+    optimizer = AdamW([
+        {"params": pcgv_params, "lr": 1e-4},
+        {"params": feature_params, "lr": 1e-4},
+        {"params": coarse_params, "lr": 2e-5},
+    ], weight_decay=1e-4)
+
+Use gradient clipping:
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+Mixed precision:
+
+- Allowed for feature/correlation network.
+- Disable autocast inside weighted DLT.
+
+Logging:
+
+    total_loss
+    align_loss
+    fil_loss
+    reproj_loss
+    cycle_loss
+    vote_loss
+    tv_loss
+    area_loss
+    mean_vote
+    mask_area
+    mask_entropy
+    mean_residual
+    solver_cond
+    H_nan_count
+    grad_norm
+
+===============================================================================
+13. EVALUATE_PCGV.PY PLAN
+===============================================================================
+
+New file:
+
+    new_approach/evaluate_pcgv.py
+
+Start from evaluate.py.
+
+Important change:
+
+- Prefer explicit H_f if available:
+
+      if "H_f" in out:
+          H = out["H_f"][b].cpu().numpy()
+      else:
+          H = flow_to_homography(out["flow_f_patch"], start_xy)
+
+Metrics:
+
+1. Existing PME / geometric point error.
+2. Per-category PME if dataset has RE/LT/LL/SF/LF labels.
+3. Mean mask area.
+4. Mean mask entropy.
+5. Mean weighted residual.
+6. Cycle consistency error:
+
+       ||H_f @ H_b - I||
+
+7. Failure detection:
+
+       correlation between uncertainty and actual point error.
+
+Visualization outputs:
+
+    overlay_mask_img1.png
+    overlay_mask_img2.png
+    matches_quiver.png
+    residual_heatmap.png
+    uncertainty_heatmap.png
+    warped_overlay.png
+
+===============================================================================
+14. CONFIG STRATEGY
+===============================================================================
+
+Add:
+
+    new_approach/configs/pcgv_v1.json
+
+Example:
+
+    {
+      "model": "pcgv",
+      "crop_h": 320,
+      "crop_w": 512,
+      "pcgv": {
+        "feat_dim": 64,
+        "hidden_dim": 128,
+        "num_iters": 4,
+        "radius": 4,
+        "use_transformer": false,
+        "use_plane_token": true,
+        "use_leverage": true,
+        "use_uncertainty": true,
+        "init_mode": "coarse_flow_corners",
+        "freeze_coarse": true,
+        "update_alpha": 0.7
+      },
+      "loss": {
+        "lambda_align": 1.0,
+        "lambda_fil": 0.5,
+        "lambda_reproj": 1.0,
+        "lambda_cycle": 0.2,
+        "lambda_vote": 0.2,
+        "lambda_tv": 0.02,
+        "lambda_area": 0.02,
+        "lambda_entropy": 0.005,
+        "lambda_cond": 0.01,
+        "lambda_uncertainty": 0.05,
+        "target_area": 0.35
+      },
+      "train": {
+        "batch_size": 8,
+        "lr_pcgv": 0.0001,
+        "lr_coarse": 0.00002,
+        "weight_decay": 0.0001,
+        "grad_clip": 1.0,
+        "amp": true
+      }
+    }
+
+Ablation flags should always be config-controlled. Do not hard-code them.
+
+===============================================================================
+15. ABLATION PLAN
+===============================================================================
+
+Required ablations:
+
+A0: Current baseline
+    - model_baseline.py, train_baseline.py
+
+A1: Coarse + weighted DLT only
+    - no correlation voting.
+    - convert coarse flow to correspondences and solve weighted DLT with all ones.
+
+A2: A1 + local correlation + soft-argmax
+    - all weights equal.
+    - tests whether learned correspondences help.
+
+A3: A2 + simple vote MLP
+    - no GRU, no transformer.
+    - tests whether feature significance helps.
+
+A4: A3 + iterative VoteGRU
+    - tests progressive voting.
+
+A5: A4 + geometry-aware transformer
+    - tests spatial consensus.
+
+A6: A5 + plane token
+    - tests global dominant-plane state.
+
+A7: A6 + leverage / conditioning
+    - tests solver-aware feature selection.
+
+A8: A7 + uncertainty head
+    - tests reliability calibration.
+
+A9: A8 + mask upsampler and full mask losses
+    - full proposed method.
+
+Report metrics:
+
+    PME average
+    PME RE/LT/LL/SF/LF
+    mean vote
+    mask area
+    mask entropy
+    residual
+    cycle error
+    solver condition
+    runtime
+    GPU memory
+
+===============================================================================
+16. UNIT TEST PLAN
+===============================================================================
+
+Add:
+
+    new_approach/tests/test_geometry_pcgv.py
+    new_approach/tests/test_correlation.py
+    new_approach/tests/test_pcgv_shapes.py
+
+Tests:
+
+1. test_weighted_dlt_identity
+    - src == dst
+    - H should be close to identity.
+
+2. test_weighted_dlt_translation
+    - dst = src + [tx, ty]
+    - H should recover translation.
+
+3. test_weighted_dlt_random_homography
+    - create random H, project grid, solve H.
+    - reprojection error should be small.
+
+4. test_weight_zero_outliers
+    - add corrupted matches with near-zero weights.
+    - H should still recover inlier transform.
+
+5. test_homography_to_flow_shape
+    - H [B,3,3] -> flow [B,H,W,2].
+
+6. test_local_correlation_shape
+    - verify corr_volume shape [B,N,(2r+1)^2].
+
+7. test_soft_argmax_center
+    - if center has highest score, delta approximately zero.
+
+8. test_pcgv_forward_shape
+    - random features + identity H.
+    - output H, mask, votes, matches have correct shapes.
+
+9. test_no_nan_forward
+    - PCGV forward has no NaN for random input.
+
+Run command:
+
+    python -m pytest new_approach/tests -q
+
+===============================================================================
+17. IMPLEMENTATION ORDER FOR CODEX / CLAUDE
+===============================================================================
+
+Prompt 1: Repository-safe scaffolding
+
+    Create the following empty or minimal files without changing existing behavior:
+        new_approach/modules/correlation.py
+        new_approach/modules/pcgv_blocks.py
+        new_approach/modules/pcgv.py
+        new_approach/model_pcgv.py
+        new_approach/losses_pcgv.py
+        new_approach/train_pcgv.py
+        new_approach/evaluate_pcgv.py
+        new_approach/tests/test_geometry_pcgv.py
+        new_approach/configs/pcgv_v1.json
+
+Prompt 2: Geometry utilities
+
+    Extend new_approach/geometry.py with differentiable PyTorch functions:
+        torch_make_pixel_grid
+        torch_pixel_to_norm
+        torch_norm_to_pixel
+        torch_warp_points_h
+        torch_normalize_homography
+        torch_weighted_dlt
+        torch_homography_to_flow
+        torch_flow_to_homography_from_corners
+        torch_symmetric_transfer_error
+        torch_dlt_condition_number
+    Preserve existing NumPy functions.
+    Add unit tests.
+
+Prompt 3: Correlation module
+
+    Implement modules/correlation.py with H-aware local correlation and
+    soft-argmax utilities.
+    Add shape tests.
+
+Prompt 4: PCGV blocks
+
+    Implement EvidenceEncoder, VoteGRU, VoteHead, optional PlaneTokenConsensus,
+    optional GeometryAwareTransformer, UncertaintyHead, MaskUpsampler.
+
+Prompt 5: PCGV main loop
+
+    Implement PCGVModule in modules/pcgv.py using:
+        feature grid
+        H projection
+        local correlation
+        soft matching
+        evidence encoding
+        recurrent vote update
+        weighted DLT
+        final mask output
+
+Prompt 6: Model wrapper
+
+    Implement model_pcgv.py:
+        make_pcgv_params
+        build_pcgv
+        PCGVHomoNet
+    It should call the existing baseline coarse model and then PCGV.
+
+Prompt 7: Losses
+
+    Implement losses_pcgv.py and make pcgv_loss return:
+        total_loss, logs
+
+Prompt 8: Training script
+
+    Copy train_baseline.py to train_pcgv.py and adapt to build_pcgv and pcgv_loss.
+
+Prompt 9: Evaluation and visualization
+
+    Copy evaluate.py to evaluate_pcgv.py, prefer H_f if available, and log PCGV
+    diagnostics.
+
+Prompt 10: Ablation configs
+
+    Add configs for A0-A9.
+
+===============================================================================
+18. RISKS AND MITIGATIONS
+===============================================================================
+
+Risk 1: Weighted DLT instability
+
+Mitigation:
+    - Hartley normalization.
+    - min_vote floor.
+    - top-k support fallback.
+    - fallback to previous H if NaN.
+    - run DLT in float32.
+
+Risk 2: Vote collapse to all zero
+
+Mitigation:
+    - area prior.
+    - min_vote floor.
+    - delayed vote loss enablement.
+    - start with frozen coarse model.
+
+Risk 3: Vote becomes all one
+
+Mitigation:
+    - residual pseudo-label loss.
+    - entropy control.
+    - outlier augmentation.
+    - monitor mask area.
+
+Risk 4: Correlation is too expensive
+
+Mitigation:
+    - compute at 1/8 or 1/16 feature scale.
+    - radius 4 first.
+    - top-k tokens if memory is high.
+    - mixed precision outside DLT.
+
+Risk 5: Coordinate bugs
+
+Mitigation:
+    - unit tests for pixel/norm conversion.
+    - visualize projected grid and matches.
+    - compare H-to-flow with OpenCV on simple transforms.
+
+Risk 6: Baseline performance regresses
+
+Mitigation:
+    - do not modify train_baseline.py.
+    - keep model_baseline.py intact.
+    - create a separate PCGV path.
+
+===============================================================================
+19. FINAL RECOMMENDATION
+===============================================================================
+
+The best professional integration strategy is:
+
+    Keep featureHomo.py and transformerHomo.py as stable foundations.
+    Add PCGV as a new middle/refinement layer.
+    Make PCGV produce explicit feature votes, soft dominant-plane masks, and
+    weighted correspondences.
+    Use weighted DLT as the final geometry step.
+    Preserve all baseline scripts and add new PCGV scripts in parallel.
+
+The resulting research claim is:
+
+    We do not merely refine a mask with loss. We learn an iterative geometric
+    voting process where pairwise feature evidence progressively decides which
+    points support the dominant plane, and those votes directly determine the
+    homography through a differentiable weighted solver.
+
+This is stronger than adding a conventional mask predictor because it makes the
+mask geometrically causal: the mask controls the homography estimate rather than
+only explaining it after the fact.
+

@@ -1,0 +1,43 @@
+{
+  "model": "pcgv",
+  "crop_h": 320,
+  "crop_w": 512,
+  "pcgv": {
+    "feat_dim": 64,
+    "hidden_dim": 128,
+    "num_iters": 4,
+    "radius": 4,
+    "temperature": 0.1,
+    "use_transformer": false,
+    "use_plane_token": true,
+    "use_leverage": true,
+    "use_uncertainty": true,
+    "init_mode": "coarse_flow_corners",
+    "freeze_coarse": true,
+    "override_baseline_keys": true,
+    "update_alpha": 0.7
+  },
+  "loss": {
+    "lambda_align": 1.0,
+    "lambda_fil": 0.5,
+    "lambda_reproj": 0.0,
+    "lambda_cycle": 0.0,
+    "lambda_vote": 0.0,
+    "lambda_tv": 0.0,
+    "lambda_area": 0.0,
+    "lambda_entropy": 0.0,
+    "lambda_cond": 0.0,
+    "lambda_uncertainty": 0.0,
+    "target_area": 0.35
+  },
+  "train": {
+    "batch_size": 8,
+    "lr_pcgv": 0.0001,
+    "lr_features": 0.0001,
+    "lr_coarse": 0.00002,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "amp": true
+  }
+}
+
