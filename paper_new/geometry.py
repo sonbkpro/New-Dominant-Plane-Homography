@@ -254,6 +254,31 @@ def torch_warp_tensor_with_flow(src: torch.Tensor, flow: torch.Tensor,
     return F.grid_sample(src, norm, mode="bilinear", padding_mode=padding_mode, align_corners=True)
 
 
+def torch_warp_full_with_patch_flow(src: torch.Tensor, flow: torch.Tensor,
+                                    start_xy: Optional[torch.Tensor] = None,
+                                    padding_mode: str = "border") -> torch.Tensor:
+    """Warp a full-frame tensor into a crop using patch-local flow.
+
+    This mirrors HomoGAN's ``get_warp_flow(full_tensor, patch_flow, start)``:
+    the output has the patch-flow spatial size, and each target crop pixel
+    samples ``src`` at ``start_xy + local_xy + flow`` in full-frame coordinates.
+    """
+    if flow.ndim != 4:
+        raise ValueError("flow must be [B, H, W, 2] or [B, 2, H, W]")
+    if flow.shape[1] == 2 and flow.shape[-1] != 2:
+        flow = flow.permute(0, 2, 3, 1)
+    batch, _, full_h, full_w = src.shape
+    if flow.shape[0] != batch:
+        raise ValueError("flow batch size must match src")
+    patch_h, patch_w = flow.shape[1:3]
+    local = torch_make_pixel_grid(batch, patch_h, patch_w, src.device, src.dtype)
+    local = local.reshape(batch, patch_h, patch_w, 2)
+    start = _as_batched_start(start_xy, batch, src.device, src.dtype).view(batch, 1, 1, 2)
+    sample = local + start + flow.to(device=src.device, dtype=src.dtype)
+    norm = torch_pixel_to_norm(sample, full_h, full_w)
+    return F.grid_sample(src, norm, mode="bilinear", padding_mode=padding_mode, align_corners=True)
+
+
 def torch_warp_tensor_with_homography(src: torch.Tensor, H: torch.Tensor,
                                       out_hw: Optional[Tuple[int, int]] = None,
                                       padding_mode: str = "border") -> torch.Tensor:

@@ -16,6 +16,7 @@ from paper_new.geometry import (
     torch_flow_to_homography_from_corners,
     torch_homography_to_flow,
     torch_normalize_homography,
+    torch_warp_full_with_patch_flow,
     torch_warp_tensor_with_flow,
 )
 from paper_new.modules.pcgv import PCGVModule
@@ -26,12 +27,29 @@ def _getattr(params: SimpleNamespace, name: str, default):
     return getattr(params, name, default)
 
 
+def _copy_matching_state(dst: nn.Module, src: nn.Module) -> Dict[str, int]:
+    """Copy state entries whose names and shapes match exactly."""
+    dst_state = dst.state_dict()
+    src_state = src.state_dict()
+    load_state = {}
+    skipped = 0
+    for key, dst_value in dst_state.items():
+        src_value = src_state.get(key)
+        if src_value is None or tuple(src_value.shape) != tuple(dst_value.shape):
+            skipped += 1
+            continue
+        load_state[key] = src_value.detach().to(device=dst_value.device, dtype=dst_value.dtype)
+    dst_state.update(load_state)
+    dst.load_state_dict(dst_state, strict=True)
+    return {"copied": len(load_state), "skipped": skipped}
+
+
 class PCGVFeatureBackbone(nn.Module):
     """Feature wrapper that reuses the existing ``featureHomo`` components."""
 
     def __init__(self,
                  shallow_out: int = 1,
-                 pyramid_embed_dim: int = 32,
+                 pyramid_embed_dim: int = 24,
                  pyramid_layers: int = 3,
                  pcgv_dim: int = 64,
                  pcgv_level: int = 0,
@@ -58,7 +76,7 @@ class PCGVFeatureBackbone(nn.Module):
 
     def forward_one(self, img: torch.Tensor) -> Dict[str, torch.Tensor]:
         shallow = self.shallow(img)
-        pyramid = self.pyramid(img)
+        pyramid = self.pyramid(shallow)
         pcgv_pyramid = [proj(feat) for proj, feat in zip(self.proj, pyramid)]
         return {
             "shallow": shallow,
@@ -72,6 +90,26 @@ class PCGVFeatureBackbone(nn.Module):
 
     def forward(self, img1: torch.Tensor, img2: torch.Tensor):
         return self.forward_one(img1), self.forward_one(img2)
+
+    def init_from_coarse(self, coarse: nn.Module) -> Dict[str, int]:
+        report = {}
+        if hasattr(coarse, "fea_extra"):
+            copied = _copy_matching_state(self.shallow, coarse.fea_extra)
+            report["shallow_copied"] = copied["copied"]
+            report["shallow_skipped"] = copied["skipped"]
+        else:
+            report["shallow_copied"] = 0
+            report["shallow_skipped"] = len(self.shallow.state_dict())
+
+        pyramid_src = getattr(getattr(coarse, "h_net", None), "feature_pyramid_extractor", None)
+        if pyramid_src is not None:
+            copied = _copy_matching_state(self.pyramid, pyramid_src)
+            report["pyramid_copied"] = copied["copied"]
+            report["pyramid_skipped"] = copied["skipped"]
+        else:
+            report["pyramid_copied"] = 0
+            report["pyramid_skipped"] = len(self.pyramid.state_dict())
+        return report
 
 
 def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
@@ -94,7 +132,7 @@ def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
         pcgv_freeze_coarse=False,
         pcgv_init_mode="coarse_flow_corners",
         pcgv_override_baseline_keys=True,
-        pcgv_pyramid_embed_dim=32,
+        pcgv_pyramid_embed_dim=24,
         pcgv_pyramid_layers=3,
         pcgv_level=0,
     )
@@ -118,7 +156,7 @@ class PCGVHomoNet(nn.Module):
         self.params = params
         self.coarse = build_baseline(params)
         self.features = PCGVFeatureBackbone(
-            pyramid_embed_dim=_getattr(params, "pcgv_pyramid_embed_dim", 32),
+            pyramid_embed_dim=_getattr(params, "pcgv_pyramid_embed_dim", 24),
             pyramid_layers=_getattr(params, "pcgv_pyramid_layers", 3),
             pcgv_dim=_getattr(params, "pcgv_feat_dim", 64),
             pcgv_level=_getattr(params, "pcgv_level", 0),
@@ -149,6 +187,19 @@ class PCGVHomoNet(nn.Module):
         for param in self.coarse.parameters():
             param.requires_grad = True
 
+    def init_pcgv_features_from_coarse(self) -> Dict[str, int]:
+        return self.features.init_from_coarse(self.coarse)
+
+    def freeze_pcgv_shallow(self):
+        for param in self.features.shallow.parameters():
+            param.requires_grad = False
+        self.features.shallow.eval()
+
+    def unfreeze_pcgv_shallow(self):
+        for param in self.features.shallow.parameters():
+            param.requires_grad = True
+        self.features.shallow.train(self.training)
+
     def _identity_h(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)
 
@@ -164,7 +215,10 @@ class PCGVHomoNet(nn.Module):
         return torch.where(finite, torch_normalize_homography(H), self._identity_h(batch, device, dtype))
 
     def _pcgv_outputs(self, img1_patch: torch.Tensor, img2_patch: torch.Tensor,
-                      coarse_out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                      coarse_out: Dict[str, torch.Tensor],
+                      img1_full: Optional[torch.Tensor] = None,
+                      img2_full: Optional[torch.Tensor] = None,
+                      start: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         batch, _, h_patch, w_patch = img1_patch.shape
         feat1, feat2 = self.features(img1_patch, img2_patch)
         pcgv1 = feat1["pcgv"]
@@ -186,10 +240,18 @@ class PCGVHomoNet(nn.Module):
 
         img1_fea = feat1["shallow"]
         img2_fea = feat2["shallow"]
-        warp_img2_patch = torch_warp_tensor_with_flow(img2_patch, flow_f_patch)
-        warp_img1_patch = torch_warp_tensor_with_flow(img1_patch, flow_b_patch)
-        warp_img2_patch_fea = torch_warp_tensor_with_flow(img2_fea, flow_f_patch)
-        warp_img1_patch_fea = torch_warp_tensor_with_flow(img1_fea, flow_b_patch)
+        if img1_full is not None and img2_full is not None:
+            img1_full_fea = self.features.forward_shallow(img1_full)
+            img2_full_fea = self.features.forward_shallow(img2_full)
+            warp_img2_patch = torch_warp_full_with_patch_flow(img2_full, flow_f_patch, start)
+            warp_img1_patch = torch_warp_full_with_patch_flow(img1_full, flow_b_patch, start)
+            warp_img2_patch_fea = torch_warp_full_with_patch_flow(img2_full_fea, flow_f_patch, start)
+            warp_img1_patch_fea = torch_warp_full_with_patch_flow(img1_full_fea, flow_b_patch, start)
+        else:
+            warp_img2_patch = torch_warp_tensor_with_flow(img2_patch, flow_f_patch)
+            warp_img1_patch = torch_warp_tensor_with_flow(img1_patch, flow_b_patch)
+            warp_img2_patch_fea = torch_warp_tensor_with_flow(img2_fea, flow_f_patch)
+            warp_img1_patch_fea = torch_warp_tensor_with_flow(img1_fea, flow_b_patch)
         img2_patch_warp_fea = self.features.forward_shallow(warp_img2_patch)
         img1_patch_warp_fea = self.features.forward_shallow(warp_img1_patch)
 
@@ -260,7 +322,18 @@ class PCGVHomoNet(nn.Module):
 
         img1_patch = data_batch["imgs_gray_patch"][:, :1]
         img2_patch = data_batch["imgs_gray_patch"][:, 1:]
-        pcgv_out = self._pcgv_outputs(img1_patch, img2_patch, coarse_out)
+        img1_full = data_batch.get("imgs_gray_full", None)
+        img2_full = None
+        if img1_full is not None:
+            img1_full, img2_full = img1_full[:, :1], img1_full[:, 1:]
+        pcgv_out = self._pcgv_outputs(
+            img1_patch,
+            img2_patch,
+            coarse_out,
+            img1_full=img1_full,
+            img2_full=img2_full,
+            start=data_batch.get("start"),
+        )
 
         out = dict(coarse_out)
         out.update({

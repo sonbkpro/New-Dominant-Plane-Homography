@@ -35,19 +35,44 @@ def _patch_h_to_full_h(H_patch: np.ndarray, start_xy):
     return H / H[2, 2]
 
 
-def _load_checkpoint_state(path, device):
+def _load_checkpoint(path, device):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    raw_checkpoint = checkpoint
     if isinstance(checkpoint, torch.nn.Module):
-        checkpoint = checkpoint.state_dict()
+        state = checkpoint.state_dict()
     elif isinstance(checkpoint, dict):
+        state = checkpoint
         for key in ("model", "state_dict", "model_state_dict"):
-            if key in checkpoint:
-                checkpoint = checkpoint[key]
+            if key in state:
+                state = state[key]
                 break
-    if not isinstance(checkpoint, dict):
-        raise TypeError(f"Unsupported checkpoint format: {type(checkpoint)}")
-    return {(key[7:] if key.startswith("module.") else key): value
-            for key, value in checkpoint.items()}
+    else:
+        state = checkpoint
+    if not isinstance(state, dict):
+        raise TypeError(f"Unsupported checkpoint format: {type(state)}")
+    state = {(key[7:] if key.startswith("module.") else key): value
+             for key, value in state.items()}
+    return raw_checkpoint, state
+
+
+def _load_compatible_state_dict(model, state):
+    model_state = model.state_dict()
+    compatible = {}
+    unexpected = []
+    mismatched = []
+    for key, value in state.items():
+        target = model_state.get(key)
+        if target is None:
+            unexpected.append(key)
+            continue
+        if tuple(target.shape) != tuple(value.shape):
+            mismatched.append(key)
+            continue
+        compatible[key] = value.to(device=target.device, dtype=target.dtype)
+    model_state.update(compatible)
+    model.load_state_dict(model_state, strict=True)
+    missing = [key for key in model_state.keys() if key not in compatible]
+    return missing, unexpected, mismatched
 
 
 def _write_report(report, output_dir):
@@ -157,29 +182,57 @@ def main():
     ap.add_argument("--num_points", type=_parse_num_points, default=6)
     ap.add_argument("--no_progress", "--no-progress", dest="progress", action="store_false")
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--num_iters", type=int, default=4)
-    ap.add_argument("--radius", type=int, default=4)
-    ap.add_argument("--feat_dim", type=int, default=64)
-    ap.add_argument("--hidden_dim", type=int, default=128)
+    ap.add_argument("--num_iters", type=int, default=None)
+    ap.add_argument("--radius", type=int, default=None)
+    ap.add_argument("--feat_dim", type=int, default=None)
+    ap.add_argument("--hidden_dim", type=int, default=None)
+    ap.add_argument("--pyramid_embed_dim", type=int, default=None,
+                    help="PCGV pyramid base channels. Defaults to checkpoint args, else 24.")
+    ap.add_argument("--pyramid_layers", type=int, default=None,
+                    help="PCGV pyramid layers. Defaults to checkpoint args, else 3.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
     args = ap.parse_args()
 
     device = torch.device(args.device)
+    checkpoint, state = _load_checkpoint(args.ckpt, device)
+    ckpt_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    pyramid_embed_dim = args.pyramid_embed_dim
+    if pyramid_embed_dim is None:
+        pyramid_embed_dim = ckpt_args.get("pyramid_embed_dim", ckpt_args.get("pcgv_pyramid_embed_dim", 24))
+    pyramid_layers = args.pyramid_layers
+    if pyramid_layers is None:
+        pyramid_layers = ckpt_args.get("pyramid_layers", ckpt_args.get("pcgv_pyramid_layers", 3))
+    num_iters = args.num_iters
+    if num_iters is None:
+        num_iters = ckpt_args.get("num_iters", ckpt_args.get("pcgv_num_iters", 4))
+    radius = args.radius
+    if radius is None:
+        radius = ckpt_args.get("radius", ckpt_args.get("pcgv_radius", 4))
+    feat_dim = args.feat_dim
+    if feat_dim is None:
+        feat_dim = ckpt_args.get("feat_dim", ckpt_args.get("pcgv_feat_dim", 64))
+    hidden_dim = args.hidden_dim
+    if hidden_dim is None:
+        hidden_dim = ckpt_args.get("hidden_dim", ckpt_args.get("pcgv_hidden_dim", 128))
     params = make_pcgv_params(
-        pcgv_num_iters=args.num_iters,
-        pcgv_radius=args.radius,
-        pcgv_feat_dim=args.feat_dim,
-        pcgv_hidden_dim=args.hidden_dim,
+        pcgv_num_iters=num_iters,
+        pcgv_radius=radius,
+        pcgv_feat_dim=feat_dim,
+        pcgv_hidden_dim=hidden_dim,
+        pcgv_pyramid_embed_dim=pyramid_embed_dim,
+        pcgv_pyramid_layers=pyramid_layers,
         pcgv_init_mode=args.init_mode,
     )
     net = build_pcgv(params).to(device)
-    state = _load_checkpoint_state(args.ckpt, device)
-    missing, unexpected = net.load_state_dict(state, strict=False)
+    missing, unexpected, mismatched = _load_compatible_state_dict(net, state)
     if missing:
         print(f"[warn] checkpoint missing {len(missing)} keys")
     if unexpected:
         print(f"[warn] checkpoint has {len(unexpected)} unexpected keys")
+    if mismatched:
+        print(f"[warn] checkpoint skipped {len(mismatched)} shape-mismatched keys")
+        print("[warn] If this is an older PCGV checkpoint, retry with --pyramid_embed_dim 32.")
 
     report = evaluate(net, device, args.list, args.img_dir, args.coord_dir,
                       max_items=args.max_items, verbose=args.verbose,
