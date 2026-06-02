@@ -55,6 +55,12 @@ def parse_args():
     ap.add_argument("--eval_max_items", type=int, default=None)
     ap.add_argument("--resume", default=None,
                     help="resume from baseline_epoch_XXX.pth, baseline_latest.pth, or baseline_final.pth")
+    ap.add_argument("--save_step_every", type=int, default=0,
+                    help="also save baseline_latest.pth every N optimizer steps; 0 disables mid-epoch saves")
+    ap.add_argument("--nonfinite_patience", type=int, default=20,
+                    help="abort after this many consecutive non-finite losses")
+    ap.add_argument("--fail_on_nonfinite", action="store_true",
+                    help="abort immediately on NaN/Inf loss instead of skipping that batch")
     return ap.parse_args()
 
 
@@ -73,6 +79,7 @@ def _clean_state_dict(state):
 def load_resume(path, net, opt, scaler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     start_epoch = _infer_epoch_from_path(path) + 1
+    start_step = 0
 
     if isinstance(ckpt, dict) and "model" in ckpt:
         net.load_state_dict(_clean_state_dict(ckpt["model"]))
@@ -80,24 +87,29 @@ def load_resume(path, net, opt, scaler, device):
             opt.load_state_dict(ckpt["optimizer"])
         if "scaler" in ckpt and ckpt["scaler"] is not None:
             scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = int(ckpt.get("epoch", start_epoch - 1)) + 1
-        print(f"Resumed full checkpoint from {path} at next epoch {start_epoch}")
-        return start_epoch
+        if ckpt.get("step") is None:
+            start_epoch = int(ckpt.get("epoch", start_epoch - 1)) + 1
+        else:
+            start_epoch = int(ckpt["epoch"])
+            start_step = int(ckpt["step"]) + 1
+        print(f"Resumed full checkpoint from {path} at epoch {start_epoch}, step {start_step}")
+        return start_epoch, start_step
 
     net.load_state_dict(_clean_state_dict(ckpt))
     print(
         f"Resumed model weights from {path} at next epoch {start_epoch}; "
         "optimizer/scaler state was not present, so they were reinitialized."
     )
-    return start_epoch
+    return start_epoch, start_step
 
 
-def save_checkpoint(path, net, opt, scaler, epoch, args):
+def save_checkpoint(path, net, opt, scaler, epoch, args, step=None):
     payload = {
         "model": net.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
+        "step": step,
         "args": vars(args),
     }
     torch.save(payload, path)
@@ -127,27 +139,50 @@ def main():
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     start_epoch = 1
+    start_step = 0
     if args.resume:
-        start_epoch = load_resume(args.resume, net, opt, scaler, device)
+        start_epoch, start_step = load_resume(args.resume, net, opt, scaler, device)
         if start_epoch > args.epochs:
             print(f"Checkpoint already reached epoch {start_epoch - 1}; nothing to train for --epochs {args.epochs}.")
             return
 
+    consecutive_nonfinite = 0
+    skipped_nonfinite = 0
     for epoch in range(start_epoch, args.epochs + 1):
         net.train()
         t0 = time.time()
         for step, batch in enumerate(loader):
+            if epoch == start_epoch and step < start_step:
+                continue
             batch = move_batch(batch, device)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out = net(batch)
                 loss, logs = baseline_loss(out, args.lambda_align, args.lambda_fil)
+
+            if not torch.isfinite(loss):
+                consecutive_nonfinite += 1
+                skipped_nonfinite += 1
+                msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite loss; "
+                       f"skipping batch (consecutive={consecutive_nonfinite}, total_skipped={skipped_nonfinite})")
+                print(msg, flush=True)
+                if args.fail_on_nonfinite or consecutive_nonfinite >= args.nonfinite_patience:
+                    raise FloatingPointError(msg)
+                continue
+            consecutive_nonfinite = 0
+
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
+
+            if args.save_step_every and (step + 1) % args.save_step_every == 0:
+                save_checkpoint(
+                    os.path.join(args.out_dir, "baseline_latest.pth"),
+                    net, opt, scaler, epoch, args, step=step,
+                )
 
             if step % args.print_freq == 0:
                 print(f"ep{epoch} [{step}/{len(loader)}] "
