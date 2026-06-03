@@ -194,15 +194,31 @@ class PCGVHomoNet(nn.Module):
     def init_pcgv_features_from_coarse(self) -> Dict[str, int]:
         return self.features.init_from_coarse(self.coarse)
 
+    def set_refine_blend(self, blend: float) -> float:
+        return self.pcgv.set_refine_blend(blend)
+
+    def get_refine_blend(self) -> float:
+        return self.pcgv.get_refine_blend()
+
     def freeze_pcgv_shallow(self):
         for param in self.features.shallow.parameters():
             param.requires_grad = False
         self.features.shallow.eval()
 
+    def freeze_pcgv_pyramid(self):
+        for param in self.features.pyramid.parameters():
+            param.requires_grad = False
+        self.features.pyramid.eval()
+
     def unfreeze_pcgv_shallow(self):
         for param in self.features.shallow.parameters():
             param.requires_grad = True
         self.features.shallow.train(self.training)
+
+    def unfreeze_pcgv_pyramid(self):
+        for param in self.features.pyramid.parameters():
+            param.requires_grad = True
+        self.features.pyramid.train(self.training)
 
     def _identity_h(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)
@@ -271,6 +287,10 @@ class PCGVHomoNet(nn.Module):
             "H0_b": H0_b_patch,
             "pcgv_H_feat_f": pcgv_f["H"],
             "pcgv_H_feat_b": pcgv_b["H"],
+            "pcgv_H_raw_feat_f": pcgv_f["H_refined"],
+            "pcgv_H_raw_feat_b": pcgv_b["H_refined"],
+            "pcgv_H_start_feat_f": pcgv_f["H_start"],
+            "pcgv_H_start_feat_b": pcgv_b["H_start"],
             "flow_f": flow_f_patch,
             "flow_b": flow_b_patch,
             "flow_f_patch": flow_f_patch,

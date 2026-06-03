@@ -78,6 +78,21 @@ class PCGVModule(nn.Module):
         self.vote_head = VoteHead(vote_in_dim, hidden_dim)
         self.uncertainty_head = UncertaintyHead(hidden_dim) if use_uncertainty else None
 
+    @staticmethod
+    def _blend_to_logit(blend: float) -> float:
+        blend = min(max(float(blend), 1e-4), 1.0 - 1e-4)
+        return math.log(blend / (1.0 - blend))
+
+    def set_refine_blend(self, blend: float) -> float:
+        """Overwrite the final coarse-to-PCGV blend and return the clamped value."""
+        blend = min(max(float(blend), 1e-4), 1.0 - 1e-4)
+        with torch.no_grad():
+            self.refine_blend_logit.fill_(self._blend_to_logit(blend))
+        return blend
+
+    def get_refine_blend(self) -> float:
+        return float(torch.sigmoid(self.refine_blend_logit.detach()).cpu())
+
     def _identity(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)
 
@@ -189,8 +204,9 @@ class PCGVModule(nn.Module):
                 "mean_residual": residuals.detach().mean(dim=1),
             })
 
+        H_refined = H_t
         refine_blend = torch.sigmoid(self.refine_blend_logit).to(device=feat_a.device, dtype=feat_a.dtype)
-        H_t = torch_normalize_homography((1.0 - refine_blend) * H_start + refine_blend * H_t)
+        H_t = torch_normalize_homography((1.0 - refine_blend) * H_start + refine_blend * H_refined)
 
         mask = votes.transpose(1, 2).reshape(batch, 1, height, width)
         if self.uncertainty_head is not None:
@@ -201,6 +217,8 @@ class PCGVModule(nn.Module):
 
         return {
             "H": H_t,
+            "H_refined": H_refined,
+            "H_start": H_start,
             "mask": mask,
             "votes": votes,
             "matches": matches,

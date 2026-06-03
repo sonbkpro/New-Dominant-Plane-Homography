@@ -73,11 +73,67 @@ def masked_baseline_loss(out: Dict[str, torch.Tensor], lambda_align: float = 1.0
     }
 
 
+def _last_corr_stat(out: Dict[str, torch.Tensor], suffix: str, key: str):
+    stats = out.get(f"pcgv_corr_stats_{suffix}")
+    if not stats:
+        return None
+    value = stats[-1].get(key)
+    return value if torch.is_tensor(value) else None
+
+
+def _quantile_score(value: torch.Tensor, low_q: float, high_q: float,
+                    high_is_good: bool, eps: float = 1e-6) -> torch.Tensor:
+    x = value.detach().float()
+    lo = torch.quantile(x, low_q, dim=1, keepdim=True)
+    hi = torch.quantile(x, high_q, dim=1, keepdim=True)
+    denom = (hi - lo).abs().clamp_min(eps)
+    score = (x - lo) / denom if high_is_good else (hi - x) / denom
+    return score.clamp(0.0, 1.0)
+
+
+def _sharpen_probability(prob: torch.Tensor, gamma: float,
+                         eps: float = 1e-6) -> torch.Tensor:
+    if abs(gamma - 1.0) < eps:
+        return prob
+    p = prob.clamp(eps, 1.0 - eps)
+    pos = p.pow(gamma)
+    neg = (1.0 - p).pow(gamma)
+    return pos / (pos + neg + eps)
+
+
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor,
+                 fallback: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.float()
+    total = mask_f.sum()
+    if float(total.detach().cpu()) < 1.0:
+        return fallback
+    return (value.float() * mask_f).sum() / total.clamp_min(1.0)
+
+
+def _vote_basic_diagnostics(votes: torch.Tensor, residuals: torch.Tensor,
+                            low_thresh: float, high_thresh: float,
+                            prefix: str) -> Dict[str, float]:
+    votes_f = votes.detach().float()
+    residuals_f = residuals.detach().float()
+    high_mask = votes_f >= high_thresh
+    low_mask = votes_f <= low_thresh
+    fallback = residuals_f.mean()
+    return {
+        f"vote_std_{prefix}": _scalar(votes_f.std(unbiased=False)),
+        f"vote_hi_{prefix}": _scalar(high_mask.float().mean()),
+        f"vote_lo_{prefix}": _scalar(low_mask.float().mean()),
+        f"vote_inlier_residual_{prefix}": _scalar(_masked_mean(residuals_f, high_mask, fallback)),
+        f"vote_outlier_residual_{prefix}": _scalar(_masked_mean(residuals_f, low_mask, fallback)),
+    }
+
+
 def weighted_reprojection_loss(out: Dict[str, torch.Tensor], robust: str = "charbonnier",
-                               eps: float = 1e-6) -> torch.Tensor:
+                               use_raw_h: bool = True, eps: float = 1e-6) -> torch.Tensor:
     losses = []
     for suffix in ("f", "b"):
-        H = out.get(f"pcgv_H_feat_{suffix}")
+        H = out.get(f"pcgv_H_raw_feat_{suffix}") if use_raw_h else None
+        if H is None:
+            H = out.get(f"pcgv_H_feat_{suffix}")
         grid = out.get("pcgv_grid")
         matches = out.get(f"pcgv_matches_{suffix}")
         votes = out.get(f"pcgv_votes_{suffix}")
@@ -128,6 +184,84 @@ def vote_pseudo_label_loss(out: Dict[str, torch.Tensor], tau: float = 2.0) -> to
         p = pseudo.float()
         losses.append(-(p * v.log() + (1.0 - p) * (1.0 - v).log()).mean())
     return sum(losses) / len(losses) if losses else _zero_like_loss(out)
+
+
+def robust_vote_pseudo_label_loss(out: Dict[str, torch.Tensor],
+                                  residual_low_q: float = 0.25,
+                                  residual_high_q: float = 0.75,
+                                  corr_weight: float = 0.35,
+                                  gamma: float = 1.5,
+                                  min_confidence_weight: float = 0.25,
+                                  low_thresh: float = 0.30,
+                                  high_thresh: float = 0.70,
+                                  eps: float = 1e-6) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Train votes from robust residual ranks and local-correlation confidence.
+
+    Residuals define geometric consistency relative to the current local match.
+    Correlation peak/gap/entropy modulate that residual target so flat or
+    ambiguous matches are less likely to become high-confidence inliers.
+    """
+    losses = []
+    logs: Dict[str, float] = {}
+    corr_weight = min(max(float(corr_weight), 0.0), 1.0)
+    for suffix in ("f", "b"):
+        votes = out.get(f"pcgv_votes_{suffix}")
+        residuals = out.get(f"pcgv_residuals_{suffix}")
+        if votes is None or residuals is None:
+            continue
+        residual_score = _quantile_score(
+            residuals,
+            residual_low_q,
+            residual_high_q,
+            high_is_good=False,
+            eps=eps,
+        )
+        corr_scores = []
+        peak = _last_corr_stat(out, suffix, "corr_peak")
+        gap = _last_corr_stat(out, suffix, "corr_gap")
+        entropy = _last_corr_stat(out, suffix, "corr_entropy")
+        if peak is not None:
+            corr_scores.append(_quantile_score(peak, residual_low_q, residual_high_q, True, eps))
+        if gap is not None:
+            corr_scores.append(_quantile_score(gap, residual_low_q, residual_high_q, True, eps))
+        if entropy is not None:
+            corr_scores.append(_quantile_score(entropy, residual_low_q, residual_high_q, False, eps))
+        if corr_scores:
+            corr_score = sum(corr_scores) / len(corr_scores)
+            pseudo = (1.0 - corr_weight) * residual_score + corr_weight * corr_score
+        else:
+            pseudo = residual_score
+        pseudo = _sharpen_probability(pseudo.detach(), gamma, eps=eps)
+
+        v = votes.float().clamp(eps, 1.0 - eps)
+        p = pseudo.float().clamp(eps, 1.0 - eps)
+        confidence = (p - 0.5).abs() * 2.0
+        sample_weight = min_confidence_weight + (1.0 - min_confidence_weight) * confidence
+        loss = F.binary_cross_entropy(v, p, reduction="none")
+        losses.append((loss * sample_weight).sum() / sample_weight.sum().clamp_min(eps))
+
+        high_pseudo = p >= high_thresh
+        low_pseudo = p <= low_thresh
+        fallback = residuals.detach().float().mean()
+        logs.update({
+            f"pseudo_mean_{suffix}": _scalar(p.mean()),
+            f"pseudo_std_{suffix}": _scalar(p.std(unbiased=False)),
+            f"pseudo_hi_{suffix}": _scalar(high_pseudo.float().mean()),
+            f"pseudo_lo_{suffix}": _scalar(low_pseudo.float().mean()),
+            f"pseudo_inlier_residual_{suffix}": _scalar(
+                _masked_mean(residuals.detach(), high_pseudo, fallback)
+            ),
+            f"pseudo_outlier_residual_{suffix}": _scalar(
+                _masked_mean(residuals.detach(), low_pseudo, fallback)
+            ),
+        })
+        if peak is not None:
+            logs[f"corr_peak_{suffix}"] = _scalar(peak)
+        if gap is not None:
+            logs[f"corr_gap_{suffix}"] = _scalar(gap)
+        if entropy is not None:
+            logs[f"corr_entropy_{suffix}"] = _scalar(entropy)
+    return (sum(losses) / len(losses) if losses else _zero_like_loss(out)), logs
 
 
 def mask_tv_loss(mask: torch.Tensor):
@@ -194,6 +328,14 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
               lambda_uncertainty: float = 0.0,
               target_area: float = 0.35,
               vote_tau: float = 2.0,
+              vote_target_mode: str = "robust",
+              vote_residual_low_q: float = 0.25,
+              vote_residual_high_q: float = 0.75,
+              vote_corr_weight: float = 0.35,
+              vote_gamma: float = 1.5,
+              vote_min_confidence_weight: float = 0.25,
+              vote_low_thresh: float = 0.30,
+              vote_high_thresh: float = 0.70,
               margin: float = 1.0,
               use_masked_align: bool = False) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Total PCGV loss.
@@ -202,7 +344,19 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
     model's current baseline-compatible outputs.  Extra terms activate only when
     their lambdas are non-zero.
     """
-    if use_masked_align:
+    if lambda_align == 0.0 and lambda_fil == 0.0:
+        total = _zero_like_loss(out)
+        zero_float = _scalar(total)
+        logs = {
+            "total": zero_float,
+            "align": zero_float,
+            "align_f": zero_float,
+            "align_b": zero_float,
+            "fil": zero_float,
+            "fil_f": zero_float,
+            "fil_b": zero_float,
+        }
+    elif use_masked_align:
         total, logs = masked_baseline_loss(out, lambda_align=lambda_align,
                                            lambda_fil=lambda_fil, margin=margin)
     else:
@@ -213,7 +367,25 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
     coarse_flow = coarse_flow_anchor_loss(out) if lambda_coarse_flow else zero
     reproj = weighted_reprojection_loss(out) if lambda_reproj else zero
     cycle = cycle_consistency_loss(out) if lambda_cycle else zero
-    vote = vote_pseudo_label_loss(out, tau=vote_tau) if lambda_vote else zero
+    vote_logs: Dict[str, float] = {}
+    if lambda_vote:
+        if vote_target_mode == "exp":
+            vote = vote_pseudo_label_loss(out, tau=vote_tau)
+        elif vote_target_mode == "robust":
+            vote, vote_logs = robust_vote_pseudo_label_loss(
+                out,
+                residual_low_q=vote_residual_low_q,
+                residual_high_q=vote_residual_high_q,
+                corr_weight=vote_corr_weight,
+                gamma=vote_gamma,
+                min_confidence_weight=vote_min_confidence_weight,
+                low_thresh=vote_low_thresh,
+                high_thresh=vote_high_thresh,
+            )
+        else:
+            raise ValueError(f"unknown vote_target_mode: {vote_target_mode}")
+    else:
+        vote = zero
     if lambda_tv:
         tv_terms = [v for v in (
             mask_tv_loss(out.get("pcgv_mask_f_patch")),
@@ -252,10 +424,22 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
         "cond": _scalar(cond),
         "uncertainty": _scalar(uncertainty),
     })
+    logs.update(vote_logs)
     for key in ("pcgv_votes_f", "pcgv_votes_b", "pcgv_residuals_f", "pcgv_residuals_b"):
         value = out.get(key)
         if torch.is_tensor(value):
             logs[key.replace("pcgv_", "mean_")] = _scalar(value)
+    for suffix in ("f", "b"):
+        votes = out.get(f"pcgv_votes_{suffix}")
+        residuals = out.get(f"pcgv_residuals_{suffix}")
+        if torch.is_tensor(votes) and torch.is_tensor(residuals):
+            logs.update(_vote_basic_diagnostics(
+                votes,
+                residuals,
+                low_thresh=vote_low_thresh,
+                high_thresh=vote_high_thresh,
+                prefix=suffix,
+            ))
     for key in ("pcgv_refine_blend_f", "pcgv_refine_blend_b"):
         value = out.get(key)
         if torch.is_tensor(value):

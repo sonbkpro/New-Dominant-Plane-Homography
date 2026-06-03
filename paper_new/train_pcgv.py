@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from typing import Dict
 
@@ -68,6 +69,8 @@ def parse_args():
     ap.add_argument("--max_steps", type=int, default=0)
     ap.add_argument("--eval_every", type=int, default=1)
     ap.add_argument("--eval_max_items", type=int, default=None)
+    ap.add_argument("--stage", choices=("custom", "vote_pretrain"), default="custom",
+                    help="Optional curriculum preset. Explicit command-line values override preset defaults.")
     ap.add_argument("--save_step_every", type=int, default=0,
                     help="also save pcgv_latest.pth every N optimizer steps; 0 disables mid-epoch saves")
     ap.add_argument("--nonfinite_patience", type=int, default=20,
@@ -89,6 +92,8 @@ def parse_args():
                     help="Initialize PCGV shallow/pyramid features from the loaded coarse baseline.")
     ap.add_argument("--freeze_pcgv_shallow", action="store_true",
                     help="Freeze the copied shallow feature extractor during PCGV training.")
+    ap.add_argument("--freeze_pcgv_pyramid", action="store_true",
+                    help="Freeze the copied PCGV feature pyramid while leaving projection/voting layers trainable.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
     ap.add_argument("--override_baseline_keys", type=_str2bool, default=True,
@@ -118,6 +123,8 @@ def parse_args():
                     help="Initial final blend from coarse H to PCGV-refined H; small values preserve the baseline early.")
     ap.add_argument("--learn_refine_blend", type=_str2bool, default=True,
                     help="Learn the final PCGV refinement blend during training.")
+    ap.add_argument("--set_refine_blend", type=float, default=None,
+                    help="Overwrite the loaded PCGV final blend, useful for staged refinement after --resume.")
 
     ap.add_argument("--lambda_align", type=float, default=1.0)
     ap.add_argument("--lambda_fil", type=float, default=0.5)
@@ -133,8 +140,59 @@ def parse_args():
     ap.add_argument("--lambda_uncertainty", type=float, default=0.0)
     ap.add_argument("--target_area", type=float, default=0.35)
     ap.add_argument("--vote_tau", type=float, default=2.0)
+    ap.add_argument("--vote_target_mode", choices=("robust", "exp"), default="robust")
+    ap.add_argument("--vote_residual_low_q", type=float, default=0.25)
+    ap.add_argument("--vote_residual_high_q", type=float, default=0.75)
+    ap.add_argument("--vote_corr_weight", type=float, default=0.35)
+    ap.add_argument("--vote_gamma", type=float, default=1.5)
+    ap.add_argument("--vote_min_confidence_weight", type=float, default=0.25)
+    ap.add_argument("--vote_low_thresh", type=float, default=0.30)
+    ap.add_argument("--vote_high_thresh", type=float, default=0.70)
     ap.add_argument("--use_masked_align", action="store_true")
     return ap.parse_args()
+
+
+def _cli_provided(name: str) -> bool:
+    return f"--{name}" in sys.argv[1:]
+
+
+def _apply_stage_defaults(args):
+    if args.stage != "vote_pretrain":
+        return
+    defaults = {
+        "freeze_coarse": True,
+        "freeze_pcgv_shallow": True,
+        "freeze_pcgv_pyramid": True,
+        "set_refine_blend": 0.0,
+        "lambda_align": 0.0,
+        "lambda_fil": 0.0,
+        "lambda_coarse_flow": 0.0,
+        "lambda_reproj": 0.2,
+        "lambda_vote": 0.5,
+        "lambda_tv": 0.002,
+        "lambda_area": 0.05,
+        "lambda_entropy": 0.01,
+        "lambda_cycle": 0.0,
+        "lambda_cond": 0.0,
+        "lambda_uncertainty": 0.0,
+        "target_area": 0.35,
+        "vote_target_mode": "robust",
+        "vote_residual_low_q": 0.25,
+        "vote_residual_high_q": 0.75,
+        "vote_corr_weight": 0.35,
+        "vote_gamma": 1.5,
+        "vote_min_confidence_weight": 0.25,
+        "vote_low_thresh": 0.30,
+        "vote_high_thresh": 0.70,
+    }
+    applied = []
+    for name, value in defaults.items():
+        if _cli_provided(name):
+            continue
+        setattr(args, name, value)
+        applied.append(f"{name}={value}")
+    if applied:
+        print("Applied vote_pretrain defaults: " + ", ".join(applied))
 
 
 def _infer_epoch_from_path(path: str) -> int:
@@ -286,6 +344,7 @@ def _build_optimizer(model, args):
 
 def main():
     args = parse_args()
+    _apply_stage_defaults(args)
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "args.json"), "w") as f:
@@ -329,11 +388,18 @@ def main():
                 f"shallow copied={report['shallow_copied']} skipped={report['shallow_skipped']}, "
                 f"pyramid copied={report['pyramid_copied']} skipped={report['pyramid_skipped']}"
             )
+    if args.set_refine_blend is not None:
+        applied_blend = net.set_refine_blend(args.set_refine_blend)
+        print(f"Set PCGV refine blend to {applied_blend:.4f}")
+    else:
+        print(f"PCGV refine blend: {net.get_refine_blend():.4f}")
     if args.freeze_coarse:
         net.freeze_coarse()
         net.coarse.eval()
     if args.freeze_pcgv_shallow:
         net.freeze_pcgv_shallow()
+    if args.freeze_pcgv_pyramid:
+        net.freeze_pcgv_pyramid()
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"PCGV built: {n_params/1e6:.2f}M trainable params, device={device}")
@@ -372,6 +438,8 @@ def main():
             net.coarse.eval()
         if args.freeze_pcgv_shallow:
             net.features.shallow.eval()
+        if args.freeze_pcgv_pyramid:
+            net.features.pyramid.eval()
         t0 = time.time()
         for step, batch in enumerate(loader):
             if epoch == start_epoch and step < start_step:
@@ -396,6 +464,14 @@ def main():
                     lambda_uncertainty=args.lambda_uncertainty,
                     target_area=args.target_area,
                     vote_tau=args.vote_tau,
+                    vote_target_mode=args.vote_target_mode,
+                    vote_residual_low_q=args.vote_residual_low_q,
+                    vote_residual_high_q=args.vote_residual_high_q,
+                    vote_corr_weight=args.vote_corr_weight,
+                    vote_gamma=args.vote_gamma,
+                    vote_min_confidence_weight=args.vote_min_confidence_weight,
+                    vote_low_thresh=args.vote_low_thresh,
+                    vote_high_thresh=args.vote_high_thresh,
                     use_masked_align=args.use_masked_align,
                 )
             if not torch.isfinite(loss):
@@ -436,6 +512,15 @@ def main():
                     msg += f" residual_f={logs['mean_residuals_f']:.3f}"
                 if "refine_blend_f" in logs:
                     msg += f" blend_f={logs['refine_blend_f']:.3f}"
+                if "vote_std_f" in logs:
+                    msg += f" vstd_f={logs['vote_std_f']:.3f}"
+                if "pseudo_hi_f" in logs and "pseudo_lo_f" in logs:
+                    msg += f" phi_f={logs['pseudo_hi_f']:.3f} plo_f={logs['pseudo_lo_f']:.3f}"
+                if "pseudo_inlier_residual_f" in logs and "pseudo_outlier_residual_f" in logs:
+                    msg += (
+                        f" rin_f={logs['pseudo_inlier_residual_f']:.3f}"
+                        f" rout_f={logs['pseudo_outlier_residual_f']:.3f}"
+                    )
                 print(msg)
             if args.max_steps and step + 1 >= args.max_steps:
                 break
@@ -451,6 +536,10 @@ def main():
             net.train()
             if args.freeze_coarse:
                 net.coarse.eval()
+            if args.freeze_pcgv_shallow:
+                net.features.shallow.eval()
+            if args.freeze_pcgv_pyramid:
+                net.features.pyramid.eval()
             print("  PME " + "  ".join(
                 f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
 
