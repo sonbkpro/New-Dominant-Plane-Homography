@@ -1,6 +1,8 @@
 {
   "objective": "dominant_plane",
   "freeze_coarse": true,
+  "freeze_pcgv_shallow": true,
+  "freeze_pcgv_pyramid": true,
   "lambda_align": 1.0,
   "lambda_fil": 0.5,
   "lambda_cov": 0.1,

@@ -518,6 +518,7 @@ def main():
         if args.freeze_pcgv_pyramid:
             net.features.pyramid.eval()
         t0 = time.time()
+        epoch_skipped_nonfinite = 0
         for step, batch in enumerate(loader):
             if epoch == start_epoch and step < start_step:
                 continue
@@ -571,6 +572,7 @@ def main():
             if not torch.isfinite(loss):
                 consecutive_nonfinite += 1
                 skipped_nonfinite += 1
+                epoch_skipped_nonfinite += 1
                 msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite loss; "
                        f"skipping batch (consecutive={consecutive_nonfinite}, total_skipped={skipped_nonfinite})")
                 print(msg, flush=True)
@@ -585,6 +587,7 @@ def main():
             if not grads_finite:
                 consecutive_nonfinite += 1
                 skipped_nonfinite += 1
+                epoch_skipped_nonfinite += 1
                 opt.zero_grad(set_to_none=True)
                 scaler.update()
                 msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite gradient"
@@ -646,7 +649,10 @@ def main():
                 print(msg)
             if args.max_steps and step + 1 >= args.max_steps:
                 break
-        print(f"epoch {epoch} done in {time.time() - t0:.1f}s")
+        print(
+            f"epoch {epoch} done in {time.time() - t0:.1f}s "
+            f"(skipped_nonfinite={epoch_skipped_nonfinite}, total_skipped={skipped_nonfinite})"
+        )
 
         ckpt = os.path.join(args.out_dir, f"pcgv_epoch_{epoch:03d}.pth")
         save_checkpoint(ckpt, net, opt, scaler, epoch, args, global_step=global_step)
