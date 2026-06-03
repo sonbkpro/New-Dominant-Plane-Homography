@@ -237,7 +237,7 @@ def robust_vote_pseudo_label_loss(out: Dict[str, torch.Tensor],
         p = pseudo.float().clamp(eps, 1.0 - eps)
         confidence = (p - 0.5).abs() * 2.0
         sample_weight = min_confidence_weight + (1.0 - min_confidence_weight) * confidence
-        loss = F.binary_cross_entropy(v, p, reduction="none")
+        loss = -(p * v.log() + (1.0 - p) * (1.0 - v).log())
         losses.append((loss * sample_weight).sum() / sample_weight.sum().clamp_min(eps))
 
         high_pseudo = p >= high_thresh
