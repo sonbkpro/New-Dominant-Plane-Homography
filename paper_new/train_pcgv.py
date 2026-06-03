@@ -79,6 +79,10 @@ def parse_args():
                     help="Optional baseline checkpoint to load into the coarse HomoGAN initializer.")
     ap.add_argument("--resume", default=None,
                     help="Optional full PCGV checkpoint to resume for staged loss activation.")
+    ap.add_argument("--resume_optimizer", type=_str2bool, default=True,
+                    help="Restore optimizer state from --resume checkpoints when present.")
+    ap.add_argument("--override_resume_lrs", type=_str2bool, default=True,
+                    help="After restoring optimizer state, apply the LR values from this command line.")
     ap.add_argument("--freeze_coarse", action="store_true",
                     help="Freeze the coarse baseline while training PCGV.")
     ap.add_argument("--init_pcgv_features_from_coarse", type=_str2bool, default=True,
@@ -212,16 +216,40 @@ def _load_resume_model(model, path: str, device):
     return checkpoint, start_epoch, start_step
 
 
-def _restore_training_state(checkpoint, opt, scaler):
+def _optimizer_lr_map(args):
+    return {
+        "pcgv": args.lr_pcgv,
+        "features": args.lr_features,
+        "coarse": args.lr_coarse,
+    }
+
+
+def _apply_optimizer_lrs(opt, group_names, args):
+    lr_map = _optimizer_lr_map(args)
+    applied = []
+    for group, name in zip(opt.param_groups, group_names):
+        if name not in lr_map:
+            continue
+        group["lr"] = lr_map[name]
+        applied.append(f"{name}={lr_map[name]:.3g}")
+    if applied:
+        print("Applied command-line learning rates after resume: " + ", ".join(applied))
+
+
+def _restore_training_state(checkpoint, opt, scaler, args, group_names):
     if not isinstance(checkpoint, dict):
         return False
     restored = False
-    if "optimizer" in checkpoint:
+    if args.resume_optimizer and "optimizer" in checkpoint:
         try:
             opt.load_state_dict(checkpoint["optimizer"])
             restored = True
         except ValueError as exc:
             print(f"[warn] optimizer state was not restored: {exc}")
+    elif not args.resume_optimizer:
+        print("Skipping optimizer state restore by request; using fresh optimizer.")
+    if restored and args.override_resume_lrs:
+        _apply_optimizer_lrs(opt, group_names, args)
     if "scaler" in checkpoint and checkpoint["scaler"] is not None:
         try:
             scaler.load_state_dict(checkpoint["scaler"])
@@ -248,11 +276,11 @@ def _build_optimizer(model, args):
     mask_params = [p for p in model.mask_upsampler.parameters() if p.requires_grad]
     coarse_params = [p for p in model.coarse.parameters() if p.requires_grad]
     if pcgv_params or mask_params:
-        groups.append({"params": pcgv_params + mask_params, "lr": args.lr_pcgv})
+        groups.append({"name": "pcgv", "params": pcgv_params + mask_params, "lr": args.lr_pcgv})
     if feature_params:
-        groups.append({"params": feature_params, "lr": args.lr_features})
+        groups.append({"name": "features", "params": feature_params, "lr": args.lr_features})
     if coarse_params:
-        groups.append({"params": coarse_params, "lr": args.lr_coarse})
+        groups.append({"name": "coarse", "params": coarse_params, "lr": args.lr_coarse})
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
 
@@ -309,7 +337,7 @@ def main():
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"PCGV built: {n_params/1e6:.2f}M trainable params, device={device}")
-    if args.freeze_coarse and not args.coarse_ckpt:
+    if args.freeze_coarse and not (args.coarse_ckpt or args.resume):
         print("[warn] coarse model is frozen without --coarse_ckpt; this is only useful for smoke tests.")
 
     ds = TrainDataset(args.train_list, args.train_img_dir, rho=args.rho,
@@ -320,16 +348,20 @@ def main():
     print(f"Train pairs: {len(ds)}  steps/epoch: {len(loader)}")
 
     opt = _build_optimizer(net, args)
+    optimizer_group_names = [group.get("name", str(i)) for i, group in enumerate(opt.param_groups)]
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if resume_checkpoint is not None:
-        restored = _restore_training_state(resume_checkpoint, opt, scaler)
+        restored = _restore_training_state(resume_checkpoint, opt, scaler, args, optimizer_group_names)
         if restored:
             print("Resumed optimizer/scaler state.")
         else:
             print("Optimizer/scaler state was not present or could not be restored; continuing with fresh optimizer.")
     if start_epoch > args.epochs:
-        print(f"Checkpoint already reached epoch {start_epoch - 1}; nothing to train for --epochs {args.epochs}.")
+        print(
+            f"Checkpoint already reached epoch {start_epoch - 1}; nothing to train for --epochs {args.epochs}. "
+            f"Use --epochs {start_epoch} or larger to continue."
+        )
         return
 
     consecutive_nonfinite = 0
