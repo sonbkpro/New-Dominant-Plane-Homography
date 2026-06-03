@@ -18,6 +18,7 @@ from new_approach.dataset_baseline import TestDataset, move_batch
 from new_approach.evaluate import CATEGORIES, _category, _pair_error, _parse_num_points
 from new_approach.geometry import flow_to_homography
 
+from paper_new.geometry import torch_convert_homography_scale
 from paper_new.model_pcgv import build_pcgv, make_pcgv_params
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
@@ -106,7 +107,7 @@ def _progress_indices(total, enabled=True, desc="Evaluating", fallback_every=100
 
 @torch.no_grad()
 def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
-             verbose=False, num_points=6, progress=True):
+             verbose=False, num_points=6, progress=True, h_source="final"):
     net.eval()
     ds = TestDataset(list_path, img_dir, coord_dir, max_items=max_items)
     buckets = {k: [] for k in CATEGORIES}
@@ -126,7 +127,21 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
                  ("imgs_gray_full", "imgs_gray_patch", "start", "pts")}
         batch = move_batch(batch, device)
         out = net(batch)
-        if "H_f" in out:
+        if h_source == "start" and "H0_f" in out:
+            H_patch = out["H0_f"][0].detach().cpu().numpy()
+            H = _patch_h_to_full_h(H_patch, _start_xy(sample))
+        elif h_source == "raw" and "pcgv_H_raw_feat_f" in out:
+            H_feat = out["pcgv_H_raw_feat_f"]
+            _, _, h_feat, w_feat = out["pcgv_mask_f"].shape
+            h_patch, w_patch = batch["imgs_gray_patch"].shape[-2:]
+            H_patch_t = torch_convert_homography_scale(
+                H_feat,
+                (h_feat, w_feat),
+                (h_patch, w_patch),
+            )
+            H_patch = H_patch_t[0].detach().cpu().numpy()
+            H = _patch_h_to_full_h(H_patch, _start_xy(sample))
+        elif "H_f" in out:
             H_patch = out["H_f"][0].detach().cpu().numpy()
             H = _patch_h_to_full_h(H_patch, _start_xy(sample))
         else:
@@ -192,6 +207,10 @@ def main():
                     help="PCGV pyramid layers. Defaults to checkpoint args, else 3.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
+    ap.add_argument("--h_source", choices=("final", "start", "raw"), default="final",
+                    help="Which PCGV homography to evaluate: final blended H, start/coarse H, or raw refined H.")
+    ap.add_argument("--set_refine_blend", type=float, default=None,
+                    help="Override the checkpoint's final coarse-to-refined blend before evaluation.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -226,6 +245,9 @@ def main():
     )
     net = build_pcgv(params).to(device)
     missing, unexpected, mismatched = _load_compatible_state_dict(net, state)
+    if args.set_refine_blend is not None:
+        applied_blend = net.set_refine_blend(args.set_refine_blend)
+        print(f"Set PCGV refine blend to {applied_blend:.4f}")
     if missing:
         print(f"[warn] checkpoint missing {len(missing)} keys")
     if unexpected:
@@ -236,7 +258,8 @@ def main():
 
     report = evaluate(net, device, args.list, args.img_dir, args.coord_dir,
                       max_items=args.max_items, verbose=args.verbose,
-                      num_points=args.num_points, progress=args.progress)
+                      num_points=args.num_points, progress=args.progress,
+                      h_source=args.h_source)
     _write_report(report, args.output_dir)
     print("\n=== PME by category ===")
     for k in ("RE", "LT", "LL", "SF", "LF", "AVG"):
