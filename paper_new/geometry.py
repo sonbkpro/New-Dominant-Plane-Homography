@@ -8,11 +8,18 @@ flow conversion, and grid-sample warping.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+def _autocast_disabled_for(tensor: torch.Tensor):
+    if tensor.device.type in ("cuda", "cpu"):
+        return torch.amp.autocast(tensor.device.type, enabled=False)
+    return nullcontext()
 
 
 def torch_make_pixel_grid(batch: int, height: int, width: int,
@@ -144,35 +151,74 @@ def torch_weighted_dlt(src_pts: torch.Tensor, dst_pts: torch.Tensor,
         raise ValueError("weighted DLT needs at least four correspondences")
 
     orig_dtype = src_pts.dtype
-    src = src_pts.float()
-    dst = dst_pts.float()
-    w = weights.float().squeeze(-1).clamp_min(eps)
+    with _autocast_disabled_for(src_pts):
+        src = src_pts.float()
+        dst = dst_pts.float()
+        w = weights.float().squeeze(-1).clamp_min(eps)
 
-    src_n, T_src = _hartley_normalize(src, w, eps)
-    dst_n, T_dst = _hartley_normalize(dst, w, eps)
-    A = _build_dlt_matrix(src_n, dst_n)
-    row_weights = w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
-    A = A * row_weights
+        src_n, T_src = _hartley_normalize(src, w, eps)
+        dst_n, T_dst = _hartley_normalize(dst, w, eps)
+        A = _build_dlt_matrix(src_n, dst_n)
+        row_weights = w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
+        A = A * row_weights
 
-    _, _, Vh = torch.linalg.svd(A, full_matrices=True)
-    Hn = Vh[:, -1].reshape(-1, 3, 3)
-    H = torch.linalg.inv(T_dst) @ Hn @ T_src
-    H = torch_normalize_homography(H, eps=eps)
+        _, _, Vh = torch.linalg.svd(A, full_matrices=True)
+        Hn = Vh[:, -1].reshape(-1, 3, 3)
+        H = torch.linalg.inv(T_dst) @ Hn @ T_src
+        H = torch_normalize_homography(H, eps=eps)
     return H.to(dtype=orig_dtype)
 
 
 def torch_dlt_condition_number(src_pts: torch.Tensor, dst_pts: torch.Tensor,
                                weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Return the SVD condition number of the weighted DLT system."""
-    src = src_pts.float()
-    dst = dst_pts.float()
-    w = weights.float().squeeze(-1).clamp_min(eps)
-    src_n, _ = _hartley_normalize(src, w, eps)
-    dst_n, _ = _hartley_normalize(dst, w, eps)
-    A = _build_dlt_matrix(src_n, dst_n)
-    A = A * w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
-    s = torch.linalg.svdvals(A)
+    with _autocast_disabled_for(src_pts):
+        src = src_pts.float()
+        dst = dst_pts.float()
+        w = weights.float().squeeze(-1).clamp_min(eps)
+        src_n, _ = _hartley_normalize(src, w, eps)
+        dst_n, _ = _hartley_normalize(dst, w, eps)
+        A = _build_dlt_matrix(src_n, dst_n)
+        A = A * w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
+        s = torch.linalg.svdvals(A)
     return s[:, 0] / s[:, -1].clamp_min(eps)
+
+
+def torch_dlt_leverage(src_pts: torch.Tensor, dst_pts: torch.Tensor,
+                       weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Return a detached regularized DLT row/point leverage cue.
+
+    This is a regularized DLT row/point leverage cue, not exact homography
+    influence on the final null-space solution.
+    """
+    if src_pts.ndim != 3 or dst_pts.ndim != 3:
+        raise ValueError("src_pts and dst_pts must have shape [B, N, 2]")
+    if src_pts.shape != dst_pts.shape or src_pts.shape[-1] != 2:
+        raise ValueError("src_pts and dst_pts must have matching [B, N, 2] shapes")
+    if src_pts.shape[1] < 4:
+        raise ValueError("DLT leverage needs at least four correspondences")
+
+    orig_dtype = src_pts.dtype
+    with torch.no_grad(), _autocast_disabled_for(src_pts):
+        src = src_pts.float()
+        dst = dst_pts.float()
+        w = weights.float().squeeze(-1).clamp_min(eps)
+        src_n, _ = _hartley_normalize(src, w, eps)
+        dst_n, _ = _hartley_normalize(dst, w, eps)
+        A = _build_dlt_matrix(src_n, dst_n)
+        A = A * w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
+
+        normal = A.transpose(1, 2) @ A
+        eye = torch.eye(9, device=A.device, dtype=A.dtype).unsqueeze(0)
+        diag_mean = normal.diagonal(dim1=-2, dim2=-1).mean(dim=1).clamp_min(1.0)
+        normal = normal + (eps * diag_mean).view(-1, 1, 1) * eye
+        inv_normal = torch.linalg.pinv(normal)
+        row_leverage = (A @ inv_normal * A).sum(dim=-1).clamp_min(0.0)
+        point_leverage = row_leverage.reshape(src.shape[0], src.shape[1], 2).mean(dim=-1, keepdim=True)
+        mean = point_leverage.mean(dim=1, keepdim=True).clamp_min(eps)
+        leverage = point_leverage / mean
+        leverage = torch.nan_to_num(leverage, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    return leverage.to(dtype=orig_dtype)
 
 
 def torch_homography_to_flow(H: torch.Tensor, height: int, width: int) -> torch.Tensor:

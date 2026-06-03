@@ -3,6 +3,7 @@ import math
 import torch
 
 from paper_new.geometry import (
+    torch_dlt_leverage,
     torch_flow_to_homography_from_corners,
     torch_homography_to_flow,
     torch_make_pixel_grid,
@@ -62,10 +63,30 @@ def test_weight_zero_outliers():
     assert (pred - dst[:, 20:]).norm(dim=-1).mean() < 1e-2
 
 
+def test_dlt_leverage_shape_finite_nonnegative():
+    grid = torch_make_pixel_grid(2, 8, 9, dtype=torch.float32)
+    dst = grid + torch.tensor([1.0, -0.5])
+    weights = torch.ones(2, grid.shape[1], 1)
+    leverage = torch_dlt_leverage(grid, dst, weights)
+    assert leverage.shape == (2, grid.shape[1], 1)
+    assert torch.isfinite(leverage).all()
+    assert (leverage >= 0).all()
+    assert torch.allclose(leverage.mean(dim=1), torch.ones(2, 1), atol=1e-3, rtol=1e-3)
+
+
+def test_dlt_leverage_tolerates_near_zero_weights():
+    grid = torch_make_pixel_grid(1, 7, 7, dtype=torch.float32)
+    dst = grid + torch.tensor([0.25, 0.75])
+    weights = torch.ones(1, grid.shape[1], 1)
+    weights[:, :12] = 1e-9
+    leverage = torch_dlt_leverage(grid, dst, weights)
+    assert torch.isfinite(leverage).all()
+    assert (leverage >= 0).all()
+
+
 def test_homography_to_flow_shape_and_corner_recovery():
     H = torch.tensor([[[1.0, 0.0, 4.0], [0.0, 1.0, -3.0], [0.0, 0.0, 1.0]]])
     flow = torch_homography_to_flow(H, 16, 20)
     assert flow.shape == (1, 16, 20, 2)
     H_rec = torch_flow_to_homography_from_corners(flow)
     _assert_h_close(H_rec, H, atol=1e-3)
-

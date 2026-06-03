@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from paper_new.geometry import (
     torch_dlt_condition_number,
+    torch_dlt_leverage,
     torch_make_pixel_grid,
     torch_normalize_homography,
     torch_pixel_to_norm,
@@ -96,9 +97,11 @@ class PCGVModule(nn.Module):
     def _identity(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)
 
-    def _finite_or_previous(self, H_new: torch.Tensor, H_prev: torch.Tensor) -> torch.Tensor:
+    def _finite_or_previous(self, H_new: torch.Tensor,
+                            H_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         finite = torch.isfinite(H_new).flatten(1).all(dim=1).view(-1, 1, 1)
-        return torch.where(finite, H_new, H_prev)
+        fallback_count = (~finite.flatten()).sum().to(device=H_prev.device, dtype=H_prev.dtype)
+        return torch.where(finite, H_new, H_prev), fallback_count
 
     def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor,
                 H_init: Optional[torch.Tensor] = None,
@@ -135,6 +138,7 @@ class PCGVModule(nn.Module):
         matches = None
         uncertainty = None
         solver_cond = feat_a.new_ones(batch)
+        dlt_fallbacks = feat_a.new_zeros(())
 
         for _ in range(self.num_iters):
             center = torch_warp_points_h(grid, H_t)
@@ -181,15 +185,22 @@ class PCGVModule(nn.Module):
             votes = self.min_vote + (1.0 - self.min_vote) * torch.sigmoid(vote_logits)
 
             H_new = torch_weighted_dlt(grid, matches, votes)
-            H_new = self._finite_or_previous(H_new, H_t)
+            H_new, fallback_count = self._finite_or_previous(H_new, H_t)
+            dlt_fallbacks = dlt_fallbacks + fallback_count
             if self.damped_update:
                 H_t = torch_normalize_homography(
                     self.update_alpha * H_new + (1.0 - self.update_alpha) * H_t
                 )
             else:
                 H_t = torch_normalize_homography(H_new)
-            H_t = self._finite_or_previous(H_t, H_new)
+            H_t, fallback_count = self._finite_or_previous(H_t, H_new)
+            dlt_fallbacks = dlt_fallbacks + fallback_count
             prev_vote = votes
+
+            if self.use_leverage:
+                leverage = torch_dlt_leverage(grid, matches, votes).to(dtype=feat_a.dtype)
+            else:
+                leverage = feat_a.new_zeros((batch, grid.shape[1], 1))
 
             with torch.no_grad():
                 try:
@@ -229,4 +240,6 @@ class PCGVModule(nn.Module):
             "stats": stats,
             "solver_cond": solver_cond,
             "refine_blend": refine_blend.detach(),
+            "dlt_fallbacks": dlt_fallbacks.detach(),
+            "dlt_attempts": feat_a.new_tensor(float(batch * max(self.num_iters, 1) * 2)),
         }

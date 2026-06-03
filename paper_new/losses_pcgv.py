@@ -38,6 +38,32 @@ def masked_triplet_align(fb: torch.Tensor, fa_warp: torch.Tensor, fa: torch.Tens
     return (loss * mask).sum() / (mask.sum() * loss.shape[1] + eps)
 
 
+def coverage_loss(mask: torch.Tensor, mode: str = "hinge",
+                  floor: float = 0.35, eps: float = 1e-6) -> torch.Tensor:
+    """Prevent mask collapse without pinning the mask to a fixed area."""
+    mean_mask = mask.float().mean().clamp_min(eps)
+    if mode == "hinge":
+        return F.relu(mask.new_tensor(float(floor)) - mean_mask)
+    if mode == "log":
+        return -mean_mask.log()
+    raise ValueError(f"unknown coverage mode: {mode}")
+
+
+def edge_aware_tv(mask: torch.Tensor, guide_img: torch.Tensor | None) -> torch.Tensor:
+    """Total variation weighted down across strong image edges."""
+    if guide_img is None:
+        return mask_tv_loss(mask)
+    if guide_img.shape[-2:] != mask.shape[-2:]:
+        guide_img = F.interpolate(guide_img, size=mask.shape[-2:], mode="bilinear", align_corners=True)
+    guide_img = guide_img.float()
+    mask_f = mask.float()
+    wx = torch.exp(-(guide_img[..., :, 1:] - guide_img[..., :, :-1]).abs().mean(dim=1, keepdim=True))
+    wy = torch.exp(-(guide_img[..., 1:, :] - guide_img[..., :-1, :]).abs().mean(dim=1, keepdim=True))
+    dx = ((mask_f[..., :, 1:] - mask_f[..., :, :-1]).abs() * wx).mean()
+    dy = ((mask_f[..., 1:, :] - mask_f[..., :-1, :]).abs() * wy).mean()
+    return dx + dy
+
+
 def masked_baseline_loss(out: Dict[str, torch.Tensor], lambda_align: float = 1.0,
                          lambda_fil: float = 0.5, margin: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Existing alignment/FIL objective with PCGV masks on the triplet terms."""
@@ -71,6 +97,15 @@ def masked_baseline_loss(out: Dict[str, torch.Tensor], lambda_align: float = 1.0
         "fil_f": _scalar(fil_f),
         "fil_b": _scalar(fil_b),
     }
+
+
+def _mean_terms(terms, zero: torch.Tensor) -> torch.Tensor:
+    if not terms:
+        return zero
+    total = zero
+    for term in terms:
+        total = total + term
+    return total / len(terms)
 
 
 def _last_corr_stat(out: Dict[str, torch.Tensor], suffix: str, key: str):
@@ -314,6 +349,105 @@ def uncertainty_nll_loss(out: Dict[str, torch.Tensor], eps: float = 1e-6) -> tor
     return sum(losses) / len(losses) if losses else _zero_like_loss(out)
 
 
+def dominant_plane_loss(out: Dict[str, torch.Tensor],
+                        lambda_align: float = 1.0,
+                        lambda_cov: float = 0.1,
+                        lambda_fil: float = 0.5,
+                        lambda_tv: float = 0.0,
+                        lambda_cycle: float = 0.05,
+                        lambda_entropy: float = 0.0,
+                        coverage_floor: float = 0.35,
+                        coverage_mode: str = "hinge",
+                        margin: float = 1.0) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Dominant-plane v1 objective using current PCGV patch masks."""
+    zero = _zero_like_loss(out)
+
+    f1 = out["img1_patch_fea"]
+    f2 = out["img2_patch_fea"]
+    f2_warp = out["warp_img2_patch_fea"]
+    f1_warp = out["warp_img1_patch_fea"]
+    f_warp2 = out["img2_patch_warp_fea"]
+    f_warp1 = out["img1_patch_warp_fea"]
+
+    mask_f = out.get("pcgv_mask_f_patch", out.get("img1_patch_mask"))
+    mask_b = out.get("pcgv_mask_b_patch", out.get("img2_patch_mask"))
+    if mask_f is None:
+        mask_f = torch.ones_like(f1[:, :1])
+    if mask_b is None:
+        mask_b = torch.ones_like(f2[:, :1])
+
+    align_f = masked_triplet_align(f1, f2_warp, f2, mask_f, margin)
+    align_b = masked_triplet_align(f2, f1_warp, f1, mask_b, margin)
+    align = align_f + align_b
+
+    fil_f = (f2_warp - f_warp2).abs().mean()
+    fil_b = (f1_warp - f_warp1).abs().mean()
+    fil = fil_f + fil_b
+
+    coverage = _mean_terms(
+        [
+            coverage_loss(mask_f, mode=coverage_mode, floor=coverage_floor),
+            coverage_loss(mask_b, mode=coverage_mode, floor=coverage_floor),
+        ],
+        zero,
+    )
+
+    if lambda_tv:
+        tv = _mean_terms(
+            [
+                edge_aware_tv(mask_f, out.get("img1_patch")),
+                edge_aware_tv(mask_b, out.get("img2_patch")),
+            ],
+            zero,
+        )
+    else:
+        tv = zero
+    cycle = cycle_consistency_loss(out) if lambda_cycle else zero
+    entropy = entropy_regularization(out) if lambda_entropy else zero
+
+    total = (
+        lambda_align * align
+        + lambda_cov * coverage
+        + lambda_fil * fil
+        + lambda_tv * tv
+        + lambda_cycle * cycle
+        + lambda_entropy * entropy
+    )
+
+    logs: Dict[str, float] = {
+        "total": _scalar(total),
+        "align": _scalar(align),
+        "align_f": _scalar(align_f),
+        "align_b": _scalar(align_b),
+        "coverage": _scalar(coverage),
+        "fil": _scalar(fil),
+        "fil_f": _scalar(fil_f),
+        "fil_b": _scalar(fil_b),
+        "tv": _scalar(tv),
+        "cycle": _scalar(cycle),
+        "entropy": _scalar(entropy),
+        "mask_area_f": _scalar(mask_f.float().mean()),
+        "mask_area_b": _scalar(mask_b.float().mean()),
+    }
+    for suffix in ("f", "b"):
+        votes = out.get(f"pcgv_votes_{suffix}")
+        if torch.is_tensor(votes):
+            logs[f"mean_vote_{suffix}"] = _scalar(votes.float().mean())
+            logs[f"vote_std_{suffix}"] = _scalar(votes.detach().float().std(unbiased=False))
+        fallbacks = out.get(f"dlt_fallbacks_{suffix}")
+        attempts = out.get(f"dlt_attempts_{suffix}")
+        if torch.is_tensor(fallbacks):
+            logs[f"dlt_fallbacks_{suffix}"] = _scalar(fallbacks)
+            if torch.is_tensor(attempts):
+                rate = fallbacks.float() / attempts.float().clamp_min(1.0)
+                logs[f"dlt_fallback_rate_{suffix}"] = _scalar(rate)
+    for key in ("pcgv_refine_blend_f", "pcgv_refine_blend_b"):
+        value = out.get(key)
+        if torch.is_tensor(value):
+            logs[key.replace("pcgv_", "")] = _scalar(value)
+    return total, logs
+
+
 def pcgv_loss(out: Dict[str, torch.Tensor],
               lambda_align: float = 1.0,
               lambda_fil: float = 0.5,
@@ -429,6 +563,20 @@ def pcgv_loss(out: Dict[str, torch.Tensor],
         value = out.get(key)
         if torch.is_tensor(value):
             logs[key.replace("pcgv_", "mean_")] = _scalar(value)
+    for suffix in ("f", "b"):
+        mask = out.get(f"pcgv_mask_{suffix}_patch")
+        if torch.is_tensor(mask):
+            logs[f"mask_area_{suffix}"] = _scalar(mask.float().mean())
+        votes = out.get(f"pcgv_votes_{suffix}")
+        if torch.is_tensor(votes):
+            logs[f"mean_vote_{suffix}"] = _scalar(votes.float().mean())
+        fallbacks = out.get(f"dlt_fallbacks_{suffix}")
+        attempts = out.get(f"dlt_attempts_{suffix}")
+        if torch.is_tensor(fallbacks):
+            logs[f"dlt_fallbacks_{suffix}"] = _scalar(fallbacks)
+            if torch.is_tensor(attempts):
+                rate = fallbacks.float() / attempts.float().clamp_min(1.0)
+                logs[f"dlt_fallback_rate_{suffix}"] = _scalar(rate)
     for suffix in ("f", "b"):
         votes = out.get(f"pcgv_votes_{suffix}")
         residuals = out.get(f"pcgv_residuals_{suffix}")

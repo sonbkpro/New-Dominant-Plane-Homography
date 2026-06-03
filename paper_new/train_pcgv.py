@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 from new_approach.dataset_baseline import TrainDataset, move_batch
 
 from paper_new.evaluate_pcgv import evaluate
-from paper_new.losses_pcgv import pcgv_loss
+from paper_new.losses_pcgv import dominant_plane_loss, pcgv_loss
 from paper_new.model_pcgv import build_pcgv, make_pcgv_params
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
@@ -48,8 +48,45 @@ def _str2bool(value):
     raise argparse.ArgumentTypeError("expected boolean")
 
 
+def _add_bool_arg(parser, *names, default=False, **kwargs):
+    parser.add_argument(*names, type=_str2bool, nargs="?", const=True, default=default, **kwargs)
+
+
+def _flatten_config(data: Dict) -> Dict:
+    if not isinstance(data, dict):
+        raise ValueError("--config must contain a JSON object")
+    defaults = {}
+    for key, value in data.items():
+        if key in ("pcgv", "loss", "train", "data", "eval"):
+            if not isinstance(value, dict):
+                raise ValueError(f"config section '{key}' must be a JSON object")
+            defaults.update(value)
+        elif key in ("model", "crop_h", "crop_w"):
+            continue
+        else:
+            defaults[key] = value
+    return defaults
+
+
+def _apply_config_defaults(parser, path: str):
+    with open(path) as f:
+        data = json.load(f)
+    defaults = _flatten_config(data)
+    valid = {action.dest for action in parser._actions}
+    unknown = sorted(key for key in defaults if key not in valid)
+    if unknown:
+        raise ValueError(f"unknown --config keys: {', '.join(unknown)}")
+    parser.set_defaults(**defaults)
+
+
 def parse_args():
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None)
+    config_args, _ = config_parser.parse_known_args()
+
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None,
+                    help="Strict JSON config whose defaults are loaded before explicit CLI overrides.")
     ap.add_argument("--train_list", default=os.path.join(ROOT, "Data/Train_List.txt"))
     ap.add_argument("--train_img_dir", default=os.path.join(ROOT, "Data/Train"))
     ap.add_argument("--test_list", default=os.path.join(ROOT, "Data/Test_List.txt"))
@@ -62,7 +99,7 @@ def parse_args():
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--rho", type=int, default=16)
     ap.add_argument("--seed", type=int, default=230)
-    ap.add_argument("--amp", action="store_true")
+    _add_bool_arg(ap, "--amp", default=False)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--print_freq", type=int, default=20)
     ap.add_argument("--max_train_items", type=int, default=None)
@@ -75,8 +112,8 @@ def parse_args():
                     help="also save pcgv_latest.pth every N optimizer steps; 0 disables mid-epoch saves")
     ap.add_argument("--nonfinite_patience", type=int, default=20,
                     help="abort after this many consecutive non-finite losses")
-    ap.add_argument("--fail_on_nonfinite", action="store_true",
-                    help="abort immediately on NaN/Inf loss instead of skipping that batch")
+    _add_bool_arg(ap, "--fail_on_nonfinite", default=False,
+                  help="abort immediately on NaN/Inf loss instead of skipping that batch")
 
     ap.add_argument("--coarse_ckpt", default=None,
                     help="Optional baseline checkpoint to load into the coarse HomoGAN initializer.")
@@ -86,14 +123,14 @@ def parse_args():
                     help="Restore optimizer state from --resume checkpoints when present.")
     ap.add_argument("--override_resume_lrs", type=_str2bool, default=True,
                     help="After restoring optimizer state, apply the LR values from this command line.")
-    ap.add_argument("--freeze_coarse", action="store_true",
-                    help="Freeze the coarse baseline while training PCGV.")
+    _add_bool_arg(ap, "--freeze_coarse", default=False,
+                  help="Freeze the coarse baseline while training PCGV.")
     ap.add_argument("--init_pcgv_features_from_coarse", type=_str2bool, default=True,
                     help="Initialize PCGV shallow/pyramid features from the loaded coarse baseline.")
-    ap.add_argument("--freeze_pcgv_shallow", action="store_true",
-                    help="Freeze the copied shallow feature extractor during PCGV training.")
-    ap.add_argument("--freeze_pcgv_pyramid", action="store_true",
-                    help="Freeze the copied PCGV feature pyramid while leaving projection/voting layers trainable.")
+    _add_bool_arg(ap, "--freeze_pcgv_shallow", default=False,
+                  help="Freeze the copied shallow feature extractor during PCGV training.")
+    _add_bool_arg(ap, "--freeze_pcgv_pyramid", default=False,
+                  help="Freeze the copied PCGV feature pyramid while leaving projection/voting layers trainable.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
     ap.add_argument("--override_baseline_keys", type=_str2bool, default=True,
@@ -125,9 +162,16 @@ def parse_args():
                     help="Learn the final PCGV refinement blend during training.")
     ap.add_argument("--set_refine_blend", type=float, default=None,
                     help="Overwrite the loaded PCGV final blend, useful for staged refinement after --resume.")
+    _add_bool_arg(ap, "--mask_refine", default=False,
+                  help="Use the learned mask upsampler instead of pure bilinear vote upsampling.")
+    ap.add_argument("--blend_start", type=float, default=0.05)
+    ap.add_argument("--blend_final", type=float, default=0.05)
+    ap.add_argument("--blend_warmup_steps", type=int, default=0)
 
+    ap.add_argument("--objective", choices=("legacy", "dominant_plane"), default="legacy")
     ap.add_argument("--lambda_align", type=float, default=1.0)
     ap.add_argument("--lambda_fil", type=float, default=0.5)
+    ap.add_argument("--lambda_cov", type=float, default=0.1)
     ap.add_argument("--lambda_coarse_flow", type=float, default=0.0,
                     help="Anchor PCGV final patch flow to the coarse baseline patch flow.")
     ap.add_argument("--lambda_reproj", type=float, default=0.0)
@@ -139,6 +183,8 @@ def parse_args():
     ap.add_argument("--lambda_cond", type=float, default=0.0)
     ap.add_argument("--lambda_uncertainty", type=float, default=0.0)
     ap.add_argument("--target_area", type=float, default=0.35)
+    ap.add_argument("--coverage_floor", type=float, default=0.35)
+    ap.add_argument("--coverage_mode", choices=("hinge", "log"), default="hinge")
     ap.add_argument("--vote_tau", type=float, default=2.0)
     ap.add_argument("--vote_target_mode", choices=("robust", "exp"), default="robust")
     ap.add_argument("--vote_residual_low_q", type=float, default=0.25)
@@ -148,7 +194,9 @@ def parse_args():
     ap.add_argument("--vote_min_confidence_weight", type=float, default=0.25)
     ap.add_argument("--vote_low_thresh", type=float, default=0.30)
     ap.add_argument("--vote_high_thresh", type=float, default=0.70)
-    ap.add_argument("--use_masked_align", action="store_true")
+    _add_bool_arg(ap, "--use_masked_align", default=False)
+    if config_args.config:
+        _apply_config_defaults(ap, config_args.config)
     return ap.parse_args()
 
 
@@ -265,13 +313,16 @@ def _load_resume_model(model, path: str, device):
 
     start_epoch = _infer_epoch_from_path(path) + 1
     start_step = 0
+    start_global_step = None
     if isinstance(checkpoint, dict) and "model" in checkpoint:
         if checkpoint.get("step") is None:
             start_epoch = int(checkpoint.get("epoch", start_epoch - 1)) + 1
         else:
             start_epoch = int(checkpoint["epoch"])
             start_step = int(checkpoint["step"]) + 1
-    return checkpoint, start_epoch, start_step
+        if checkpoint.get("global_step") is not None:
+            start_global_step = int(checkpoint["global_step"])
+    return checkpoint, start_epoch, start_step, start_global_step
 
 
 def _optimizer_lr_map(args):
@@ -316,13 +367,14 @@ def _restore_training_state(checkpoint, opt, scaler, args, group_names):
     return restored
 
 
-def save_checkpoint(path, model, opt, scaler, epoch, args, step=None):
+def save_checkpoint(path, model, opt, scaler, epoch, args, step=None, global_step=None):
     torch.save({
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
         "step": step,
+        "global_step": global_step,
         "args": vars(args),
     }, path)
 
@@ -342,9 +394,18 @@ def _build_optimizer(model, args):
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
 
+def _scheduled_blend(args, global_step: int) -> float:
+    g = min(1.0, float(global_step) / float(max(args.blend_warmup_steps, 1)))
+    return float(args.blend_start + (args.blend_final - args.blend_start) * g)
+
+
 def main():
     args = parse_args()
     _apply_stage_defaults(args)
+    use_blend_schedule = args.blend_warmup_steps > 0
+    if use_blend_schedule and args.learn_refine_blend:
+        args.learn_refine_blend = False
+        print("Disabled learn_refine_blend because a deterministic blend schedule is active.")
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "args.json"), "w") as f:
@@ -365,6 +426,7 @@ def main():
         pcgv_update_alpha=args.update_alpha,
         pcgv_refine_blend_init=args.refine_blend_init,
         pcgv_learn_refine_blend=args.learn_refine_blend,
+        pcgv_mask_refine=args.mask_refine,
         pcgv_freeze_coarse=args.freeze_coarse,
         pcgv_init_mode=args.init_mode,
         pcgv_override_baseline_keys=args.override_baseline_keys,
@@ -376,8 +438,9 @@ def main():
     resume_checkpoint = None
     start_epoch = 1
     start_step = 0
+    resume_global_step = None
     if args.resume:
-        resume_checkpoint, start_epoch, start_step = _load_resume_model(net, args.resume, device)
+        resume_checkpoint, start_epoch, start_step, resume_global_step = _load_resume_model(net, args.resume, device)
         print(f"Resumed PCGV weights from {args.resume} at epoch {start_epoch}, step {start_step}")
     elif args.coarse_ckpt:
         _load_coarse(net, args.coarse_ckpt, device)
@@ -412,6 +475,10 @@ def main():
                         num_workers=args.num_workers, drop_last=True,
                         pin_memory=(device.type == "cuda"))
     print(f"Train pairs: {len(ds)}  steps/epoch: {len(loader)}")
+    if resume_global_step is None:
+        global_step = max(0, (start_epoch - 1) * len(loader) + start_step)
+    else:
+        global_step = resume_global_step
 
     opt = _build_optimizer(net, args)
     optimizer_group_names = [group.get("name", str(i)) for i, group in enumerate(opt.param_groups)]
@@ -446,34 +513,51 @@ def main():
                 continue
             batch = move_batch(batch, device)
             opt.zero_grad(set_to_none=True)
+            active_blend = net.get_refine_blend()
+            if use_blend_schedule:
+                active_blend = net.set_refine_blend(_scheduled_blend(args, global_step))
             amp_device = "cuda" if device.type == "cuda" else "cpu"
             with torch.amp.autocast(amp_device, enabled=use_amp):
                 out = net(batch)
-                loss, logs = pcgv_loss(
-                    out,
-                    lambda_align=args.lambda_align,
-                    lambda_fil=args.lambda_fil,
-                    lambda_coarse_flow=args.lambda_coarse_flow,
-                    lambda_reproj=args.lambda_reproj,
-                    lambda_cycle=args.lambda_cycle,
-                    lambda_vote=args.lambda_vote,
-                    lambda_tv=args.lambda_tv,
-                    lambda_area=args.lambda_area,
-                    lambda_entropy=args.lambda_entropy,
-                    lambda_cond=args.lambda_cond,
-                    lambda_uncertainty=args.lambda_uncertainty,
-                    target_area=args.target_area,
-                    vote_tau=args.vote_tau,
-                    vote_target_mode=args.vote_target_mode,
-                    vote_residual_low_q=args.vote_residual_low_q,
-                    vote_residual_high_q=args.vote_residual_high_q,
-                    vote_corr_weight=args.vote_corr_weight,
-                    vote_gamma=args.vote_gamma,
-                    vote_min_confidence_weight=args.vote_min_confidence_weight,
-                    vote_low_thresh=args.vote_low_thresh,
-                    vote_high_thresh=args.vote_high_thresh,
-                    use_masked_align=args.use_masked_align,
-                )
+                if args.objective == "dominant_plane":
+                    loss, logs = dominant_plane_loss(
+                        out,
+                        lambda_align=args.lambda_align,
+                        lambda_cov=args.lambda_cov,
+                        lambda_fil=args.lambda_fil,
+                        lambda_tv=args.lambda_tv,
+                        lambda_cycle=args.lambda_cycle,
+                        lambda_entropy=args.lambda_entropy,
+                        coverage_floor=args.coverage_floor,
+                        coverage_mode=args.coverage_mode,
+                    )
+                else:
+                    loss, logs = pcgv_loss(
+                        out,
+                        lambda_align=args.lambda_align,
+                        lambda_fil=args.lambda_fil,
+                        lambda_coarse_flow=args.lambda_coarse_flow,
+                        lambda_reproj=args.lambda_reproj,
+                        lambda_cycle=args.lambda_cycle,
+                        lambda_vote=args.lambda_vote,
+                        lambda_tv=args.lambda_tv,
+                        lambda_area=args.lambda_area,
+                        lambda_entropy=args.lambda_entropy,
+                        lambda_cond=args.lambda_cond,
+                        lambda_uncertainty=args.lambda_uncertainty,
+                        target_area=args.target_area,
+                        vote_tau=args.vote_tau,
+                        vote_target_mode=args.vote_target_mode,
+                        vote_residual_low_q=args.vote_residual_low_q,
+                        vote_residual_high_q=args.vote_residual_high_q,
+                        vote_corr_weight=args.vote_corr_weight,
+                        vote_gamma=args.vote_gamma,
+                        vote_min_confidence_weight=args.vote_min_confidence_weight,
+                        vote_low_thresh=args.vote_low_thresh,
+                        vote_high_thresh=args.vote_high_thresh,
+                        use_masked_align=args.use_masked_align,
+                    )
+            logs["blend"] = active_blend
             if not torch.isfinite(loss):
                 consecutive_nonfinite += 1
                 skipped_nonfinite += 1
@@ -491,29 +575,44 @@ def main():
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
+            global_step += 1
 
             if args.save_step_every and (step + 1) % args.save_step_every == 0:
                 save_checkpoint(
                     os.path.join(args.out_dir, "pcgv_latest.pth"),
-                    net, opt, scaler, epoch, args, step=step,
+                    net, opt, scaler, epoch, args, step=step, global_step=global_step,
                 )
 
             if step % args.print_freq == 0:
                 msg = (
                     f"ep{epoch} [{step}/{len(loader)}] "
                     f"total={logs['total']:.4f} align={logs['align']:.4f} "
-                    f"fil={logs['fil']:.4f} coarse={logs['coarse_flow']:.4f} "
-                    f"reproj={logs['reproj']:.4f} "
-                    f"vote={logs['vote']:.4f}"
+                    f"fil={logs['fil']:.4f}"
                 )
-                if "mean_votes_f" in logs:
+                if "coverage" in logs:
+                    msg += f" cov={logs['coverage']:.4f}"
+                if "coarse_flow" in logs:
+                    msg += f" coarse={logs['coarse_flow']:.4f}"
+                if "reproj" in logs:
+                    msg += f" reproj={logs['reproj']:.4f}"
+                if "vote" in logs:
+                    msg += f" vote={logs['vote']:.4f}"
+                if "mean_vote_f" in logs:
+                    msg += f" mean_vote_f={logs['mean_vote_f']:.3f}"
+                elif "mean_votes_f" in logs:
                     msg += f" mean_vote_f={logs['mean_votes_f']:.3f}"
                 if "mean_residuals_f" in logs:
                     msg += f" residual_f={logs['mean_residuals_f']:.3f}"
-                if "refine_blend_f" in logs:
+                if "blend" in logs:
+                    msg += f" blend={logs['blend']:.3f}"
+                elif "refine_blend_f" in logs:
                     msg += f" blend_f={logs['refine_blend_f']:.3f}"
+                if "mask_area_f" in logs:
+                    msg += f" area_f={logs['mask_area_f']:.3f}"
                 if "vote_std_f" in logs:
                     msg += f" vstd_f={logs['vote_std_f']:.3f}"
+                if "dlt_fallback_rate_f" in logs:
+                    msg += f" dltfb_f={logs['dlt_fallback_rate_f']:.4f}"
                 if "pseudo_hi_f" in logs and "pseudo_lo_f" in logs:
                     msg += f" phi_f={logs['pseudo_hi_f']:.3f} plo_f={logs['pseudo_lo_f']:.3f}"
                 if "pseudo_inlier_residual_f" in logs and "pseudo_outlier_residual_f" in logs:
@@ -527,8 +626,9 @@ def main():
         print(f"epoch {epoch} done in {time.time() - t0:.1f}s")
 
         ckpt = os.path.join(args.out_dir, f"pcgv_epoch_{epoch:03d}.pth")
-        save_checkpoint(ckpt, net, opt, scaler, epoch, args)
-        save_checkpoint(os.path.join(args.out_dir, "pcgv_latest.pth"), net, opt, scaler, epoch, args)
+        save_checkpoint(ckpt, net, opt, scaler, epoch, args, global_step=global_step)
+        save_checkpoint(os.path.join(args.out_dir, "pcgv_latest.pth"), net, opt, scaler, epoch, args,
+                        global_step=global_step)
 
         if args.eval_every and epoch % args.eval_every == 0:
             report = evaluate(net, device, args.test_list, args.test_img_dir,
@@ -543,7 +643,8 @@ def main():
             print("  PME " + "  ".join(
                 f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
 
-    save_checkpoint(os.path.join(args.out_dir, "pcgv_final.pth"), net, opt, scaler, args.epochs, args)
+    save_checkpoint(os.path.join(args.out_dir, "pcgv_final.pth"), net, opt, scaler, args.epochs, args,
+                    global_step=global_step)
     print("saved final checkpoint")
 
 

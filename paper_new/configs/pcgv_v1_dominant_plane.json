@@ -1,0 +1,17 @@
+{
+  "objective": "dominant_plane",
+  "freeze_coarse": true,
+  "lambda_align": 1.0,
+  "lambda_fil": 0.5,
+  "lambda_cov": 0.1,
+  "coverage_floor": 0.35,
+  "coverage_mode": "hinge",
+  "lambda_tv": 0.0,
+  "lambda_cycle": 0.05,
+  "lambda_entropy": 0.0,
+  "mask_refine": false,
+  "blend_start": 0.1,
+  "blend_final": 1.0,
+  "blend_warmup_steps": 1500,
+  "learn_refine_blend": false
+}

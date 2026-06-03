@@ -7,6 +7,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from new_approach.model_baseline import CROP_H, CROP_W, FULL_H, FULL_W, build_baseline, make_params
 from new_approach.modules.featureHomo import FeatureExtractor, feature_extractor
@@ -131,6 +132,7 @@ def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
         pcgv_update_alpha=0.7,
         pcgv_refine_blend_init=0.05,
         pcgv_learn_refine_blend=True,
+        pcgv_mask_refine=False,
         pcgv_freeze_coarse=False,
         pcgv_init_mode="coarse_flow_corners",
         pcgv_override_baseline_keys=True,
@@ -180,6 +182,10 @@ class PCGVHomoNet(nn.Module):
             learn_refine_blend=_getattr(params, "pcgv_learn_refine_blend", True),
         )
         self.mask_upsampler = MaskUpsampler()
+        self.pcgv_mask_refine = bool(_getattr(params, "pcgv_mask_refine", _getattr(params, "mask_refine", False)))
+        if not self.pcgv_mask_refine:
+            for param in self.mask_upsampler.parameters():
+                param.requires_grad = False
         if _getattr(params, "pcgv_freeze_coarse", False):
             self.freeze_coarse()
 
@@ -222,6 +228,11 @@ class PCGVHomoNet(nn.Module):
 
     def _identity_h(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)
+
+    def _upsample_pcgv_mask(self, mask: torch.Tensor, size) -> torch.Tensor:
+        if self.pcgv_mask_refine:
+            return self.mask_upsampler(mask, size=size)
+        return F.interpolate(mask, size=size, mode="bilinear", align_corners=True)
 
     def _initial_h(self, coarse_out: Dict[str, torch.Tensor], key: str,
                    batch: int, device, dtype) -> torch.Tensor:
@@ -275,8 +286,8 @@ class PCGVHomoNet(nn.Module):
         img2_patch_warp_fea = self.features.forward_shallow(warp_img2_patch)
         img1_patch_warp_fea = self.features.forward_shallow(warp_img1_patch)
 
-        mask_f_patch = self.mask_upsampler(pcgv_f["mask"], size=(h_patch, w_patch))
-        mask_b_patch = self.mask_upsampler(pcgv_b["mask"], size=(h_patch, w_patch))
+        mask_f_patch = self._upsample_pcgv_mask(pcgv_f["mask"], size=(h_patch, w_patch))
+        mask_b_patch = self._upsample_pcgv_mask(pcgv_b["mask"], size=(h_patch, w_patch))
         warp_img2_patch_mask = torch_warp_tensor_with_flow(mask_b_patch, flow_f_patch)
         warp_img1_patch_mask = torch_warp_tensor_with_flow(mask_f_patch, flow_b_patch)
 
@@ -295,6 +306,8 @@ class PCGVHomoNet(nn.Module):
             "flow_b": flow_b_patch,
             "flow_f_patch": flow_f_patch,
             "flow_b_patch": flow_b_patch,
+            "img1_patch": img1_patch,
+            "img2_patch": img2_patch,
             "img1_patch_fea": img1_fea,
             "img2_patch_fea": img2_fea,
             "warp_img1_patch_fea": warp_img1_patch_fea,
@@ -319,6 +332,10 @@ class PCGVHomoNet(nn.Module):
             "pcgv_corr_stats_b": pcgv_b["stats"],
             "pcgv_refine_blend_f": pcgv_f["refine_blend"],
             "pcgv_refine_blend_b": pcgv_b["refine_blend"],
+            "dlt_fallbacks_f": pcgv_f["dlt_fallbacks"],
+            "dlt_fallbacks_b": pcgv_b["dlt_fallbacks"],
+            "dlt_attempts_f": pcgv_f["dlt_attempts"],
+            "dlt_attempts_b": pcgv_b["dlt_attempts"],
             "pcgv_residuals_f": pcgv_f["residuals"],
             "pcgv_residuals_b": pcgv_b["residuals"],
             "pcgv_votes_f": pcgv_f["votes"],

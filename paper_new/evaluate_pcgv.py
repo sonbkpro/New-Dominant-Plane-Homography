@@ -80,10 +80,15 @@ def _write_report(report, output_dir):
     if output_dir is None:
         return
     os.makedirs(output_dir, exist_ok=True)
-    json_report = {
-        key: (None if isinstance(value, float) and np.isnan(value) else value)
-        for key, value in report.items()
-    }
+
+    def _json_safe(value):
+        if isinstance(value, dict):
+            return {k: _json_safe(v) for k, v in value.items()}
+        if isinstance(value, float) and np.isnan(value):
+            return None
+        return value
+
+    json_report = {key: _json_safe(value) for key, value in report.items()}
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(json_report, f, indent=2)
 
@@ -113,6 +118,7 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
     buckets = {k: [] for k in CATEGORIES}
     all_errs = []
     mask_areas = []
+    mask_area_buckets = {k: [] for k in CATEGORIES}
     mask_entropies = []
     residuals = []
     cycle_errors = []
@@ -159,7 +165,10 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
         mask = out.get("pcgv_mask_f_patch")
         if torch.is_tensor(mask):
             m = mask.detach().float().clamp(1e-6, 1.0 - 1e-6)
-            mask_areas.append(float(m.mean().cpu()))
+            area = float(m.mean().cpu())
+            mask_areas.append(area)
+            if cat is not None:
+                mask_area_buckets[cat].append(area)
             ent = -(m * m.log() + (1.0 - m) * (1.0 - m).log()).mean()
             mask_entropies.append(float(ent.cpu()))
         res = out.get("pcgv_residuals_f")
@@ -179,10 +188,25 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
     report["_n"] = len(all_errs)
     report["_skipped"] = skipped
     report["mask_area"] = float(np.mean(mask_areas)) if mask_areas else float("nan")
+    report["mask_area_by_cat"] = {
+        k: (float(np.mean(v)) if v else float("nan"))
+        for k, v in mask_area_buckets.items()
+    }
     report["mask_entropy"] = float(np.mean(mask_entropies)) if mask_entropies else float("nan")
     report["weighted_residual"] = float(np.mean(residuals)) if residuals else float("nan")
     report["cycle_error"] = float(np.mean(cycle_errors)) if cycle_errors else float("nan")
     return report
+
+
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ("1", "true", "yes", "y"):
+        return True
+    if value in ("0", "false", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError("expected boolean")
 
 
 def main():
@@ -207,8 +231,10 @@ def main():
                     help="PCGV pyramid layers. Defaults to checkpoint args, else 3.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
-    ap.add_argument("--h_source", choices=("final", "start", "raw"), default="final",
+    ap.add_argument("--h_source", choices=("final", "start", "raw"), default="raw",
                     help="Which PCGV homography to evaluate: final blended H, start/coarse H, or raw refined H.")
+    ap.add_argument("--mask_refine", type=_str2bool, default=None,
+                    help="Override checkpoint mask refinement mode for mask statistics.")
     ap.add_argument("--set_refine_blend", type=float, default=None,
                     help="Override the checkpoint's final coarse-to-refined blend before evaluation.")
     args = ap.parse_args()
@@ -241,6 +267,11 @@ def main():
         pcgv_hidden_dim=hidden_dim,
         pcgv_pyramid_embed_dim=pyramid_embed_dim,
         pcgv_pyramid_layers=pyramid_layers,
+        pcgv_mask_refine=(
+            args.mask_refine
+            if args.mask_refine is not None
+            else ckpt_args.get("mask_refine", ckpt_args.get("pcgv_mask_refine", False))
+        ),
         pcgv_init_mode=args.init_mode,
     )
     net = build_pcgv(params).to(device)
@@ -265,6 +296,8 @@ def main():
     for k in ("RE", "LT", "LL", "SF", "LF", "AVG"):
         print(f"  {k}: {report[k]:.4f}")
     print(f"  mask_area: {report['mask_area']:.4f}")
+    print("  mask_area_by_cat: " + "  ".join(
+        f"{k}={report['mask_area_by_cat'][k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF")))
     print(f"  mask_entropy: {report['mask_entropy']:.4f}")
     print(f"  weighted_residual: {report['weighted_residual']:.4f}")
     print(f"  cycle_error: {report['cycle_error']:.4f}")

@@ -21,7 +21,8 @@
     "override_baseline_keys": true,
     "update_alpha": 0.7,
     "refine_blend_init": 0.05,
-    "learn_refine_blend": true
+    "learn_refine_blend": true,
+    "mask_refine": false
   },
   "loss": {
     "lambda_align": 1.0,
