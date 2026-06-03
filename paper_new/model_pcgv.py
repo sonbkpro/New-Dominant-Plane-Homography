@@ -130,6 +130,7 @@ def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
         pcgv_use_leverage=True,
         pcgv_damped_update=True,
         pcgv_update_alpha=0.7,
+        pcgv_detach_dlt=True,
         pcgv_refine_blend_init=0.05,
         pcgv_learn_refine_blend=True,
         pcgv_mask_refine=False,
@@ -180,6 +181,7 @@ class PCGVHomoNet(nn.Module):
             update_alpha=_getattr(params, "pcgv_update_alpha", 0.7),
             refine_blend_init=_getattr(params, "pcgv_refine_blend_init", 0.05),
             learn_refine_blend=_getattr(params, "pcgv_learn_refine_blend", True),
+            detach_dlt=_getattr(params, "pcgv_detach_dlt", True),
         )
         self.mask_upsampler = MaskUpsampler()
         self.pcgv_mask_refine = bool(_getattr(params, "pcgv_mask_refine", _getattr(params, "mask_refine", False)))

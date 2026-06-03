@@ -46,7 +46,8 @@ class PCGVModule(nn.Module):
                  damped_update: bool = True,
                  update_alpha: float = 0.7,
                  refine_blend_init: float = 0.05,
-                 learn_refine_blend: bool = True):
+                 learn_refine_blend: bool = True,
+                 detach_dlt: bool = True):
         super().__init__()
         self.feat_dim = feat_dim
         self.hidden_dim = hidden_dim
@@ -60,6 +61,7 @@ class PCGVModule(nn.Module):
         self.use_leverage = use_leverage
         self.damped_update = damped_update
         self.update_alpha = update_alpha
+        self.detach_dlt = detach_dlt
         blend = min(max(float(refine_blend_init), 1e-4), 1.0 - 1e-4)
         blend_logit = math.log(blend / (1.0 - blend))
         self.refine_blend_logit = nn.Parameter(
@@ -184,7 +186,12 @@ class PCGVModule(nn.Module):
             vote_logits = self.vote_head(vote_input)
             votes = self.min_vote + (1.0 - self.min_vote) * torch.sigmoid(vote_logits)
 
-            H_new = torch_weighted_dlt(grid, matches, votes)
+            if self.detach_dlt:
+                with torch.no_grad():
+                    H_new = torch_weighted_dlt(grid.detach(), matches.detach(), votes.detach())
+                H_new = H_new.to(dtype=feat_a.dtype)
+            else:
+                H_new = torch_weighted_dlt(grid, matches, votes)
             H_new, fallback_count = self._finite_or_previous(H_new, H_t)
             dlt_fallbacks = dlt_fallbacks + fallback_count
             if self.damped_update:

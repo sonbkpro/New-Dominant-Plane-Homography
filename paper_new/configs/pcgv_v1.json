@@ -20,6 +20,7 @@
     "freeze_pcgv_shallow": false,
     "override_baseline_keys": true,
     "update_alpha": 0.7,
+    "detach_dlt": true,
     "refine_blend_init": 0.05,
     "learn_refine_blend": true,
     "mask_refine": false

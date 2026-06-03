@@ -156,6 +156,8 @@ def parse_args():
     ap.add_argument("--use_leverage", type=_str2bool, default=True)
     ap.add_argument("--use_uncertainty", type=_str2bool, default=True)
     ap.add_argument("--update_alpha", type=float, default=0.7)
+    ap.add_argument("--detach_dlt", type=_str2bool, default=True,
+                    help="Stop gradients through the weighted DLT/SVD solve; keeps training numerically stable.")
     ap.add_argument("--refine_blend_init", type=float, default=0.05,
                     help="Initial final blend from coarse H to PCGV-refined H; small values preserve the baseline early.")
     ap.add_argument("--learn_refine_blend", type=_str2bool, default=True,
@@ -399,6 +401,13 @@ def _scheduled_blend(args, global_step: int) -> float:
     return float(args.blend_start + (args.blend_final - args.blend_start) * g)
 
 
+def _gradients_are_finite(model):
+    for name, param in model.named_parameters():
+        if param.grad is not None and not torch.isfinite(param.grad).all():
+            return False, name
+    return True, None
+
+
 def main():
     args = parse_args()
     _apply_stage_defaults(args)
@@ -424,6 +433,7 @@ def main():
         pcgv_use_uncertainty=args.use_uncertainty,
         pcgv_use_leverage=args.use_leverage,
         pcgv_update_alpha=args.update_alpha,
+        pcgv_detach_dlt=args.detach_dlt,
         pcgv_refine_blend_init=args.refine_blend_init,
         pcgv_learn_refine_blend=args.learn_refine_blend,
         pcgv_mask_refine=args.mask_refine,
@@ -570,8 +580,21 @@ def main():
             consecutive_nonfinite = 0
 
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            grads_finite, bad_grad_name = _gradients_are_finite(net)
+            if not grads_finite:
+                consecutive_nonfinite += 1
+                skipped_nonfinite += 1
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite gradient"
+                       f" in {bad_grad_name}; skipping optimizer step "
+                       f"(consecutive={consecutive_nonfinite}, total_skipped={skipped_nonfinite})")
+                print(msg, flush=True)
+                if args.fail_on_nonfinite or consecutive_nonfinite >= args.nonfinite_patience:
+                    raise FloatingPointError(msg)
+                continue
             if args.grad_clip > 0:
-                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()

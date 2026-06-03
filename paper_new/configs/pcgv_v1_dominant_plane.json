@@ -10,6 +10,7 @@
   "lambda_cycle": 0.05,
   "lambda_entropy": 0.0,
   "mask_refine": false,
+  "detach_dlt": true,
   "blend_start": 0.1,
   "blend_final": 1.0,
   "blend_warmup_steps": 1500,
