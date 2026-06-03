@@ -63,6 +63,16 @@ def test_weight_zero_outliers():
     assert (pred - dst[:, 20:]).norm(dim=-1).mean() < 1e-2
 
 
+def test_weighted_dlt_bad_input_returns_nonfinite_h():
+    grid = torch_make_pixel_grid(1, 8, 8, dtype=torch.float32)
+    dst = grid.clone()
+    dst[:, 0, 0] = float("nan")
+    weights = torch.ones(1, grid.shape[1], 1)
+    H = torch_weighted_dlt(grid, dst, weights)
+    assert H.shape == (1, 3, 3)
+    assert not torch.isfinite(H).all()
+
+
 def test_dlt_leverage_shape_finite_nonnegative():
     grid = torch_make_pixel_grid(2, 8, 9, dtype=torch.float32)
     dst = grid + torch.tensor([1.0, -0.5])

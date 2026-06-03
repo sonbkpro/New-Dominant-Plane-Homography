@@ -131,6 +131,46 @@ def _build_dlt_matrix(src_pts: torch.Tensor, dst_pts: torch.Tensor) -> torch.Ten
     return torch.stack((row1, row2), dim=2).reshape(src_pts.shape[0], -1, 9)
 
 
+def _svd_right_null_vector(A: torch.Tensor, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Smallest right singular vector, with per-sample failure masking."""
+
+    def _svd_one(matrix: torch.Tensor) -> torch.Tensor:
+        if matrix.is_cuda:
+            _, _, Vh = torch.linalg.svd(matrix, full_matrices=True, driver="gesvd")
+        else:
+            _, _, Vh = torch.linalg.svd(matrix, full_matrices=True)
+        return Vh[:, -1]
+
+    failed = torch.zeros(A.shape[0], device=A.device, dtype=torch.bool)
+    try:
+        return _svd_one(A), failed
+    except RuntimeError:
+        vectors = []
+        for idx in range(A.shape[0]):
+            matrix = A[idx:idx + 1]
+            sample_failed = False
+            try:
+                h = _svd_one(matrix)
+            except RuntimeError:
+                try:
+                    normal = matrix.transpose(1, 2) @ matrix
+                    eye = torch.eye(9, device=A.device, dtype=A.dtype).unsqueeze(0)
+                    diag_mean = normal.diagonal(dim1=-2, dim2=-1).mean(dim=1).clamp_min(1.0)
+                    normal = normal + (eps * diag_mean).view(-1, 1, 1) * eye
+                    with torch.no_grad():
+                        _, evecs = torch.linalg.eigh(normal)
+                        h = evecs[:, :, 0].detach()
+                except RuntimeError:
+                    h = matrix.new_full((1, 9), float("nan"))
+                    sample_failed = True
+            if not torch.isfinite(h).all():
+                h = matrix.new_full((1, 9), float("nan"))
+                sample_failed = True
+            failed[idx] = sample_failed
+            vectors.append(h)
+        return torch.cat(vectors, dim=0), failed
+
+
 def torch_weighted_dlt(src_pts: torch.Tensor, dst_pts: torch.Tensor,
                        weights: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Solve a weighted homography with differentiable DLT.
@@ -162,10 +202,16 @@ def torch_weighted_dlt(src_pts: torch.Tensor, dst_pts: torch.Tensor,
         row_weights = w.sqrt().repeat_interleave(2, dim=1).unsqueeze(-1)
         A = A * row_weights
 
-        _, _, Vh = torch.linalg.svd(A, full_matrices=True)
-        Hn = Vh[:, -1].reshape(-1, 3, 3)
+        h_vec, svd_failed = _svd_right_null_vector(A, eps)
+        Hn = h_vec.reshape(-1, 3, 3)
         H = torch.linalg.inv(T_dst) @ Hn @ T_src
         H = torch_normalize_homography(H, eps=eps)
+        if svd_failed.any():
+            H = torch.where(
+                svd_failed.view(-1, 1, 1),
+                H.new_full(H.shape, float("nan")),
+                H,
+            )
     return H.to(dtype=orig_dtype)
 
 

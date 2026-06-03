@@ -198,7 +198,10 @@ class PCGVModule(nn.Module):
             prev_vote = votes
 
             if self.use_leverage:
-                leverage = torch_dlt_leverage(grid, matches, votes).to(dtype=feat_a.dtype)
+                try:
+                    leverage = torch_dlt_leverage(grid, matches, votes).to(dtype=feat_a.dtype)
+                except RuntimeError:
+                    leverage = feat_a.new_zeros((batch, grid.shape[1], 1))
             else:
                 leverage = feat_a.new_zeros((batch, grid.shape[1], 1))
 
