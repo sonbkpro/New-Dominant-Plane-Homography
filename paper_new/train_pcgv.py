@@ -26,7 +26,10 @@ import time
 from typing import Dict
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from new_approach.dataset_baseline import TrainDataset, move_batch
 
@@ -415,19 +418,56 @@ def _gradients_are_finite(model):
     return True, None
 
 
+def _init_distributed():
+    """Initialize torch.distributed when launched via torchrun (WORLD_SIZE > 1)."""
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if world <= 1:
+        return False, 0, 0, 1
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return True, rank, local_rank, world
+
+
+def _all_finite_across_ranks(flag, ddp, device):
+    """True only if `flag` holds on ALL ranks (keeps DDP backward in lockstep so a
+    non-finite batch on one rank skips on every rank instead of deadlocking)."""
+    if not ddp:
+        return bool(flag)
+    t = torch.tensor([1.0 if flag else 0.0], device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    return t.item() >= 1.0
+
+
 def main():
     args = parse_args()
     _apply_stage_defaults(args)
+    ddp, rank, local_rank, world_size = _init_distributed()
+    is_main = (rank == 0)
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k)
+
     use_blend_schedule = args.blend_warmup_steps > 0
     if use_blend_schedule and args.learn_refine_blend:
         args.learn_refine_blend = False
-        print("Disabled learn_refine_blend because a deterministic blend schedule is active.")
+        log("Disabled learn_refine_blend because a deterministic blend schedule is active.")
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
-    with open(os.path.join(args.out_dir, "args.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
+    if is_main:
+        with open(os.path.join(args.out_dir, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
 
-    device = torch.device(args.device)
+    if ddp and torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
+    if ddp:
+        log(f"DDP enabled: world_size={world_size} (one process per GPU)")
     params = make_pcgv_params(
         pcgv_enabled=args.pcgv_enabled,
         pcgv_feat_dim=args.feat_dim,
@@ -459,21 +499,21 @@ def main():
     resume_global_step = None
     if args.resume:
         resume_checkpoint, start_epoch, start_step, resume_global_step = _load_resume_model(net, args.resume, device)
-        print(f"Resumed PCGV weights from {args.resume} at epoch {start_epoch}, step {start_step}")
+        log(f"Resumed PCGV weights from {args.resume} at epoch {start_epoch}, step {start_step}")
     elif args.coarse_ckpt:
         _load_coarse(net, args.coarse_ckpt, device)
         if args.init_pcgv_features_from_coarse:
             report = net.init_pcgv_features_from_coarse()
-            print(
+            log(
                 "Initialized PCGV features from coarse: "
                 f"shallow copied={report['shallow_copied']} skipped={report['shallow_skipped']}, "
                 f"pyramid copied={report['pyramid_copied']} skipped={report['pyramid_skipped']}"
             )
     if args.set_refine_blend is not None:
         applied_blend = net.set_refine_blend(args.set_refine_blend)
-        print(f"Set PCGV refine blend to {applied_blend:.4f}")
+        log(f"Set PCGV refine blend to {applied_blend:.4f}")
     else:
-        print(f"PCGV refine blend: {net.get_refine_blend():.4f}")
+        log(f"PCGV refine blend: {net.get_refine_blend():.4f}")
     if args.freeze_coarse:
         net.freeze_coarse()
         net.coarse.eval()
@@ -485,16 +525,19 @@ def main():
         net.freeze_pcgv_projection()
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    print(f"PCGV built: {n_params/1e6:.2f}M trainable params, device={device}")
+    log(f"PCGV built: {n_params/1e6:.2f}M trainable params, device={device}")
     if args.freeze_coarse and not (args.coarse_ckpt or args.resume):
-        print("[warn] coarse model is frozen without --coarse_ckpt; this is only useful for smoke tests.")
+        log("[warn] coarse model is frozen without --coarse_ckpt; this is only useful for smoke tests.")
 
     ds = TrainDataset(args.train_list, args.train_img_dir, rho=args.rho,
                       max_items=args.max_train_items)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, drop_last=True,
+    sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True,
+                                 drop_last=True) if ddp else None
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None),
+                        sampler=sampler, num_workers=args.num_workers, drop_last=True,
                         pin_memory=(device.type == "cuda"))
-    print(f"Train pairs: {len(ds)}  steps/epoch: {len(loader)}")
+    log(f"Train pairs: {len(ds)}  steps/epoch: {len(loader)}"
+        + (f"  (per GPU; x{world_size} GPUs)" if ddp else ""))
     if resume_global_step is None:
         global_step = max(0, (start_epoch - 1) * len(loader) + start_step)
     else:
@@ -502,24 +545,33 @@ def main():
 
     opt = _build_optimizer(net, args)
     optimizer_group_names = [group.get("name", str(i)) for i, group in enumerate(opt.param_groups)]
+    train_model = (
+        DDP(net, device_ids=[local_rank] if (ddp and torch.cuda.is_available()) else None,
+            find_unused_parameters=True)
+        if ddp else net
+    )
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if resume_checkpoint is not None:
         restored = _restore_training_state(resume_checkpoint, opt, scaler, args, optimizer_group_names)
         if restored:
-            print("Resumed optimizer/scaler state.")
+            log("Resumed optimizer/scaler state.")
         else:
-            print("Optimizer/scaler state was not present or could not be restored; continuing with fresh optimizer.")
+            log("Optimizer/scaler state was not present or could not be restored; continuing with fresh optimizer.")
     if start_epoch > args.epochs:
-        print(
+        log(
             f"Checkpoint already reached epoch {start_epoch - 1}; nothing to train for --epochs {args.epochs}. "
             f"Use --epochs {start_epoch} or larger to continue."
         )
+        if ddp:
+            dist.destroy_process_group()
         return
 
     consecutive_nonfinite = 0
     skipped_nonfinite = 0
     for epoch in range(start_epoch, args.epochs + 1):
+        if ddp:
+            sampler.set_epoch(epoch)
         net.train()
         if args.freeze_coarse:
             net.coarse.eval()
@@ -541,7 +593,7 @@ def main():
                 active_blend = net.set_refine_blend(_scheduled_blend(args, global_step))
             amp_device = "cuda" if device.type == "cuda" else "cpu"
             with torch.amp.autocast(amp_device, enabled=use_amp):
-                out = net(batch)
+                out = train_model(batch)
                 if args.objective == "dominant_plane":
                     loss, logs = dominant_plane_loss(
                         out,
@@ -581,13 +633,14 @@ def main():
                         use_masked_align=args.use_masked_align,
                     )
             logs["blend"] = active_blend
-            if not torch.isfinite(loss):
+            if not _all_finite_across_ranks(bool(torch.isfinite(loss)), ddp, device):
                 consecutive_nonfinite += 1
                 skipped_nonfinite += 1
                 epoch_skipped_nonfinite += 1
                 msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite loss; "
                        f"skipping batch (consecutive={consecutive_nonfinite}, total_skipped={skipped_nonfinite})")
-                print(msg, flush=True)
+                if is_main:
+                    print(msg, flush=True)
                 if args.fail_on_nonfinite or consecutive_nonfinite >= args.nonfinite_patience:
                     raise FloatingPointError(msg)
                 continue
@@ -595,7 +648,7 @@ def main():
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             grads_finite, bad_grad_name = _gradients_are_finite(net)
-            if not grads_finite:
+            if not _all_finite_across_ranks(grads_finite, ddp, device):
                 consecutive_nonfinite += 1
                 skipped_nonfinite += 1
                 epoch_skipped_nonfinite += 1
@@ -604,7 +657,8 @@ def main():
                 msg = (f"ep{epoch} [{step}/{len(loader)}] non-finite gradient"
                        f" in {bad_grad_name}; skipping optimizer step "
                        f"(consecutive={consecutive_nonfinite}, total_skipped={skipped_nonfinite})")
-                print(msg, flush=True)
+                if is_main:
+                    print(msg, flush=True)
                 if args.fail_on_nonfinite or consecutive_nonfinite >= args.nonfinite_patience:
                     raise FloatingPointError(msg)
                 continue
@@ -615,13 +669,13 @@ def main():
             consecutive_nonfinite = 0
             global_step += 1
 
-            if args.save_step_every and (step + 1) % args.save_step_every == 0:
+            if is_main and args.save_step_every and (step + 1) % args.save_step_every == 0:
                 save_checkpoint(
                     os.path.join(args.out_dir, "pcgv_latest.pth"),
                     net, opt, scaler, epoch, args, step=step, global_step=global_step,
                 )
 
-            if step % args.print_freq == 0:
+            if is_main and step % args.print_freq == 0:
                 msg = (
                     f"ep{epoch} [{step}/{len(loader)}] "
                     f"total={logs['total']:.4f} align={logs['align']:.4f} "
@@ -661,35 +715,44 @@ def main():
                 print(msg)
             if args.max_steps and step + 1 >= args.max_steps:
                 break
-        print(
+        log(
             f"epoch {epoch} done in {time.time() - t0:.1f}s "
             f"(skipped_nonfinite={epoch_skipped_nonfinite}, total_skipped={skipped_nonfinite})"
         )
 
-        ckpt = os.path.join(args.out_dir, f"pcgv_epoch_{epoch:03d}.pth")
-        save_checkpoint(ckpt, net, opt, scaler, epoch, args, global_step=global_step)
-        save_checkpoint(os.path.join(args.out_dir, "pcgv_latest.pth"), net, opt, scaler, epoch, args,
-                        global_step=global_step)
+        if is_main:
+            ckpt = os.path.join(args.out_dir, f"pcgv_epoch_{epoch:03d}.pth")
+            save_checkpoint(ckpt, net, opt, scaler, epoch, args, global_step=global_step)
+            save_checkpoint(os.path.join(args.out_dir, "pcgv_latest.pth"), net, opt, scaler, epoch, args,
+                            global_step=global_step)
+        if ddp:
+            dist.barrier()
 
         if args.eval_every and epoch % args.eval_every == 0:
-            report = evaluate(net, device, args.test_list, args.test_img_dir,
-                              args.coord_dir, max_items=args.eval_max_items,
-                              h_source="raw")
-            net.train()
-            if args.freeze_coarse:
-                net.coarse.eval()
-            if args.freeze_pcgv_shallow:
-                net.features.shallow.eval()
-            if args.freeze_pcgv_pyramid:
-                net.features.pyramid.eval()
-            if args.freeze_pcgv_projection:
-                net.features.proj.eval()
-            print("  PME " + "  ".join(
-                f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
+            if is_main:
+                report = evaluate(net, device, args.test_list, args.test_img_dir,
+                                  args.coord_dir, max_items=args.eval_max_items,
+                                  h_source="raw")
+                net.train()
+                if args.freeze_coarse:
+                    net.coarse.eval()
+                if args.freeze_pcgv_shallow:
+                    net.features.shallow.eval()
+                if args.freeze_pcgv_pyramid:
+                    net.features.pyramid.eval()
+                if args.freeze_pcgv_projection:
+                    net.features.proj.eval()
+                print("  PME " + "  ".join(
+                    f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
+            if ddp:
+                dist.barrier()
 
-    save_checkpoint(os.path.join(args.out_dir, "pcgv_final.pth"), net, opt, scaler, args.epochs, args,
-                    global_step=global_step)
-    print("saved final checkpoint")
+    if is_main:
+        save_checkpoint(os.path.join(args.out_dir, "pcgv_final.pth"), net, opt, scaler, args.epochs, args,
+                        global_step=global_step)
+        log("saved final checkpoint")
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
