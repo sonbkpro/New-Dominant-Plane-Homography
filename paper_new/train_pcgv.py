@@ -587,7 +587,6 @@ def main():
                 if args.fail_on_nonfinite or consecutive_nonfinite >= args.nonfinite_patience:
                     raise FloatingPointError(msg)
                 continue
-            consecutive_nonfinite = 0
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -609,6 +608,7 @@ def main():
                 torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
+            consecutive_nonfinite = 0
             global_step += 1
 
             if args.save_step_every and (step + 1) % args.save_step_every == 0:

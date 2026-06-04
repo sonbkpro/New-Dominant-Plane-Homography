@@ -155,7 +155,11 @@ class PCGVModule(nn.Module):
             )
             matches = corr["matches"]
             delta = corr["delta"]
-            residuals = (matches - center).square().sum(dim=-1, keepdim=True).sqrt()
+            # eps in the radicand keeps the gradient finite when matches==center
+            # (sqrt'(0)=inf); without it, a zero residual produces NaN grads once
+            # the features are trainable. 1e-6 also caps the gradient magnitude when
+            # many locations are near-zero (the dominant plane on real data).
+            residuals = (matches - center).square().sum(dim=-1, keepdim=True).add(1e-6).sqrt()
             feat_b_match = sample_features_at_points(feat_b_n, matches, padding_mode="zeros")
 
             scale = float(max(height - 1, width - 1, 1))
