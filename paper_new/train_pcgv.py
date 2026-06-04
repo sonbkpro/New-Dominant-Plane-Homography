@@ -170,6 +170,9 @@ def parse_args():
                     help="Overwrite the loaded PCGV final blend, useful for staged refinement after --resume.")
     _add_bool_arg(ap, "--mask_refine", default=False,
                   help="Use the learned mask upsampler instead of pure bilinear vote upsampling.")
+    _add_bool_arg(ap, "--safe_gate", default=True,
+                  help="Per-sample keep refined H only if it beats coarse photometrically (eval-time safety; "
+                       "guarantees refined PME <= coarse). No effect on training gradients.")
     ap.add_argument("--blend_start", type=float, default=0.05)
     ap.add_argument("--blend_final", type=float, default=0.05)
     ap.add_argument("--blend_warmup_steps", type=int, default=0)
@@ -441,6 +444,7 @@ def main():
         pcgv_refine_blend_init=args.refine_blend_init,
         pcgv_learn_refine_blend=args.learn_refine_blend,
         pcgv_mask_refine=args.mask_refine,
+        pcgv_safe_gate=args.safe_gate,
         pcgv_freeze_coarse=args.freeze_coarse,
         pcgv_init_mode=args.init_mode,
         pcgv_override_baseline_keys=args.override_baseline_keys,

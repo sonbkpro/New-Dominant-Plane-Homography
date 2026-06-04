@@ -80,7 +80,12 @@ def local_correlation(feat_a: torch.Tensor, feat_b: torch.Tensor,
     feat_b_n = F.normalize(feat_b, dim=1)
     tokens_a = sample_features_at_points(feat_a_n, grid_a, padding_mode="border").transpose(1, 2)
     windows_b = extract_local_windows(feat_b_n, center_points, radius, padding_mode=padding_mode)
-    return (tokens_a.unsqueeze(-1) * windows_b).sum(dim=1) / math.sqrt(float(channels))
+    # feat_*_n are already L2-normalized, so this dot product is cosine similarity
+    # in [-1, 1]. Dividing by sqrt(C) crushed the logits to +-1/sqrt(C) (~0.125 for
+    # C=64), which flattened the soft-argmax softmax and collapsed every match onto
+    # the projected center -> the refinement could never recover real offsets. Use
+    # the raw cosine logits so the temperature actually controls peak sharpness.
+    return (tokens_a.unsqueeze(-1) * windows_b).sum(dim=1)
 
 
 def soft_argmax_corr(corr_volume: torch.Tensor, radius: int,

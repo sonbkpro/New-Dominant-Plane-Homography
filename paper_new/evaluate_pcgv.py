@@ -121,6 +121,8 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
     mask_area_buckets = {k: [] for k in CATEGORIES}
     mask_entropies = []
     residuals = []
+    gate_accepts = []
+    res_scale = 1.0
     cycle_errors = []
     skipped = 0
 
@@ -135,6 +137,11 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
         out = net(batch)
         if h_source == "start" and "H0_f" in out:
             H_patch = out["H0_f"][0].detach().cpu().numpy()
+            H = _patch_h_to_full_h(H_patch, _start_xy(sample))
+        elif h_source in ("raw", "final") and "pcgv_H_gated_f" in out:
+            # safe-gated refined H (per-sample falls back to coarse); equals the
+            # ungated refined H when the model is built with safe_gate=False.
+            H_patch = out["pcgv_H_gated_f"][0].detach().cpu().numpy()
             H = _patch_h_to_full_h(H_patch, _start_xy(sample))
         elif h_source == "raw" and "pcgv_H_raw_feat_f" in out:
             H_feat = out["pcgv_H_raw_feat_f"]
@@ -174,6 +181,14 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
         res = out.get("pcgv_residuals_f")
         if torch.is_tensor(res):
             residuals.append(float(res.detach().mean().cpu()))
+            m_feat = out.get("pcgv_mask_f")
+            if torch.is_tensor(m_feat):
+                _, _, hf, wf = m_feat.shape
+                hp, wp = batch["imgs_gray_patch"].shape[-2:]
+                res_scale = 0.5 * ((wp - 1) / max(wf - 1, 1) + (hp - 1) / max(hf - 1, 1))
+        gacc = out.get("pcgv_gate_accept_f")
+        if torch.is_tensor(gacc):
+            gate_accepts.append(float(gacc.detach().float().mean().cpu()))
         if "H_f" in out and "H_b" in out:
             Hf = out["H_f"]
             Hb = out["H_b"]
@@ -194,6 +209,8 @@ def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
     }
     report["mask_entropy"] = float(np.mean(mask_entropies)) if mask_entropies else float("nan")
     report["weighted_residual"] = float(np.mean(residuals)) if residuals else float("nan")
+    report["weighted_residual_fullpx"] = (float(np.mean(residuals)) * res_scale) if residuals else float("nan")
+    report["gate_accept_rate"] = float(np.mean(gate_accepts)) if gate_accepts else float("nan")
     report["cycle_error"] = float(np.mean(cycle_errors)) if cycle_errors else float("nan")
     return report
 
@@ -235,6 +252,9 @@ def main():
                     help="Which PCGV homography to evaluate: final blended H, start/coarse H, or raw refined H.")
     ap.add_argument("--mask_refine", type=_str2bool, default=None,
                     help="Override checkpoint mask refinement mode for mask statistics.")
+    ap.add_argument("--safe_gate", type=_str2bool, default=None,
+                    help="Per-sample accept refined H only if it beats coarse photometrically "
+                         "(default from checkpoint args, else True). Set false to evaluate the ungated refined H.")
     ap.add_argument("--set_refine_blend", type=float, default=None,
                     help="Override the checkpoint's final coarse-to-refined blend before evaluation.")
     args = ap.parse_args()
@@ -272,6 +292,11 @@ def main():
             if args.mask_refine is not None
             else ckpt_args.get("mask_refine", ckpt_args.get("pcgv_mask_refine", False))
         ),
+        pcgv_safe_gate=(
+            args.safe_gate
+            if args.safe_gate is not None
+            else ckpt_args.get("safe_gate", ckpt_args.get("pcgv_safe_gate", True))
+        ),
         pcgv_init_mode=args.init_mode,
     )
     net = build_pcgv(params).to(device)
@@ -299,7 +324,9 @@ def main():
     print("  mask_area_by_cat: " + "  ".join(
         f"{k}={report['mask_area_by_cat'][k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF")))
     print(f"  mask_entropy: {report['mask_entropy']:.4f}")
-    print(f"  weighted_residual: {report['weighted_residual']:.4f}")
+    print(f"  weighted_residual: {report['weighted_residual']:.4f} (feat px)"
+          f"  | full px: {report['weighted_residual_fullpx']:.4f}")
+    print(f"  gate_accept_rate: {report['gate_accept_rate']:.4f}")
     print(f"  cycle_error: {report['cycle_error']:.4f}")
     print(f"  (n={report['_n']}, skipped={report['_skipped']})")
 

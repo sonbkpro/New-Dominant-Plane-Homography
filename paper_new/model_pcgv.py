@@ -134,6 +134,7 @@ def make_pcgv_params(crop_h: int = CROP_H, crop_w: int = CROP_W, **overrides):
         pcgv_refine_blend_init=0.05,
         pcgv_learn_refine_blend=True,
         pcgv_mask_refine=False,
+        pcgv_safe_gate=True,
         pcgv_freeze_coarse=False,
         pcgv_init_mode="coarse_flow_corners",
         pcgv_override_baseline_keys=True,
@@ -185,6 +186,7 @@ class PCGVHomoNet(nn.Module):
         )
         self.mask_upsampler = MaskUpsampler()
         self.pcgv_mask_refine = bool(_getattr(params, "pcgv_mask_refine", _getattr(params, "mask_refine", False)))
+        self.safe_gate = bool(_getattr(params, "pcgv_safe_gate", _getattr(params, "safe_gate", True)))
         if not self.pcgv_mask_refine:
             for param in self.mask_upsampler.parameters():
                 param.requires_grad = False
@@ -298,6 +300,33 @@ class PCGVHomoNet(nn.Module):
         img2_patch_warp_fea = self.features.forward_shallow(warp_img2_patch)
         img1_patch_warp_fea = self.features.forward_shallow(warp_img1_patch)
 
+        # Eval-time safety gate: per-sample, keep the refined H only if it aligns the
+        # raw (un-gameable) images at least as well as the coarse H; otherwise fall
+        # back to coarse H0. Computed under no_grad so it never affects training
+        # gradients; consumed only by evaluation. Guarantees refined PME <= coarse.
+        if self.safe_gate:
+            with torch.no_grad():
+                if img1_full is not None and img2_full is not None:
+                    warp_img2_coarse = torch_warp_full_with_patch_flow(img2_full, coarse_out["flow_f_patch"], start)
+                    warp_img1_coarse = torch_warp_full_with_patch_flow(img1_full, coarse_out["flow_b_patch"], start)
+                else:
+                    warp_img2_coarse = torch_warp_tensor_with_flow(img2_patch, coarse_out["flow_f_patch"])
+                    warp_img1_coarse = torch_warp_tensor_with_flow(img1_patch, coarse_out["flow_b_patch"])
+                err_ref_f = (img1_patch - warp_img2_patch).abs().flatten(1).mean(dim=1)
+                err_crs_f = (img1_patch - warp_img2_coarse).abs().flatten(1).mean(dim=1)
+                err_ref_b = (img2_patch - warp_img1_patch).abs().flatten(1).mean(dim=1)
+                err_crs_b = (img2_patch - warp_img1_coarse).abs().flatten(1).mean(dim=1)
+                accept_f = (err_ref_f <= err_crs_f).view(batch, 1, 1)
+                accept_b = (err_ref_b <= err_crs_b).view(batch, 1, 1)
+            H_f_gated = torch.where(accept_f, H_f, H0_f_patch)
+            H_b_gated = torch.where(accept_b, H_b, H0_b_patch)
+            gate_accept_f = accept_f.reshape(batch).float()
+            gate_accept_b = accept_b.reshape(batch).float()
+        else:
+            H_f_gated, H_b_gated = H_f, H_b
+            gate_accept_f = H_f.new_ones(batch)
+            gate_accept_b = H_f.new_ones(batch)
+
         mask_f_patch = self._upsample_pcgv_mask(pcgv_f["mask"], size=(h_patch, w_patch))
         mask_b_patch = self._upsample_pcgv_mask(pcgv_b["mask"], size=(h_patch, w_patch))
         warp_img2_patch_mask = torch_warp_tensor_with_flow(mask_b_patch, flow_f_patch)
@@ -308,6 +337,10 @@ class PCGVHomoNet(nn.Module):
             "H_b": H_b,
             "H0_f": H0_f_patch,
             "H0_b": H0_b_patch,
+            "pcgv_H_gated_f": H_f_gated,
+            "pcgv_H_gated_b": H_b_gated,
+            "pcgv_gate_accept_f": gate_accept_f,
+            "pcgv_gate_accept_b": gate_accept_b,
             "pcgv_H_feat_f": pcgv_f["H"],
             "pcgv_H_feat_b": pcgv_b["H"],
             "pcgv_H_raw_feat_f": pcgv_f["H_refined"],
