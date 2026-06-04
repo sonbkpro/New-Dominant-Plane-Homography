@@ -1,0 +1,23 @@
+{
+  "objective": "dominant_plane",
+  "freeze_coarse": true,
+  "freeze_pcgv_shallow": false,
+  "freeze_pcgv_pyramid": false,
+  "freeze_pcgv_projection": false,
+  "lambda_align": 1.0,
+  "lambda_fil": 0.5,
+  "lambda_cov": 1.0,
+  "coverage_floor": 0.4,
+  "coverage_mode": "hinge",
+  "lambda_tv": 0.0,
+  "lambda_cycle": 0.1,
+  "lambda_entropy": 0.0,
+  "mask_refine": false,
+  "safe_gate": true,
+  "detach_dlt": false,
+  "pcgv_level": 1,
+  "blend_start": 0.1,
+  "blend_final": 1.0,
+  "blend_warmup_steps": 1500,
+  "learn_refine_blend": false
+}
