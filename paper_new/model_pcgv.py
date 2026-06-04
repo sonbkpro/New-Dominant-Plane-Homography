@@ -218,6 +218,11 @@ class PCGVHomoNet(nn.Module):
             param.requires_grad = False
         self.features.pyramid.eval()
 
+    def freeze_pcgv_projection(self):
+        for param in self.features.proj.parameters():
+            param.requires_grad = False
+        self.features.proj.eval()
+
     def unfreeze_pcgv_shallow(self):
         for param in self.features.shallow.parameters():
             param.requires_grad = True
@@ -227,6 +232,11 @@ class PCGVHomoNet(nn.Module):
         for param in self.features.pyramid.parameters():
             param.requires_grad = True
         self.features.pyramid.train(self.training)
+
+    def unfreeze_pcgv_projection(self):
+        for param in self.features.proj.parameters():
+            param.requires_grad = True
+        self.features.proj.train(self.training)
 
     def _identity_h(self, batch: int, device, dtype) -> torch.Tensor:
         return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(batch, 1, 1)

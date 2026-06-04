@@ -131,6 +131,8 @@ def parse_args():
                   help="Freeze the copied shallow feature extractor during PCGV training.")
     _add_bool_arg(ap, "--freeze_pcgv_pyramid", default=False,
                   help="Freeze the copied PCGV feature pyramid while leaving projection/voting layers trainable.")
+    _add_bool_arg(ap, "--freeze_pcgv_projection", default=False,
+                  help="Freeze the PCGV 1x1 feature projection during warmup.")
     ap.add_argument("--init_mode", choices=("identity", "coarse_flow_corners"),
                     default="coarse_flow_corners")
     ap.add_argument("--override_baseline_keys", type=_str2bool, default=True,
@@ -157,7 +159,9 @@ def parse_args():
     ap.add_argument("--use_uncertainty", type=_str2bool, default=True)
     ap.add_argument("--update_alpha", type=float, default=0.7)
     ap.add_argument("--detach_dlt", type=_str2bool, default=True,
-                    help="Stop gradients through the weighted DLT/SVD solve; keeps training numerically stable.")
+                    help="Stop gradients through the weighted DLT/SVD solve; keeps training numerically "
+                         "stable. NOTE: while True the refined H carries no gradient, so the cycle term "
+                         "(lambda_cycle) is inert; votes/mask still train via the mask path.")
     ap.add_argument("--refine_blend_init", type=float, default=0.05,
                     help="Initial final blend from coarse H to PCGV-refined H; small values preserve the baseline early.")
     ap.add_argument("--learn_refine_blend", type=_str2bool, default=True,
@@ -473,6 +477,8 @@ def main():
         net.freeze_pcgv_shallow()
     if args.freeze_pcgv_pyramid:
         net.freeze_pcgv_pyramid()
+    if args.freeze_pcgv_projection:
+        net.freeze_pcgv_projection()
 
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"PCGV built: {n_params/1e6:.2f}M trainable params, device={device}")
@@ -517,6 +523,8 @@ def main():
             net.features.shallow.eval()
         if args.freeze_pcgv_pyramid:
             net.features.pyramid.eval()
+        if args.freeze_pcgv_projection:
+            net.features.proj.eval()
         t0 = time.time()
         epoch_skipped_nonfinite = 0
         for step, batch in enumerate(loader):
@@ -661,7 +669,8 @@ def main():
 
         if args.eval_every and epoch % args.eval_every == 0:
             report = evaluate(net, device, args.test_list, args.test_img_dir,
-                              args.coord_dir, max_items=args.eval_max_items)
+                              args.coord_dir, max_items=args.eval_max_items,
+                              h_source="raw")
             net.train()
             if args.freeze_coarse:
                 net.coarse.eval()
@@ -669,6 +678,8 @@ def main():
                 net.features.shallow.eval()
             if args.freeze_pcgv_pyramid:
                 net.features.pyramid.eval()
+            if args.freeze_pcgv_projection:
+                net.features.proj.eval()
             print("  PME " + "  ".join(
                 f"{k}={report[k]:.4f}" for k in ("RE", "LT", "LL", "SF", "LF", "AVG")))
 

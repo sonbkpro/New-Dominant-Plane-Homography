@@ -112,7 +112,7 @@ def _progress_indices(total, enabled=True, desc="Evaluating", fallback_every=100
 
 @torch.no_grad()
 def evaluate(net, device, list_path, img_dir, coord_dir, max_items=None,
-             verbose=False, num_points=6, progress=True, h_source="final"):
+             verbose=False, num_points=6, progress=True, h_source="raw"):
     net.eval()
     ds = TestDataset(list_path, img_dir, coord_dir, max_items=max_items)
     buckets = {k: [] for k in CATEGORIES}
